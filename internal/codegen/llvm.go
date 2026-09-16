@@ -296,6 +296,12 @@ type vneed struct {
 type llvmEmitter struct {
 	p *sema.Program
 
+	// curPos is the expression or statement being lowered. A refusal raised
+	// deep inside a helper -- one that converts a value, or lays out an object
+	// -- has no position of its own, and a limit that names the construct but
+	// not the line is one the user has to bisect their own file to find.
+	curPos source.Pos
+
 	types    strings.Builder
 	globals  strings.Builder
 	defs     strings.Builder
@@ -625,6 +631,12 @@ func (e *llvmEmitter) useArray() *ast.Class {
 
 // refuse stops emission with the diagnostic for a construct outside the subset.
 func (e *llvmEmitter) refuse(pos source.Pos, format string, args ...any) {
+	if pos.File == nil {
+		pos = e.curPos
+	}
+	if pos.File == nil && e.fb != nil {
+		pos = e.fb.pos
+	}
 	where := ""
 	if e.fb != nil && e.fb.fn != nil {
 		if e.fb.fn.Owner != nil {
@@ -1441,7 +1453,7 @@ func (e *llvmEmitter) emitClassRecord(cl *ast.Class) {
 		"subs":     "ptr null",
 		"nref":     fmt.Sprintf("i32 %d", len(refs)),
 		"refoffs":  "ptr @refs_" + n,
-		"mods":     "i32 0",
+		"mods":     fmt.Sprintf("i32 %d", (&Emitter{prog: e.p}).classMods(cl)),
 		"prim":     "i32 0",
 		"fields":   "ptr null",
 		"nfields":  "i32 0",
@@ -1696,6 +1708,10 @@ type fb struct {
 	cur  string // the block being written
 	term bool   // it already has its terminator
 	n    int
+
+	// pos is the statement being lowered, for the refusals that have no
+	// position of their own.
+	pos source.Pos
 
 	locals map[*ast.Var]string
 	// slots are the function's own stack slots. Once a try statement has opened

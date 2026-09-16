@@ -25,6 +25,12 @@ type switchCtx struct {
 }
 
 func (e *llvmEmitter) stmt(f *fb, s ast.Stmt) {
+	if p, ok := s.(interface{ GetPos() source.Pos }); ok {
+		if q := p.GetPos(); q.File != nil {
+			f.pos = q
+			e.curPos = q
+		}
+	}
 	switch v := s.(type) {
 	case *ast.Block:
 		e.block(f, v)

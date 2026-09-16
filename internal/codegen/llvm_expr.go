@@ -29,6 +29,9 @@ func (e *llvmEmitter) expr(f *fb, x ast.Expr) lval {
 	if x == nil {
 		return value("0", nil)
 	}
+	if p := x.GetPos(); p.File != nil {
+		e.curPos = p
+	}
 	if v, ok := e.p.Lowered(x); ok {
 		return e.expr(f, v)
 	}
