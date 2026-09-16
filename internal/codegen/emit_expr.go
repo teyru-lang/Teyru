@@ -85,7 +85,18 @@ func (e *Emitter) coerce(v string, src, dst ast.Type) string {
 	_, dp := dst.(*ast.PrimType)
 	switch {
 	case sp && dp:
-		return v // C handles numeric conversions implicitly
+		// C handles the numeric conversions implicitly, and for every pair but
+		// one that is also what Java means. The exception is a floating-point
+		// value converted to an integral one: a value that fits is the same
+		// truncation in both languages, but a value that does not is undefined
+		// in C. Java only allows that conversion behind a cast, and the cast is
+		// what this function is handed for one; a conversion the language
+		// permits without one -- a compound assignment, a constant that fits --
+		// arrives here, and it clamps for the same reason.
+		if conv := e.saturatingConv(src.(*ast.PrimType), dst.(*ast.PrimType), v); conv != "" {
+			return conv
+		}
+		return v // C handles the other numeric conversions implicitly
 	case sp && !dp:
 		return e.boxCall(v, src.(*ast.PrimType), dst)
 	case !sp && dp:
@@ -681,6 +692,9 @@ func (e *Emitter) cast(v *ast.Cast) string {
 	inner := e.expr(v.X)
 	switch {
 	case sp && dp:
+		if conv := e.saturatingConv(src.(*ast.PrimType), dst.(*ast.PrimType), inner); conv != "" {
+			return conv
+		}
 		return "((" + e.ctype(dst) + ")(" + inner + "))"
 	case sp && !dp:
 		return e.boxCall(inner, src.(*ast.PrimType), dst)
@@ -694,6 +708,55 @@ func (e *Emitter) cast(v *ast.Cast) string {
 		return "((tyarr*)ty_checkcast((tyobj*)" + e.refExpr(v.X) + ", &cls_" + mangle(e.prog.ArrayClass().Full) + "))"
 	}
 	return "(" + e.ctype(dst) + ")(" + inner + ")"
+}
+
+// saturatingConv renders a conversion from a floating-point value to an
+// integral one, and an empty string for every other pair.
+//
+// It is the one primitive conversion C does not already do the way Java defines
+// it: a value that does not fit the destination is undefined in C -- the machine
+// instruction answers 0x80000000 on x86-64, and a folded constant is whatever
+// the optimiser decided -- while JLS 5.1.3 answers NaN, the infinities, and
+// both ends of the range, all of which the runtime's helper does. A conversion
+// to a type narrower than int is that int and then the truncation to the type,
+// which is the two steps the conversion is defined in; the cast here is the
+// second step. The in-range case is the same cast C would have emitted.
+func (e *Emitter) saturatingConv(src, dst *ast.PrimType, inner string) string {
+	switch src.Kind {
+	case ast.Float, ast.Double:
+	default:
+		return ""
+	}
+	switch dst.Kind {
+	case ast.Long:
+		return "ty_d2l(" + inner + ")"
+	case ast.Int:
+		return "ty_d2i(" + inner + ")"
+	case ast.Byte, ast.Short, ast.Char:
+		return "((" + e.ctype(dst) + ")ty_d2i(" + inner + "))"
+	}
+	return ""
+}
+
+// narrowTarget is saturatingConv for a compound assignment, which converts the
+// result of its operation back to the target's type (JLS 15.26.2). When the
+// operation happens in a floating-point type and the target is integral, that
+// conversion is the narrowing one -- the same one a cast performs, so the same
+// clamp -- and `inner` is wrapped in it. An empty answer means there is nothing
+// to clamp and the caller keeps whatever it would have emitted.
+func (e *Emitter) narrowTarget(opType, target ast.Type, inner string) string {
+	ot, ok := opType.(*ast.PrimType)
+	if !ok {
+		return inner
+	}
+	tt, ok := target.(*ast.PrimType)
+	if !ok {
+		return inner
+	}
+	if conv := e.saturatingConv(ot, tt, inner); conv != "" {
+		return conv
+	}
+	return inner
 }
 
 func (e *Emitter) instanceOf(v *ast.InstanceOf) string {
@@ -1445,7 +1508,10 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 			if op == "%" {
 				call = "fmod(" + lv + ", " + e.expr(v.Y) + ")"
 			}
-			return "(" + lv + " = (" + e.ctype(xt) + ")" + call + ")"
+			// the result is converted back to the target (JLS 15.26.2), and for
+			// an integral target that is the narrowing conversion a cast does --
+			// which C's own conversion of a double to an int does not define
+			return "(" + lv + " = (" + e.ctype(xt) + ")" + e.narrowTarget(v.OpType, xt, call) + ")"
 		}
 		fn := "ty_div_int"
 		if op == "%" {
@@ -1459,6 +1525,16 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 			}
 		}
 		return "(" + lv + " = (" + e.ctype(xt) + ")" + fn + "(" + lv + ", " + e.expr(v.Y) + "))"
+	}
+	// The result of the operation is converted back to the target's type, and
+	// when the operation happens in a floating-point type and the target is
+	// integral that conversion is a narrowing one: Java runs it through the same
+	// conversion a cast performs (JLS 15.26.2), while C's `x op= y` converts it
+	// with a plain cast, which is undefined for a value that does not fit. The
+	// statement C already emitted is kept wherever no clamping is needed.
+	call := "(" + lv + " " + op + " " + e.operand(v.Y, v.OpType) + ")"
+	if conv := e.narrowTarget(v.OpType, v.X.GetType(), call); conv != call {
+		return "(" + lv + " = " + conv + ")"
 	}
 	return "(" + lv + " " + op + "= " + e.operand(v.Y, v.OpType) + ")"
 }

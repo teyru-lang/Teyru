@@ -351,6 +351,44 @@ source → lexer → parser → ast → sema → codegen
   填入（`Class` 自己的 7／12／13／16）。用到反射的程式不變（各約 4.1～4.9 MB），因為反射會從
   main 接上每一張成員表；五個基準的時間與 checksum 都不變。
 
+- **浮點轉整數的窄化轉換（已修，兩個後端都改）**：C 的 `(int)`／`(long)` 對「放不下的 double」
+  是 undefined，所以同一支 `main` 裡的 `(long) 1.0e20` 在四個建置給出四個不同的答案：C 後端
+  `-O2` 是 **160**、`-O0` 是 **-9223372036854775808**、`-O3` 是 **0**、LLVM 後端是 **48**——
+  常數摺疊的那一份更糟（0、140727421376656、140736752435552、0）。Java 由 JLS 5.1.3 指定：
+  NaN → 0、±∞ → 最大／最小值、太大 → 最大值、太小 → 最小值、其餘往零截斷。現在兩個後端都呼叫
+  `ty_d2i`／`ty_d2l`（實作在 `tyrt.c`，原型在 `tyrt.h`——LLVM 後端的原型本來就是從那個標頭讀
+  的，所以兩邊是同一個語意）：C 後端在 `cast`、`coerce` 與複合指定（`narrowTarget`）三條路徑都會
+  發出呼叫，LLVM 後端在 `convertTo` 的浮點→整數分支發出 `call`；窄於 `int` 的目標再做第二步
+  （C 是窄化轉型、IR 是 `trunc`），與 Java 的「先到 int 再截斷」相同。因為發出的是有定義的呼叫，
+  **常數摺疊也跟著變成有定義**：四個最佳化等級與兩個後端現在都給 9223372036854775807。測試
+  `tests/programs/t191_narrowing_saturation`（336 行，期望值由 javac 產生，兩個後端逐行相同）。
+  **仍開放（同族、不同缺陷）**：LLVM 後端的複合 `/=`、`%=` 遇到浮點右運算元，會先把右邊窄化到
+  目標型別再做整數除法，違反 JLS 15.26.2 的二元數值提升——`int a = 7; a /= 2.5` 得 3（Java 是
+  2）、`a %= 2.5` 得 1（Java 2）、`int m = 2147483647; m /= 0.5` 直接丟 ArithmeticException
+  （Java 是 2147483647）。C 後端這幾條是對的；重現程式 `/tmp/scout/x10_compound_div.teyru`。
+- **`IndexOutOfBoundsException` 的繼承階層與 Java 不同（未修，屬完備性）**：`lib/06_errors.teyru`
+  裡 `ArrayIndexOutOfBoundsException` 直接繼承 `RuntimeException`（Java 繼承
+  `IndexOutOfBoundsException`），`IndexOutOfBoundsException` 成了它的兄弟，而
+  `StringIndexOutOfBoundsException` 不存在；`"abc".charAt(9)` 丟的是
+  `ArrayIndexOutOfBoundsException`。後果是 Java 的慣用寫法 `catch (IndexOutOfBoundsException)`
+  **接不到**陣列／字串越界：程式落到更廣的 catch，或直接死掉（`/tmp/scout/x8_oob_hierarchy`
+  與 Java 對照：Teyru 三個案例都落到 `RuntimeException`，Java 三個都是 `IndexOutOfBounds`）。
+  同族的完備性缺漏：`StringIndexOutOfBoundsException` 無法命名（程式編不過，
+  `PrintStream.write(byte[])` 與 `flush()` 也不存在）。
+- **已檢查且正確的形狀（暫存程式在 `/tmp/scout`，方法：`teyru build` 後跑執行檔，Java 21 當規格
+  逐行比對）**：14 個收集器形狀在**確實發生收集**（儀器化探針量到 gc=4～15）下全部正確、無崩潰
+  ——物件只被陣列元素／static／lambda 捕獲／回傳值指向、1000 與 10 萬節的鏈、13 萬節的樹、容器
+  擴容換掉底層陣列、4500 個裝箱值、30 個區域變數跨過會收集的呼叫、運算式進行中的物件跨過會收集
+  的呼叫、兩個都在收集的執行緒、256 KB 陣列夾著 24 B 的小物件。8 個例外／清理形狀與 Java 逐位元
+  組相同：finally 內配置、catch 內重丟、finally 內的迴圈包 try、finally 內丟出、catch 內 return、
+  巢狀 finally 的順序、longjmp 前後讀區域變數（另一個 agent 修過的那個形狀，這裡仍正確）、運算式
+  進行中丟出。字串與數字除上面那條之外全部相同：各原生型別邊界值的格式化（含 NaN、∞、MIN／MAX、
+  1e±308）、`substring`／`indexOf`／`charAt` 的邊界、10 萬字元單行進出 iostream、整數與長整數除
+  以零、`MIN_VALUE / -1`、位移量超過型別寬度、陣列與字串越界（都有檢查、記憶體未被寫壞）。
+  未涵蓋：Web 堆疊自重的那一組（空 body／邊界大小的 body／沒有值的標頭／keep-alive 上的轉導／
+  過期或超大的 session cookie／被切成兩次讀的 WebSocket frame）——那一組我沒有寫程式，不宣稱它
+  沒問題。
+
 ---
 
 ## 11. 送出前檢查清單

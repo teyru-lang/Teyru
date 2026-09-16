@@ -581,13 +581,7 @@ func (e *llvmEmitter) convertTo(f *fb, v lval, want string) string {
 		f.ins(fmt.Sprintf("%s = %s %s %s to %s", r, op, from, v.v, want))
 		return r
 	case isFloatLLVM(from) && isIntLLVM(want):
-		r := f.reg()
-		op := "fptosi"
-		if isUnsigned(v.t) {
-			op = "fptoui"
-		}
-		f.ins(fmt.Sprintf("%s = %s %s %s to %s", r, op, from, v.v, want))
-		return r
+		return e.saturatingCast(f, v, from, want)
 	case isFloatLLVM(from) && isFloatLLVM(want):
 		r := f.reg()
 		if want == "double" {
@@ -599,6 +593,35 @@ func (e *llvmEmitter) convertTo(f *fb, v lval, want string) string {
 	}
 	e.refuse(noPos, "an internal lowerer error: no conversion from %s to %s", from, want)
 	return v.v
+}
+
+// saturatingCast lowers a conversion from a floating-point value to an integral
+// one the way JLS 5.1.3 defines it, through the runtime's helper.
+//
+// An fptosi is the same conversion C leaves undefined -- it is poison for a
+// value that does not fit -- and four builds of `(long) 1.0e20` answered 160, 0,
+// -9223372036854775808 and 48 before this, one of them from this back end. The
+// helper takes a double and answers an int32_t or an int64_t: a float source is
+// widened on the way in, which is exact and is the order the conversion is
+// defined in, and a destination narrower than the helper's own width is the
+// truncation of that int, which is the second of the two steps JLS states. A
+// destination that is not narrower is the helper's answer unchanged.
+func (e *llvmEmitter) saturatingCast(f *fb, v lval, from, want string) string {
+	helper := "ty_d2i"
+	if llvmWidth(want) > 32 {
+		helper = "ty_d2l"
+	}
+	proto, ok := rtProtoOf(helper)
+	if !ok {
+		e.refuse(noPos, "converting a floating-point value to an integer: internal/runtime/src/tyrt.h does not declare %s", helper)
+	}
+	got := e.rtCall(f, helper, nil, []lval{v})
+	if proto.ret == want {
+		return got.v
+	}
+	r := f.reg()
+	f.ins(fmt.Sprintf("%s = trunc %s %s to %s", r, proto.ret, got.v, want))
+	return r
 }
 
 // convertFrom converts a value the runtime answered with into the Teyru type the
