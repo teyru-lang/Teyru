@@ -1,24 +1,13 @@
-* text=auto eol=lf
-*.teyru text eol=lf
-*.expected text eol=lf
+# GitHub's language statistics. This project is written in Teyru: the compiler
+# is Go and the runtime C, but the language, its standard library and every test
+# are .teyru, and Linguist does not know the extension unless it is told.
+*.teyru linguist-language=Teyru
 
-# GitHub shows every .teyru file as Java until linguist ships a Teyru
-# definition: the syntax is Java-like, so Java is the closest grammar to
-# highlight with, and without this the language bar and the diffs for the whole
-# repository would be empty. The editors/ directory has the real grammars
-# (VS Code TextMate, tree-sitter) to use instead.
-*.teyru linguist-language=Java
-*.teyru diff=java
+# The Java files under tests/ are references: javac's output is the
+# specification the .expected files were derived from, and several of them are
+# whole JDK-shaped programs. Counting them made "Java" the largest language in a
+# repository that contains almost none.
+*.java.ref linguist-detectable=false
+
+# Expected output is test data, not a language.
 *.expected linguist-detectable=false
-*.args linguist-detectable=false
-
-# The tree-sitter parser is generated from grammar.js by the tree-sitter CLI,
-# and the headers beside it are copied from tree-sitter itself. parser.c alone
-# is 113k lines: without these markers linguist counts it as C and the language
-# bar reports a C project with a Go compiler attached. Marking them generated
-# also collapses them in pull request diffs, which is what a file nobody edits
-# by hand should do.
-editors/tree-sitter-teyru/src/parser.c linguist-generated=true
-editors/tree-sitter-teyru/src/node-types.json linguist-generated=true
-editors/tree-sitter-teyru/src/grammar.json linguist-generated=true
-editors/tree-sitter-teyru/src/tree_sitter/* linguist-vendored=true
