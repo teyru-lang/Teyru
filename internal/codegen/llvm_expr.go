@@ -1475,20 +1475,34 @@ func opTypeOf(a *ast.Assign, t ast.Type) ast.Type {
 	return t
 }
 
+// compoundDiv lowers `x /= y` and `x %= y`.
+//
+// The operation happens in the type binary numeric promotion gives the two
+// operands, and only its result is converted back to the target (JLS 15.26.2).
+// Dividing in the target's type instead narrows the right operand first: for
+// `int a = 7; a /= 2.5` that is 7/2, which is 3, where Java's promotion makes it
+// 7.0/2.5 = 2.8 and the conversion back gives 2. The same mistake turns
+// `a %= 2.5` into 1 instead of 2, and makes `int m = 2147483647; m /= 0.5`
+// divide by zero where Java divides in double and saturates on the way back.
+//
+// OpType is the checker's answer to that promotion, the same one the other
+// compound operators use.
 func (e *llvmEmitter) compoundDiv(f *fb, a *ast.Assign, op string, cur lval, t ast.Type) lval {
-	if isFloating(t) {
-		y := e.coerce(f, e.expr(f, a.Y), t)
+	ot := opTypeOf(a, t)
+	if isFloating(ot) {
+		x := e.coerce(f, cur, ot)
+		y := e.coerce(f, e.expr(f, a.Y), ot)
 		r := f.reg()
 		ins := "fdiv"
 		if op == "%" {
 			ins = "frem"
 		}
-		f.ins(fmt.Sprintf("%s = %s %s %s, %s", r, ins, e.llvmType(t), cur.v, y.v))
-		return value(r, t)
+		f.ins(fmt.Sprintf("%s = %s %s %s, %s", r, ins, e.llvmType(ot), x.v, y.v))
+		return e.coerce(f, value(r, ot), t)
 	}
 	e.markExn("TY_ARITH", e.p.Builtins.Arith)
 	fn := "ty_div_int"
-	if ast.IsPrim(t, ast.Long) {
+	if ast.IsPrim(ot, ast.Long) {
 		fn = "ty_div_long"
 		if op == "%" {
 			fn = "ty_rem_long"
@@ -1496,8 +1510,9 @@ func (e *llvmEmitter) compoundDiv(f *fb, a *ast.Assign, op string, cur lval, t a
 	} else if op == "%" {
 		fn = "ty_rem_int"
 	}
-	y := e.coerce(f, e.expr(f, a.Y), t)
-	return e.rtCall(f, fn, t, []lval{cur, y})
+	x := e.coerce(f, cur, ot)
+	y := e.coerce(f, e.expr(f, a.Y), ot)
+	return e.coerce(f, e.rtCall(f, fn, ot, []lval{x, y}), t)
 }
 
 // elemClassForStore is the class an array store at this site promises, or ""
