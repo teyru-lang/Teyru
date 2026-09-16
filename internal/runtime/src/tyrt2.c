@@ -161,7 +161,7 @@ int32_t ty_str_eq_obj(tystr *a, void *b) {
 
 tystr *ty_str_sub_from(tystr *s, int32_t from) {
   if (!s) return NULL;
-  if (from < 0 || from > s->len) ty_throw((tyobj *)ty_aioobe(from, s ? s->len : 0));
+  if (from < 0 || from > s->len) ty_throw((tyobj *)ty_sioobe(from, s ? s->len : 0));
   return ty_str_sub(s, from, (int32_t)s->len);
 }
 

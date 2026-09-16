@@ -999,6 +999,7 @@ func (e *Emitter) entry() string {
 	}
 	for _, pair := range [][2]any{
 		{"TY_NPE", e.prog.Builtins.NPE}, {"TY_AIOOBE", e.prog.Builtins.AIOOBE},
+		{"TY_SIOOBE", e.prog.Builtins.SIOOBE},
 		{"TY_ARITH", e.prog.Builtins.Arith}, {"TY_CCE", e.prog.Builtins.CCE},
 		{"TY_NEGARR", e.prog.Builtins.NegArr}, {"TY_ASSERT", e.prog.Builtins.Assertion},
 		{"TY_ILLARG", e.prog.Builtins.IllArg}, {"TY_ILLSTATE", e.prog.Builtins.IllState},

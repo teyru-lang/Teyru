@@ -361,11 +361,37 @@ source → lexer → parser → ast → sema → codegen
   發出呼叫，LLVM 後端在 `convertTo` 的浮點→整數分支發出 `call`；窄於 `int` 的目標再做第二步
   （C 是窄化轉型、IR 是 `trunc`），與 Java 的「先到 int 再截斷」相同。因為發出的是有定義的呼叫，
   **常數摺疊也跟著變成有定義**：四個最佳化等級與兩個後端現在都給 9223372036854775807。測試
+<<<<<<< /root/tywork/alloc/work/AGENTS.md
+  `tests/programs/t191_narrowing_saturation`（336 行，期望值由 javac 產生，兩個後端逐行相同）。
+=======
   `tests/programs/t193_narrowing_saturation`（336 行，期望值由 javac 產生，兩個後端逐行相同）。
+>>>>>>> /root/tywork/alloc/applycheck/AGENTS.md
   **仍開放（同族、不同缺陷）**：LLVM 後端的複合 `/=`、`%=` 遇到浮點右運算元，會先把右邊窄化到
   目標型別再做整數除法，違反 JLS 15.26.2 的二元數值提升——`int a = 7; a /= 2.5` 得 3（Java 是
   2）、`a %= 2.5` 得 1（Java 2）、`int m = 2147483647; m /= 0.5` 直接丟 ArithmeticException
   （Java 是 2147483647）。C 後端這幾條是對的；重現程式 `/tmp/scout/x10_compound_div.teyru`。
+<<<<<<< /root/tywork/alloc/work/AGENTS.md
+- **`IndexOutOfBoundsException` 的繼承階層（已修）**：原本 `lib/06_errors.teyru` 裡
+  `ArrayIndexOutOfBoundsException` 直接繼承 `RuntimeException`、`IndexOutOfBoundsException`
+  是它的兄弟，`StringIndexOutOfBoundsException` 根本不存在，而 `"abc".charAt(9)` 丟的是陣列那一
+  個。後果不是編譯錯誤而是**靜默走錯分支**：Java 的慣用寫法
+  `catch (IndexOutOfBoundsException)` 接不到任何越界，程式落到更廣的 catch 或直接死掉
+  （修前 `x8_oob_hierarchy` 三個案例都落到 `RuntimeException`，Java 三個都是
+  `IndexOutOfBounds`）。修法：三個類別照 Java 的階層重建（`IndexOutOfBoundsException` 為父、
+  陣列與字串兩個為子，三個都有 `()` 與 `(String)` 建構子、都可被命名）；runtime 新增
+  `ty_sioobe`（`tyrt.c`，與 `ty_aioobe` 同一個錯誤路徑）並把**字串與緩衝區**的越界檢查全部改走
+  它——`ty_str_sub`／`ty_str_charat`／`ty_str_of_chars_part`／`StringBuilder`、`StringBuffer` 的
+  `charAt`／`setCharAt`／`insert`／`delete`／`substring`／`setLength` 共 18 處——而**陣列**的檢查
+  （`ty_arr_ptr`、`ty_arr_slot_ref`、`ty_arraycopy`、header 內的陣列讀、`tyrt_reflect.c` 兩處）
+  維持 `ty_aioobe` 不變。類別 handle 走既有的 builtin 管線（`TY_SIOOBE`：`sema/checker.go` 的
+  Builtins、`codegen/emit.go` 與 `codegen/llvm.go` 的兩張表），所以兩個後端都能丟它。測試
+  `t192_index_out_of_bounds`（期望值 javac 產生；以**父類別** catch 並印出「哪一個到了」，因為
+  這才是那個慣用寫法；11 個案例涵蓋字串、緩衝區、`String.valueOf(char[],off,count)`、陣列讀寫與
+  一個沒越界的對照，兩個後端逐行相同）。同族、**已命名但未提供**的 API（記錄下來，不是佔位）：
+  `PrintStream.write(byte[])` 與 `PrintStream.flush()` 不存在，用到它們的程式在編譯期就會被拒
+  （`TY-TYP-0076`），而不是執行時才發現——名字留在這裡是為了讓下一個讀的人知道它們是「已知且刻
+  意沒有」，不是被忘記。
+=======
 - **`IndexOutOfBoundsException` 的繼承階層與 Java 不同（未修，屬完備性）**：`lib/06_errors.teyru`
   裡 `ArrayIndexOutOfBoundsException` 直接繼承 `RuntimeException`（Java 繼承
   `IndexOutOfBoundsException`），`IndexOutOfBoundsException` 成了它的兄弟，而
@@ -375,6 +401,7 @@ source → lexer → parser → ast → sema → codegen
   與 Java 對照：Teyru 三個案例都落到 `RuntimeException`，Java 三個都是 `IndexOutOfBounds`）。
   同族的完備性缺漏：`StringIndexOutOfBoundsException` 無法命名（程式編不過，
   `PrintStream.write(byte[])` 與 `flush()` 也不存在）。
+>>>>>>> /root/tywork/alloc/applycheck/AGENTS.md
 - **已檢查且正確的形狀（暫存程式在 `/tmp/scout`，方法：`teyru build` 後跑執行檔，Java 21 當規格
   逐行比對）**：14 個收集器形狀在**確實發生收集**（儀器化探針量到 gc=4～15）下全部正確、無崩潰
   ——物件只被陣列元素／static／lambda 捕獲／回傳值指向、1000 與 10 萬節的鏈、13 萬節的樹、容器
@@ -389,6 +416,8 @@ source → lexer → parser → ast → sema → codegen
   過期或超大的 session cookie／被切成兩次讀的 WebSocket frame）——那一組我沒有寫程式，不宣稱它
   沒問題。
 
+<<<<<<< /root/tywork/alloc/work/AGENTS.md
+=======
 - **`bench_invoke` 的每一次反射呼叫拆開來看，貴的是配置不是反射（數字已由消去法更正）**：20M 次呼叫的 invoke
   迴圈實測 540／612／601 ms（約 27 ns/次）。**配置快速路徑本身只要約 2 ns**——消去法（把真實標頭逐一拿掉、加上
   不透明屏障防止最佳化折疊）量到：兩個標頭寫入 0.5、payload 歸零 0.23、預算檢查與計數 0.27、執行緒指標 0.06 ns。
@@ -404,6 +433,7 @@ source → lexer → parser → ast → sema → codegen
   （一個**不可用**的消去法也記在這裡：把 bump 拿掉、每次發同一塊，程式會 SIGSEGV（exit 139）——用弄壞程式的
   方式量配置，數字本身就不成立，所以那條路的 0.0019 s 是崩潰不是加速，只跑一次、診斷、不重試。）
 
+>>>>>>> /root/tywork/alloc/applycheck/AGENTS.md
 ---
 
 ## 11. 送出前檢查清單
