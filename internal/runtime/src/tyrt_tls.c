@@ -75,6 +75,22 @@
 #include <stdio.h>
 #include <string.h>
 
+/* OpenSSL 1.1 is the floor, and the floor is stated here rather than discovered
+   one undeclared identifier at a time. Three of the calls below arrived in 1.1
+   and have no predecessor worth using: BIO_meth_new (1.0.2 has none -- a custom
+   BIO was written by filling a BIO_METHOD struct by hand), TLS_client_method
+   (1.0.2 has SSLv23_client_method), and
+   SSL_CTX_set_min_proto_version (1.0.2 can only *add* options to a default that
+   already allowed SSLv3 and TLS 1.0). A machine with 1.0.2 headers therefore
+   cannot build this file at all, and what a person should see when that happens
+   is one sentence saying so, not a page of "undeclared identifier" inside a
+   runtime file they did not write. OPENSSL_VERSION_NUMBER is OpenSSL's own
+   macro, so this costs nothing and can never disagree with the headers it is
+   read from. */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#error "the TLS layer needs OpenSSL 1.1 or newer (SSL_set1_host, BIO_meth_new, TLS_client_method and SSL_CTX_set_min_proto_version are not in 1.0.x)"
+#endif
+
 /* ---- the codes -------------------------------------------------------- */
 
 /* The certificate the peer sent is not trusted: it does not chain to an anchor,
