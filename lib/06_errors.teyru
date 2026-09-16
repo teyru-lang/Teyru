@@ -77,10 +77,35 @@ class NullPointerException extends RuntimeException {
   }
 }
 
-class ArrayIndexOutOfBoundsException extends RuntimeException {
+/* The three indexing exceptions have the shape Java gives them, which is
+   load-bearing rather than cosmetic: a program that catches
+   IndexOutOfBoundsException -- the idiom for "an index was out of range",
+   whatever was indexed -- catches all three, and one that catches
+   ArrayIndexOutOfBoundsException does not catch a String's. Making the array
+   one a subclass of RuntimeException directly, which is how this file had it,
+   leaves that catch unfired and the program takes a wider branch or dies. */
+class IndexOutOfBoundsException extends RuntimeException {
+  public IndexOutOfBoundsException() {
+  }
+  public IndexOutOfBoundsException(String message) {
+    super(message)
+  }
+}
+
+class ArrayIndexOutOfBoundsException extends IndexOutOfBoundsException {
   public ArrayIndexOutOfBoundsException() {
   }
   public ArrayIndexOutOfBoundsException(String message) {
+    super(message)
+  }
+}
+
+/* Thrown by the string reads whose index is out of range: charAt, substring and
+   the buffer methods, which is what the runtime's ty_sioobe raises. */
+class StringIndexOutOfBoundsException extends IndexOutOfBoundsException {
+  public StringIndexOutOfBoundsException() {
+  }
+  public StringIndexOutOfBoundsException(String message) {
     super(message)
   }
 }
@@ -159,12 +184,6 @@ class AssertionError extends RuntimeException {
   public AssertionError() {
   }
   public AssertionError(String message) {
-    super(message)
-  }
-}
-
-class IndexOutOfBoundsException extends RuntimeException {
-  public IndexOutOfBoundsException(String message) {
     super(message)
   }
 }

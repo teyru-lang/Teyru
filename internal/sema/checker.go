@@ -32,6 +32,11 @@ type Builtins struct {
 	// knows the classes the generated startup installs here.
 	IllMon                                     *ast.Class
 	NPE, AIOOBE, Arith, CCE, NegArr, Assertion *ast.Class
+	// StringIndexOutOfBoundsException: what a string read with an index out of
+	// range throws, which Java keeps apart from the array one -- both are
+	// IndexOutOfBoundsExceptions, and neither is the other. The runtime throws
+	// it, so it is a builtin rather than just a prelude class.
+	SIOOBE                                     *ast.Class
 	// java.lang.reflect's checked exceptions. Teyru does not check them --
 	// nothing here is checked -- but they are the classes the runtime throws
 	// and a program catches, so they are named like the rest.
@@ -475,6 +480,7 @@ func (c *Checker) initBuiltins() {
 		IllMon:     get("IllegalMonitorStateException"),
 		ArrayStore: get("ArrayStoreException"),
 		NPE:        get("NullPointerException"), AIOOBE: get("ArrayIndexOutOfBoundsException"),
+		SIOOBE:     get("StringIndexOutOfBoundsException"),
 		ClassNotFound: get("ClassNotFoundException"), NoSuchField: get("NoSuchFieldException"),
 		NoSuchMethod: get("NoSuchMethodException"), IllAccess: get("IllegalAccessException"),
 		Invocation: get("InvocationTargetException"), Instantiation: get("InstantiationException"),

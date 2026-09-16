@@ -24,7 +24,7 @@ tyclass *TY_ARRAY = NULL;
 tyclass *TY_BOX[9] = {0};
 tyclass *TY_OBJECT = NULL;
 
-tyclass *TY_NPE, *TY_AIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT;
+tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT;
 tyclass *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE;
 tyclass *TY_ILLMON;
 /* java.lang.reflect's own exceptions. A program that never reflects never
@@ -875,6 +875,16 @@ void *ty_aioobe(int64_t idx, int64_t len) {
   ty_throw(ty_make_ex(TY_AIOOBE, buf));
   return NULL;
 }
+/* The same report for a string or a buffer, which Java keeps apart from an
+   array's: both are IndexOutOfBoundsExceptions, so a program that catches that
+   one catches either, but a program that catches ArrayIndexOutOfBoundsException
+   -- "an array index was wrong" -- must not be answering a String's. */
+void *ty_sioobe(int64_t idx, int64_t len) {
+  char buf[128];
+  snprintf(buf, sizeof buf, "index %lld out of bounds for length %lld", (long long)idx, (long long)len);
+  ty_throw(ty_make_ex(TY_SIOOBE, buf));
+  return NULL;
+}
 void *ty_arith(const char *msg) {
   ty_throw(ty_make_ex(TY_ARITH, msg));
   return NULL;
@@ -1186,9 +1196,9 @@ tystr *ty_str_trim(tystr *s) {
 }
 tystr *ty_str_sub(tystr *s, int32_t from, int32_t to) {
   if (!s) return NULL;
-  if (from < 0) { ty_throw((tyobj *)ty_aioobe(from, s->len)); }
-  if (to > s->len) { ty_throw((tyobj *)ty_aioobe(to, s->len)); }
-  if (from > to) { ty_throw((tyobj *)ty_aioobe(to, s->len)); }
+  if (from < 0) { ty_throw((tyobj *)ty_sioobe(from, s->len)); }
+  if (to > s->len) { ty_throw((tyobj *)ty_sioobe(to, s->len)); }
+  if (from > to) { ty_throw((tyobj *)ty_sioobe(to, s->len)); }
   return ty_str_new(s->data + from, to - from);
 }
 int32_t ty_str_indexof(tystr *s, tystr *sub) {
@@ -1199,7 +1209,7 @@ int32_t ty_str_indexof(tystr *s, tystr *sub) {
   return -1;
 }
 int32_t ty_str_charat(tystr *s, int32_t i) {
-  if (!s || i < 0 || i >= s->len) ty_throw((tyobj *)ty_aioobe(i, s ? s->len : 0));
+  if (!s || i < 0 || i >= s->len) ty_throw((tyobj *)ty_sioobe(i, s ? s->len : 0));
   return (unsigned char)s->data[i];
 }
 int32_t ty_str_contains(tystr *s, tystr *sub) { return ty_str_indexof(s, sub) >= 0; }
@@ -2266,7 +2276,7 @@ tystr *ty_str_of_chars_part(tyarr *chars, int32_t off, int32_t count) {
   tystr *r;
   int64_t i;
   if (!chars) ty_npe();
-  if (off < 0 || count < 0 || off > chars->len - count) ty_aioobe(off, chars->len);
+  if (off < 0 || count < 0 || off > chars->len - count) ty_sioobe(off, chars->len);
   r = ty_str_new(NULL, count);
   for (i = 0; i < count; i++) r->data[i] = (char)(uint8_t)((uint16_t *)chars->data)[off + i];
   return r;
@@ -2355,12 +2365,12 @@ static void lang_sb_insert_raw(tySB *sb, int64_t at, const char *d, int64_t n) {
   sb->len += n;
 }
 /* Every index check below is Java's: an offset outside 0..length is a
-   StringIndexOutOfBoundsException, which this runtime reports as the
-   IndexOutOfBoundsException it has a class for. */
+   StringIndexOutOfBoundsException -- a buffer's, not an array's, which is why
+   these call ty_sioobe and the array helpers call ty_aioobe. */
 static tySB *sb_checked(void *p, int64_t at, int64_t hi) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (at < 0 || at > hi) ty_aioobe(at, hi);
+  if (at < 0 || at > hi) ty_sioobe(at, hi);
   return sb;
 }
 void *ty_sb_insert_str(void *p, int32_t at, tystr *s) {
@@ -2416,13 +2426,13 @@ void *ty_sb_ensure(void *p, int32_t cap) {
 int32_t ty_sb_charat(void *p, int32_t at) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (at < 0 || at >= sb->len) ty_aioobe(at, sb->len);
+  if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
   return (unsigned char)sb->buf[at];
 }
 void *ty_sb_set_charat(void *p, int32_t at, uint16_t c) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (at < 0 || at >= sb->len) ty_aioobe(at, sb->len);
+  if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
   sb->buf[at] = (char)(uint8_t)c;
   return p;
 }
@@ -2432,8 +2442,8 @@ void *ty_sb_set_charat(void *p, int32_t at, uint16_t c) {
 void *ty_sb_delete(void *p, int32_t from, int32_t to) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (from < 0 || from > sb->len || from > to) ty_aioobe(from, sb->len);
-  if (to > sb->len) ty_aioobe(to, sb->len);
+  if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
+  if (to > sb->len) ty_sioobe(to, sb->len);
   memmove(sb->buf + from, sb->buf + to, (size_t)(sb->len - to));
   sb->len -= to - from;
   return p;
@@ -2441,7 +2451,7 @@ void *ty_sb_delete(void *p, int32_t from, int32_t to) {
 void *ty_sb_delete_charat(void *p, int32_t at) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (at < 0 || at >= sb->len) ty_aioobe(at, sb->len);
+  if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
   memmove(sb->buf + at, sb->buf + at + 1, (size_t)(sb->len - at - 1));
   sb->len--;
   return p;
@@ -2450,8 +2460,8 @@ void *ty_sb_replace(void *p, int32_t from, int32_t to, tystr *s) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (!s) ty_npe();
-  if (from < 0 || from > sb->len || from > to) ty_aioobe(from, sb->len);
-  if (to > sb->len) ty_aioobe(to, sb->len);
+  if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
+  if (to > sb->len) ty_sioobe(to, sb->len);
   ty_sb_delete(p, from, to);
   lang_sb_insert_raw(sb, from, s->data, s->len);
   return p;
@@ -2472,7 +2482,7 @@ void *ty_sb_reverse(void *p) {
 void *ty_sb_set_length(void *p, int32_t n) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (n < 0) ty_aioobe(n, sb->len);
+  if (n < 0) ty_sioobe(n, sb->len);
   if (n > sb->len) {
     lang_sb_ensure(sb, n - sb->len);
     memset(sb->buf + sb->len, 0, (size_t)(n - sb->len));
@@ -2513,13 +2523,13 @@ int32_t ty_sb_lastindexof(void *p, tystr *s) {
 tystr *ty_sb_substring(void *p, int32_t from) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (from < 0 || from > sb->len) ty_aioobe(from, sb->len);
+  if (from < 0 || from > sb->len) ty_sioobe(from, sb->len);
   return ty_str_new(sb->buf + from, sb->len - from);
 }
 tystr *ty_sb_substring_to(void *p, int32_t from, int32_t to) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (from < 0 || to > sb->len || from > to) ty_aioobe(from, sb->len);
+  if (from < 0 || to > sb->len || from > to) ty_sioobe(from, sb->len);
   return ty_str_new(sb->buf + from, to - from);
 }
 

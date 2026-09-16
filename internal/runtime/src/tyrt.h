@@ -193,7 +193,7 @@ void ty_throw(void *e) __attribute__((noreturn));
 void ty_uncaught(void *e) __attribute__((noreturn));
 
 /* Preallocated exception classes (filled by generated code at startup). */
-extern tyclass *TY_NPE, *TY_AIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT,
+extern tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT,
     *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE,
     *TY_ILLMON;
 
@@ -205,6 +205,7 @@ extern tyclass *TY_CNF, *TY_NSFE, *TY_NSME, *TY_ILLACCESS, *TY_INVOCATION,
 
 void *ty_npe(void);
 void *ty_aioobe(int64_t idx, int64_t len);
+void *ty_sioobe(int64_t idx, int64_t len);
 void *ty_arith(const char *msg);
 void *ty_cce(tyclass *from, tyclass *to);
 void *ty_negarr(void);
