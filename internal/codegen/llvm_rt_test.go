@@ -25,6 +25,8 @@ func TestRuntimeProtos(t *testing.T) {
 		{"ty_str_of_float", "ptr", []string{"float"}},
 		{"ty_str_of_obj", "ptr", []string{"ptr"}},
 		{"ty_str_intern", "ptr", []string{"ptr"}},
+		{"ty_d2i", "i32", []string{"double"}},
+		{"ty_d2l", "i64", []string{"double"}},
 		{"ty_div_int", "i32", []string{"i32", "i32"}},
 		{"ty_div_long", "i64", []string{"i64", "i64"}},
 		{"ty_rem_int", "i32", []string{"i32", "i32"}},

@@ -388,6 +388,26 @@ void ty_gc(void);
 void ty_gc_register_static(void *p);
 void ty_free_block(void *payload, size_t total);
 
+/* ---- narrowing a floating-point value to an integer -------------------- */
+
+/* Java's narrowing conversion of a floating-point value to an integral type is
+   not C's: C leaves a value that does not fit undefined, and what a machine
+   does with it is not an answer -- x86-64's cvttsd2si gives 0x80000000, another
+   machine traps, and an optimiser folding a constant expression may give
+   anything at all (the four builds of `(long) 1.0e20` this replaced answered
+   160, 0, -9223372036854775808 and 48). JLS 5.1.3 gives the answer instead:
+   NaN is 0, either infinity is the maximum, a value too large is the maximum,
+   a value too small is the minimum, and anything else is the value truncated
+   toward zero.
+
+   Both back ends call these for a conversion from float or double to an
+   integral type. A conversion to a type narrower than int is this int and then
+   the truncation to that type, which is the two steps JLS 5.1.3 states; the
+   callers do the second step. A float source is widened to double on the way
+   in, which is exact and is the order the conversion is defined in. */
+int32_t ty_d2i(double d);
+int64_t ty_d2l(double d);
+
 /* ---- the heap, as tyrt_thread.c needs to see it ------------------------ */
 
 /* The lock every thread takes to refill its slab and to sweep. It is not the

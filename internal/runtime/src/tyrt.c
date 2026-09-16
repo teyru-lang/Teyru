@@ -781,6 +781,34 @@ void *ty_alloc_slow(size_t total) {
   return obj;
 }
 
+/* ---- narrowing a floating-point value to an integer -------------------- */
+
+/* The two conversions both back ends emit, with the answers JLS 5.1.3 gives.
+   The comparisons are the whole of it: a value at or above the bound is the
+   bound, one at or below the lower bound is that bound, and everything else
+   fits and is truncated toward zero by the cast. NaN has to be tested first
+   because it compares false against both bounds and would otherwise be cast --
+   which is the undefined case this function exists to avoid.
+
+   The bounds are written as the exact powers of two, not as MAX_VALUE: 2^31 and
+   2^63 are exactly representable as doubles while 2147483647 and
+   9223372036854775807 are not, and a rounded bound would clamp one value late.
+   (The largest double below 2^63 is 2^63 - 1024, which still fits in an int64,
+   so nothing between the bound and the largest representable value is lost.) */
+int32_t ty_d2i(double d) {
+  if (d != d) return 0;              /* NaN */
+  if (d >= 2147483648.0) return INT32_MAX;
+  if (d <= -2147483648.0) return INT32_MIN;
+  return (int32_t)d;
+}
+
+int64_t ty_d2l(double d) {
+  if (d != d) return 0;              /* NaN */
+  if (d >= 9223372036854775808.0) return INT64_MAX;
+  if (d <= -9223372036854775808.0) return INT64_MIN;
+  return (int64_t)d;
+}
+
 void ty_gc_init(void) {
   for (int i = 0; i < TY_NCLASS; i++) freelist[i] = NULL;
 }
