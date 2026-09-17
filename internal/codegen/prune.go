@@ -88,6 +88,24 @@ const dispatchPrefix = "->vtable["
 // whether a build compiles internal/runtime/src/tyrt_tls.c and links -lssl.
 const tlsPrefix = "ty_tls_"
 
+// reflectOnly is the comment the emitter writes at the end of a line whose
+// references belong to reflection alone: the startup statements that give a
+// class its member tables (reflect.go's attach, written into main) and the class
+// table Class.forName searches (reflect.go's forNameTable).
+//
+// The two reachability questions this file answers read such a line differently,
+// and that is why the emitter marks it rather than the scan guessing at its
+// shape. The vtable rewrite follows a marked line's references like any other: a
+// reflective Method.invoke dispatches through the receiver's vtable exactly as a
+// call site does (reflect.go's emitInvoker), so the slots those invokers read
+// have to stay filled. The question of whether the program uses TLS does not: a
+// class named only by a member table is a class a reflective call may ask for,
+// not a class the program's own code builds, and a call that does arrive at a
+// TLS method that way is answered by the weak stubs in tyrt_net.c, which name
+// the failure instead of leaving the link to reach for a library the target may
+// not have.
+const reflectOnly = "/* reflection-only */"
+
 // pruneVtables returns src with every vtable slot that no reachable dispatch can
 // read set to NULL, and whether the program can reach a TLS helper.
 //
@@ -102,7 +120,7 @@ func pruneVtables(src string) (string, bool) {
 	if p == nil {
 		return src, true
 	}
-	p.liveSlots()
+	p.live, p.need = p.reach(false)
 	return p.rewrite(), p.reachesTLS()
 }
 
@@ -111,26 +129,29 @@ func pruneVtables(src string) (string, bool) {
 // itself, which is not one of them (main is written without `static`, exactly so
 // that a program may name the runtime's helpers without a procedure in between).
 //
-// This is the same reachability the vtable rewrite above computes, and reading
-// it off the emitted C rather than off the tree is deliberate for the same
-// reason: the C is what the linker sees. A call written in a method nothing can
-// run -- the https branch of a client no program uses -- is not live here, and
-// the bytes it would have taken are not in the program either.
+// Reading it off the emitted C rather than off the tree is deliberate: the C is
+// what the linker sees. A call written in a method nothing can run -- the https
+// branch of a client no program uses -- is not live here, and the bytes it would
+// have taken are not in the program either.
 //
-// One thing it is not is precise about *branches*: a live method's every call is
-// live, taken or not, because a call graph has no notion of which way a test
-// went. The consequence is worth knowing when a program that does not use TLS
-// turns out to be linked against OpenSSL: a program that reaches Class.forName
-// carries the table that names every class of the program
-// (emitSynth's forname_all), and that makes the TLS classes live -- so every
-// client of the reflection API, which includes anything the web framework scans,
-// reaches the TLS layer through them. That is a program that already carries the
-// whole standard library (see AGENTS.md on the 4 MB a reflecting program costs),
-// and it is the same conservative direction as the slot pruning: a layer linked
-// and not called costs bytes, and one called and not linked does not build.
+// What it does *not* follow is the reflection metadata, and that is the whole
+// reason the fixpoint runs a second time: a member table names every method its
+// class declares -- through an invoker whose body calls the method -- so a
+// program that reflects at all, which is anything the web framework scans and
+// anything Gson binds, reaches every TLS method through the metadata without one
+// call site of its own pointing at one. What a member table names is what a
+// *reflective* call may ask for at run time; the question here is what the
+// program's own code reaches, which is what a build may link.
+//
+// The other thing it is not is precise about *branches*: a live method's every
+// call is live, taken or not, because a call graph has no notion of which way a
+// test went. That is the same conservative direction as the slot pruning: a
+// layer linked and not called costs bytes, and one called and not linked does
+// not build.
 func (p *cparse) reachesTLS() bool {
+	live, _ := p.reach(true)
 	for i, d := range p.defs {
-		if !p.live[i] || !d.fn {
+		if !live[i] || !d.fn {
 			continue
 		}
 		for k := d.start; k <= d.end; k++ {
@@ -156,6 +177,11 @@ type cdef struct {
 	end   int // last line, inclusive
 	// refs are the definitions this one names, by index into the parse's defs.
 	refs map[int]bool
+	// refl is the subset of refs written on a line the emitter marked
+	// reflectOnly: the metadata attachments and the class table Class.forName
+	// searches. They are references to the vtable rewrite and not to the TLS
+	// question -- see reflectOnly.
+	refl map[int]bool
 	// slots are the dispatches this definition makes: the slot index read, and
 	// the class the call was compiled against, whose subclasses can be its
 	// receiver. Only a function has them.
@@ -185,8 +211,10 @@ type cparse struct {
 	// question about the entry point itself -- does main name a TLS helper --
 	// has to be asked of.
 	rootStart, rootEnd int
-	// live marks the definitions the fixpoint reached, and need the dispatches a
-	// reached method makes.
+	// live marks the definitions the fixpoint reached and need the dispatches a
+	// reached method makes. reach fills both and pruneVtables stores that answer,
+	// which is the one the vtable rewrite uses; reachesTLS asks for its own,
+	// because the two questions are not the same one (see reachesTLS).
 	live []bool
 	need map[slotKey]bool
 	// bases is each class's transitive supertypes, by mangled name, read out of
@@ -230,7 +258,7 @@ func parseC(src string) *cparse {
 			continue
 		}
 		d := &cdef{name: name, fn: sep == '(', start: i, end: i,
-			refs: map[int]bool{}, slots: map[slotKey]bool{}}
+			refs: map[int]bool{}, refl: map[int]bool{}, slots: map[slotKey]bool{}}
 		end, ok := defEnd(lines, i, d.fn)
 		if !ok {
 			return nil // a body or a table that does not end: not this shape
@@ -261,13 +289,11 @@ func parseC(src string) *cparse {
 			}
 		}
 	}
-	p.roots = &cdef{name: "int main", refs: map[int]bool{}, slots: map[slotKey]bool{}}
+	p.roots = &cdef{name: "int main", refs: map[int]bool{}, refl: map[int]bool{}, slots: map[slotKey]bool{}}
 	p.rootStart, p.rootEnd = mainAt, len(lines)-1
 	for k := mainAt; k < len(lines); k++ {
 		p.scanLine(lines[k], p.roots)
 	}
-	p.live = make([]bool, len(p.defs))
-	p.need = map[slotKey]bool{}
 	return p
 }
 
@@ -477,6 +503,12 @@ func entriesOf(body string) ([]string, []string) {
 // scanLine records what one line of a definition names: the definitions it
 // mentions, and the slot indices it dispatches through.
 func (p *cparse) scanLine(line string, d *cdef) {
+	// A line the emitter marked names what reflection alone reaches: its
+	// references are recorded in refl as well as in refs, so that each of the
+	// two reachability questions can read the line the way it needs to (see
+	// reflectOnly). Dispatches are recorded either way: the marked lines hold
+	// none, and one that did would name a slot the program can read.
+	only := strings.Contains(line, reflectOnly)
 	for i := 0; i < len(line); {
 		if line[i] == '-' && strings.HasPrefix(line[i:], dispatchPrefix) {
 			if n, ok := scanInt(line, i+len(dispatchPrefix), ']'); ok {
@@ -493,6 +525,9 @@ func (p *cparse) scanLine(line string, d *cdef) {
 		}
 		if idx, ok := p.index[line[start:i]]; ok && p.defs[idx] != d {
 			d.refs[idx] = true
+			if only {
+				d.refl[idx] = true
+			}
 		}
 	}
 }
@@ -542,41 +577,57 @@ func scanInt(line string, i int, close byte) (int, bool) {
 	return n, true
 }
 
-// liveSlots runs the fixpoint: it marks the definitions the program can reach in
-// p.live and records the dispatches they make in p.need.
-func (p *cparse) liveSlots() {
+// reach runs the fixpoint: it marks the definitions the program can reach and
+// records the dispatches they make.
+//
+// skipReflection is the one thing the two callers disagree about. Unset, the
+// fixpoint follows every reference, which is what the vtable rewrite needs: a
+// reflective Method.invoke arrives at an invoker through a member table and
+// dispatches through the receiver's vtable from there, so the slot it reads has
+// to stay filled. Set, the references written on a reflectOnly line are not
+// followed, which answers the other question -- what the program's own code
+// reaches. They are two traversals and not one because the same
+// over-approximation cannot be right for both: a TLS layer that is linked and
+// never called costs bytes, one that is called and not linked is a named
+// failure at run time (the weak stubs in tyrt_net.c), and a vtable slot that is
+// read and not filled is a jump to NULL.
+func (p *cparse) reach(skipReflection bool) ([]bool, map[slotKey]bool) {
+	live := make([]bool, len(p.defs))
+	need := map[slotKey]bool{}
 	queue := make([]int, 0, len(p.defs))
 	enqueue := func(i int) {
-		if !p.live[i] {
-			p.live[i] = true
+		if !live[i] {
+			live[i] = true
 			queue = append(queue, i)
 		}
 	}
-	for i := range p.roots.refs {
-		enqueue(i)
+	// follow records what one reached definition does: the dispatches it makes,
+	// and the definitions it names.
+	follow := func(d *cdef) {
+		for k := range d.slots {
+			need[k] = true
+		}
+		// A vtable's entries are not references. They are the slots a live
+		// dispatch asks for, and the class loop below is what decides which of
+		// them are adopted; following them here would put every method the class
+		// declares back into the live set, which is the whole thing this pass
+		// exists to avoid.
+		if strings.HasPrefix(d.name, "vt_") {
+			return
+		}
+		for n := range d.refs {
+			if skipReflection && d.refl[n] {
+				continue
+			}
+			enqueue(n)
+		}
 	}
-	for k := range p.roots.slots {
-		p.need[k] = true
-	}
+	follow(p.roots)
 	for {
 		for len(queue) > 0 {
 			i := queue[len(queue)-1]
 			queue = queue[:len(queue)-1]
-			d := p.defs[i]
-			for k := range d.slots {
-				p.need[k] = true
-			}
-			// A vtable's entries are not references. They are the slots a live
-			// dispatch asks for, and the class loop below is what decides which
-			// of them are adopted; following them here would put every method
-			// the class declares back into the live set, which is the whole
-			// thing this pass exists to avoid.
-			if strings.HasPrefix(d.name, "vt_") {
-				continue
-			}
-			for n := range d.refs {
-				enqueue(n)
-			}
+			follow(p.defs[i])
 		}
 		// A live class answers the object protocol and every slot a live dispatch
 		// of one of its supertypes asks for, and each answer is a method that is
@@ -584,7 +635,7 @@ func (p *cparse) liveSlots() {
 		// changed.
 		grew := false
 		for i, d := range p.defs {
-			if !p.live[i] || !strings.HasPrefix(d.name, "cls_") {
+			if !live[i] || !strings.HasPrefix(d.name, "cls_") {
 				continue
 			}
 			vt, ok := p.index["vt_"+d.name[len("cls_"):]]
@@ -592,17 +643,17 @@ func (p *cparse) liveSlots() {
 				continue
 			}
 			for n, target := range p.defs[vt].targets {
-				if !p.answers(d.name[len("cls_"):], n) {
+				if !p.answers(d.name[len("cls_"):], n, need) {
 					continue
 				}
-				if idx, ok := p.index[target]; ok && !p.live[idx] {
+				if idx, ok := p.index[target]; ok && !live[idx] {
 					enqueue(idx)
 					grew = true
 				}
 			}
 		}
 		if !grew && len(queue) == 0 {
-			return
+			return live, need
 		}
 	}
 }
@@ -610,11 +661,11 @@ func (p *cparse) liveSlots() {
 // answers reports whether class x fills slot idx: slots 0, 1 and 2 because the
 // runtime calls those on whatever object it is handed, and any other slot because
 // a live dispatch asks for that index on a class x inherits from.
-func (p *cparse) answers(x string, idx int) bool {
+func (p *cparse) answers(x string, idx int, need map[slotKey]bool) bool {
 	if idx < objectProtocolSlots {
 		return true
 	}
-	for k := range p.need {
+	for k := range need {
 		if k.idx == idx && p.isSub(x, k.owner) {
 			return true
 		}
@@ -651,7 +702,7 @@ func (p *cparse) rewrite() string {
 		kept := make([]string, len(d.entries))
 		dropped := false
 		for n := range d.entries {
-			if p.answers(d.name[len("vt_"):], n) {
+			if p.answers(d.name[len("vt_"):], n, p.need) {
 				kept[n] = d.entries[n]
 				continue
 			}

@@ -537,16 +537,26 @@ func (e *Emitter) forNameTable() (string, int) {
 		return "NULL", 0
 	}
 	name := "forname_all"
-	fmt.Fprintf(e.code, "static tyclass* %s[%d] = {%s};\n", name, len(names), strings.Join(names, ", "))
+	// The table is marked reflectOnly for the same reason an attachment is: it
+	// names every class of the program, and it does so for the reflective call
+	// that has not happened yet, not because the program's own code names them.
+	fmt.Fprintf(e.code, "static tyclass* %s[%d] = {%s}; %s\n",
+		name, len(names), strings.Join(names, ", "), reflectOnly)
 	return name, len(names)
 }
 
 // attach records the assignment that hands a class its table at startup. The
 // class object itself is written with a null table, because whether the table
 // ships is not known until the program's call sites have been emitted.
+//
+// The line is marked reflectOnly: it is the one place a class is named because
+// reflection may ask for it, and what it names -- the class, and the member
+// table that names every method's invoker -- is what a *reflective* call can
+// reach rather than what the program's own code calls. codegen/prune.go reads
+// the mark when it decides whether the program uses TLS.
 func (e *Emitter) attach(cl *ast.Class, field, table, elem string, n int, count string) {
-	e.metaInit = append(e.metaInit, fmt.Sprintf("cls_%s.%s = (%s*)%s; cls_%s.%s = %d;",
-		mangle(cl.Full), field, elem, table, mangle(cl.Full), count, n))
+	e.metaInit = append(e.metaInit, fmt.Sprintf("cls_%s.%s = (%s*)%s; cls_%s.%s = %d; %s",
+		mangle(cl.Full), field, elem, table, mangle(cl.Full), count, n, reflectOnly))
 }
 
 // reflectMethodCount is how many entries a class's method table holds: every

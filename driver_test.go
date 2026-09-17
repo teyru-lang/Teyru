@@ -88,8 +88,27 @@ func check(t *testing.T, known map[string]knownFailure, name string, run func() 
 	}
 }
 
-// skips reports whether tests/<dir>/<name>.skip says the case cannot run on
-// this platform, and the reason written beside the tokens.
+// target is the platform this run builds for: TEYRU_TARGET when it is set, and
+// this machine's platform otherwise. It is the same variable teyru-lang/tests'
+// run.sh reads (see tests/README.md), down to the spelling, because a cross run
+// that means one thing here and another there is worse than no cross run at all.
+//
+// A cross run is only meaningful where the built programs can actually run
+// (qemu for linux/arm64, wine for windows/amd64): the suite runs what it built,
+// and a platform that cannot run a program the compiler built for it has to skip
+// that case -- which is what skips below is for.
+func target() (goos, goarch string) {
+	if t := os.Getenv("TEYRU_TARGET"); t != "" {
+		if i := strings.IndexByte(t, '/'); i > 0 {
+			return t[:i], t[i+1:]
+		}
+		return t, runtime.GOARCH
+	}
+	return runtime.GOOS, runtime.GOARCH
+}
+
+// skips reports whether tests/<dir>/<name>.skip says the case cannot run on the
+// platform this run is for, and the reason written beside the tokens.
 //
 // A token is a goos (`windows`), a goos/goarch pair (`darwin/arm64`), or one of
 // those prefixed with `!`, which names the one platform the case *can* run on.
@@ -111,11 +130,12 @@ func skips(t *testing.T, dir, name string) (bool, string) {
 		}
 		tokens = append(tokens, strings.Fields(line)...)
 	}
-	here := runtime.GOOS + "/" + runtime.GOARCH
+	osname, arch := target()
+	here := osname + "/" + arch
 	for _, token := range tokens {
 		neg := strings.HasPrefix(token, "!")
 		token = strings.TrimPrefix(token, "!")
-		if (token == runtime.GOOS || token == here) != neg {
+		if (token == osname || token == here) != neg {
 			return true, strings.Join(reasons, "; ")
 		}
 	}
@@ -215,7 +235,7 @@ func runProgramCase(work, dir, name, file string) error {
 		return fmt.Errorf("missing expectation file: %v", err)
 	}
 	res, err := driver.Compile([]string{filepath.Join(dir, file)},
-		driver.Options{Out: filepath.Join(work, name), Opt: "-O1"})
+		driver.Options{Out: filepath.Join(work, name), Opt: "-O1", Target: os.Getenv("TEYRU_TARGET")})
 	if err != nil {
 		return fmt.Errorf("compile failed: %v\n%s", err, res.Diags)
 	}
@@ -275,7 +295,7 @@ func TestPackages(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				work := t.TempDir()
 				check(t, known, name, func() error {
-					res, err := driver.Compile([]string{dir}, driver.Options{Out: filepath.Join(work, name), Opt: "-O0"})
+					res, err := driver.Compile([]string{dir}, driver.Options{Out: filepath.Join(work, name), Opt: "-O0", Target: os.Getenv("TEYRU_TARGET")})
 					if err == nil {
 						return fmt.Errorf("expected a compile failure")
 					}
@@ -302,7 +322,7 @@ func runPackageCase(work, dir, name string) error {
 	if err != nil {
 		return fmt.Errorf("missing expectation file: %v", err)
 	}
-	res, err := driver.Compile([]string{dir}, driver.Options{Out: filepath.Join(work, name), Opt: "-O1"})
+	res, err := driver.Compile([]string{dir}, driver.Options{Out: filepath.Join(work, name), Opt: "-O1", Target: os.Getenv("TEYRU_TARGET")})
 	if err != nil {
 		return fmt.Errorf("compile failed: %v\n%s", err, res.Diags)
 	}
@@ -351,7 +371,7 @@ func TestDiagnostics(t *testing.T) {
 			work := t.TempDir()
 			check(t, known, name, func() error {
 				res, err := driver.Compile([]string{filepath.Join(dir, e.Name())},
-					driver.Options{Out: filepath.Join(work, "out"), Opt: "-O0"})
+					driver.Options{Out: filepath.Join(work, "out"), Opt: "-O0", Target: os.Getenv("TEYRU_TARGET")})
 				if err == nil {
 					return fmt.Errorf("expected failure")
 				}
@@ -402,7 +422,7 @@ func TestNative(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "native")
 	header := filepath.Join(dir, "native.h")
-	res, err := driver.Compile([]string{"tests/native/program.teyru"}, driver.Options{
+	res, err := driver.Compile([]string{"tests/native/program.teyru"}, driver.Options{Target: os.Getenv("TEYRU_TARGET"),
 		Out:          out,
 		Opt:          "-O1",
 		Native:       []string{"tests/native/impl.c"},
