@@ -87,7 +87,20 @@ func (p *printer) imported(fqn string) string {
 // records the import it needs. A dotted name is left alone: a java.* path and a
 // nested type are both valid Java as written.
 func (p *printer) name(pos source.Pos, s string) string {
-	if s == "" || strings.ContainsRune(s, '.') {
+	if s == "" {
+		return s
+	}
+	if i := strings.IndexByte(s, '.'); i > 0 {
+		/* A nested type: Map.Entry. The dotted spelling is valid Java only when
+		   the outer class is imported, and leaving it alone without that import
+		   is what made a printed program say "package Map does not exist" --
+		   javac reads Map as a package when nothing has named the class. So the
+		   outer class is what gets the import; a name already written with its
+		   own package (java.util.Map.Entry) maps to nothing here and is left
+		   alone, which is right, because it needs no import. */
+		if fqn, ok := util.JavaClassOf(s[:i]); ok {
+			p.imported(fqn)
+		}
 		return s
 	}
 	if reason, ok := refuseStdlib[s]; ok {
