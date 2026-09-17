@@ -211,7 +211,7 @@ var nativeNetTable = registerNativeNet(map[string]nativeFn{
 		fn:    "ty_file_list",
 		proto: "tyarr *ty_file_list(tystr *, tyarr *)",
 	},
-	"Fs.readBytes0(String,AB)": {
+	"Fs.readBytes0(String,AI)": {
 		fn:    "ty_file_read_bytes",
 		proto: "tyarr *ty_file_read_bytes(tystr *, tyarr *)",
 	},
