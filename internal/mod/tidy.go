@@ -205,7 +205,7 @@ func ModuleImports(m *Module) ([]string, error) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(name, SourceExt) {
+		if !IsSource(name) {
 			return nil
 		}
 		data, err := os.ReadFile(p)

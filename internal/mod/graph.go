@@ -14,6 +14,19 @@ import (
 // files of a package.
 const SourceExt = ".teyru"
 
+// JavaExt is the extension Java sources are written with. A `.java` file is a
+// source this compiler reads unchanged: the statement terminator is optional
+// (decision D6), so the same program is a Teyru program, and a build that names
+// a `.java` file or a directory holding one compiles it. `tests/java-compat/`
+// is the corpus that holds the claim to what compiles; nothing about the two
+// extensions differs once the file is read.
+const JavaExt = ".java"
+
+// IsSource reports whether a file name is a source file of this compiler.
+func IsSource(name string) bool {
+	return strings.HasSuffix(name, SourceExt) || strings.HasSuffix(name, JavaExt)
+}
+
 // Module is the module a build starts from: the directory holding teyru.mod
 // and what that file says.
 type Module struct {
@@ -539,7 +552,7 @@ func PackageFiles(dir string) ([]string, error) {
 	}
 	out := []string{}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), SourceExt) {
+		if e.IsDir() || !IsSource(e.Name()) {
 			continue
 		}
 		out = append(out, filepath.Join(dir, e.Name()))
