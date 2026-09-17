@@ -2,19 +2,29 @@ name: release
 
 # The only workflow in this repository.
 #
-# GitHub Actions is switched off for the project, so every check a CI would run
-# lives in this repository as a make target or a script instead -- `make ci`,
-# `make jdk-diff`, `make notices`, `tests/run.sh` -- and this workflow is the
-# one place they are called automatically, when a release is published: the
-# released tag is built, the whole suite is run against it, and the binaries are
-# attached to the release.
+# Every check a CI would run lives in this repository as a make target or a
+# script -- `make ci`, `make jdk-diff`, `make notices`, `tests/run.sh` -- and
+# this workflow is the one place they are called automatically: when a release is
+# published, the released tag is built, the whole suite is run against it, and the
+# binaries are attached to the release.
 #
 # Nothing here runs on a push or a pull request, and nothing else belongs in
-# .github/workflows.
+# .github/workflows. It can also be started by hand, which is what to do when a
+# run fails part way through: the steps after the failure are skipped, so without
+# a manual start the release would keep whatever the failure left it with -- the
+# first run of this workflow failed in `make ci` and skipped the two steps that
+# attach the binaries, and re-running it by hand is cheaper than cutting a tag
+# only to retry the same commit.
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: the tag to build, test and attach the binaries to
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -23,11 +33,15 @@ jobs:
   release:
     name: build, test and publish the released tag
     runs-on: ubuntu-24.04
+    env:
+      # Both ways in name the tag: a published release in the event payload, and a
+      # manual start in the input. Every step below reads this and nothing else.
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
     steps:
       - name: check out the released tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.TAG }}
           # tests/ is the teyru-lang/tests submodule and the suite is its data
           submodules: recursive
 
@@ -68,7 +82,7 @@ jobs:
 
       - name: build the release binaries
         run: |
-          tag="${{ github.event.release.tag_name }}"
+          tag="$TAG"
           # The binaries carry the tag they were built from, so `teyru version`
           # on a downloaded binary answers with the release rather than with
           # whatever the tree's default happens to be.
@@ -90,4 +104,4 @@ jobs:
       - name: attach the binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+        run: gh release upload "$TAG" dist/* --clobber
