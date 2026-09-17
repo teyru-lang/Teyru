@@ -91,7 +91,7 @@ ci: lint
 # same cases again through `go test`, as TestJavaCompat), and it needs no JDK:
 # the expectations are committed beside the programs.
 java-compat: build submodule
-	TEYRU=./$(BIN) sh tests/run.sh java-compat
+	TEYRU=$(abspath $(BIN)) sh tests/run.sh java-compat
 
 ## jdk-diff: compile every translatable program with the JDK and compare
 #
@@ -104,7 +104,7 @@ jdk-diff:
 	@test -n "$$TEYRU_JDK" || { \
 	  echo "jdk-diff: set TEYRU_JDK to a JDK 21 home:"; \
 	  echo "          TEYRU_JDK=/opt/jdk21/jdk-21.0.11+10 make jdk-diff"; exit 2; }
-	$(GO) test -run TestJDKDiff -count=1 -v .
+	$(GO) test -run TestJDKDiff -count=1 -v -timeout 45m .
 
 ## progen: the random-program differential, 200 seeds
 #
