@@ -2094,7 +2094,28 @@ func (ctx *methodCtx) checkAssign(v *ast.Assign) {
 		v.SetType(xt)
 		return
 	}
-	if xp == nil || yp == nil || ast.IsError(xt) || ast.IsError(yt) {
+	if ast.IsError(xt) || ast.IsError(yt) {
+		// a type the expression checker already reported on
+		v.SetType(ast.ErrorType{})
+		return
+	}
+	if xp == nil || yp == nil {
+		// The operation needs both operands' values, and one of them has none
+		// to give: a reference type that is not one of the eight wrappers has
+		// no unboxing conversion (JLS 5.1.8), so `Number n; n += 1` is not a
+		// Java program -- javac says "bad operand types for binary operator
+		// '+='". Teyru used to record an error type in silence and let the back
+		// ends combine two references: the C back end emitted `(*p) += 1` on a
+		// `C_teyru_Number **`, which is pointer arithmetic on the box and
+		// compiled -- `i += t` for `T extends Integer` answered 2015836448
+		// where the JDK answers 3 -- and the LLVM back end emitted a module that
+		// does not verify.
+		//
+		// The one target this refuses that javac accepts is a type variable
+		// with a wrapper bound, because javac unboxes through the bound: this
+		// checker has no unboxing through a type variable, so a named refusal
+		// is the honest answer until it does.
+		ctx.errf(v.Pos, "TY-TYP-0064", "operator '%s' cannot be applied to %s and %s", v.Op, xt, yt)
 		v.SetType(ast.ErrorType{})
 		return
 	}
