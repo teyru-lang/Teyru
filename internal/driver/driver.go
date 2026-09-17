@@ -85,8 +85,10 @@ type Result struct {
 // Compile turns Teyru sources into a native executable.
 func Compile(paths []string, opts Options) (*Result, error) {
 	// The target is resolved first so that "no compiler for that platform" is
-	// said before a single file is read, let alone a program compiled.
-	tgt, err := resolveTarget(opts.Target)
+	// said before a single file is read, let alone a program compiled. opts.CC
+	// goes with it: a target this table names no compiler for is built with the
+	// one the caller named, which is the only way to build for it at all.
+	tgt, err := resolveTarget(opts.Target, opts.CC)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +337,7 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 	res := &Result{Diags: diags}
 	// The target decides which half of the runtime is compiled beside the module
 	// and what the output is called, exactly as it does for the C back end.
-	tgt, err := resolveTarget(opts.Target)
+	tgt, err := resolveTarget(opts.Target, opts.CC)
 	if err != nil {
 		return nil, err
 	}
@@ -923,7 +925,16 @@ func platTextFor(goos string) string {
 // resolveTarget turns a --target into the target a build uses. An empty name is
 // the host. An unknown name, or one whose compiler is not installed, is an
 // error: a build must not quietly produce a program for somewhere else.
-func resolveTarget(name string) (*target, error) {
+//
+// cc is the C compiler the caller named with --cc, and it is what a target this
+// table names no compiler for is built with. The Apple rows are the ones with
+// none -- there is no cross compiler for macOS that a table could name, so the
+// only thing that can build for them is a compiler that runs here and targets
+// them, which is what --cc hands the build (zig cc -target <arch>-macos, behind
+// a wrapper, is the one that has been measured). A --cc names the build's
+// compiler for every target for the same reason: the target says which platform
+// the program is for, and --cc says what turns it into one.
+func resolveTarget(name, cc string) (*target, error) {
 	if name == "" || name == runtime.GOOS+"/"+runtime.GOARCH {
 		return hostTarget(), nil
 	}
@@ -936,12 +947,21 @@ func resolveTarget(name string) (*target, error) {
 		sort.Strings(names)
 		return nil, fmt.Errorf("unknown target %q: known targets are %s", name, strings.Join(names, ", "))
 	}
-	if t.cc == "" {
-		return nil, fmt.Errorf("no C compiler for %s on a %s host: building for it needs a compiler that runs here and targets it",
+	// The compiler the build will actually run: the one the caller named, or
+	// the target's own. Checking the one that will be used is the point of the
+	// check -- a target whose compiler is missing is refused here whether the
+	// table names it or the caller does, and a target that names none is
+	// refused only when the caller named none either.
+	want := t.cc
+	if cc != "" {
+		want = cc
+	}
+	if want == "" {
+		return nil, fmt.Errorf("no C compiler for %s on a %s host: building for it needs a compiler that runs here and targets it, and neither this table nor --cc names one",
 			name, runtime.GOOS+"/"+runtime.GOARCH)
 	}
-	if _, err := exec.LookPath(t.cc); err != nil {
-		return nil, fmt.Errorf("no C compiler for %s: %s is not on PATH", name, t.cc)
+	if _, err := exec.LookPath(want); err != nil {
+		return nil, fmt.Errorf("no C compiler for %s: %s is not on PATH", name, want)
 	}
 	return t, nil
 }
