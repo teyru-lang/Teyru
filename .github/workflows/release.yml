@@ -63,12 +63,21 @@ jobs:
         run: make build
 
       - name: the checks a CI job would run (format, vet, the suite under clang and gcc)
+        env:
+          # `make ci` runs the JDK differential only when TEYRU_JDK names a JDK
+          # home, and prints a line saying it did not run when it does not. The
+          # JDK set up above lands in JAVA_HOME, so hand it over here: without
+          # this the differential is skipped inside `ci` and then fails at the
+          # step below, which is how the first run of this workflow went.
+          TEYRU_JDK: ${{ env.JAVA_HOME }}
         run: make ci
 
       - name: the unmodified-Java corpus (tests/java-compat)
         run: make java-compat
 
       - name: the JDK differential
+        env:
+          TEYRU_JDK: ${{ env.JAVA_HOME }}
         run: make jdk-diff
 
       - name: the back-end matrix (every program under both back ends, -O0 and -O2, clang and gcc)
