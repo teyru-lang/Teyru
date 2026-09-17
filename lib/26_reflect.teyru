@@ -24,10 +24,13 @@ package teyru
 // table to read, and the index in it. It allocates once and holds no copy of
 // the metadata, so a Field taken now still reads the live field.
 //
-// Names are this language's: Class.getName answers "teyru.String" where javac
-// answers "java.lang.String", for the reason teyru.Throwable.toString already
-// gives -- the class really is teyru.String. Class.forName accepts both, so a
-// program that loads a class by Java's name still finds it.
+// Names are the JDK's: Class.getName answers "java.lang.String" for the string
+// class and "java.util.Map$Entry" for a nested one, because decision D8 of the
+// fix plan is that a class of the standard library reports the JDK class it
+// stands in for. A class a program declares itself is reported under its own
+// name. Class.forName still accepts both spellings for a library class -- the
+// JDK's name and teyru.String -- because a class is looked up by the binary
+// name it really has, which is the name the class table holds.
 
 // ---- the exceptions ------------------------------------------------------
 

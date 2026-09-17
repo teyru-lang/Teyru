@@ -1012,7 +1012,7 @@ void *ty_arith(const char *msg) {
 }
 void *ty_cce(tyclass *from, tyclass *to) {
   char buf[256];
-  snprintf(buf, sizeof buf, "class %s cannot be cast to class %s", from ? from->name : "?", to ? to->name : "?");
+  snprintf(buf, sizeof buf, "class %s cannot be cast to class %s", ty_class_jname(from), ty_class_jname(to));
   ty_throw(ty_make_ex(TY_CCE, buf));
   return NULL;
 }
@@ -1483,7 +1483,7 @@ tystr *ty_str_of_float(float v) {
 tystr *ty_object_tostring(void *o) {
   if (!o) return ty_str_intern("null");
   char buf[128];
-  int n = snprintf(buf, sizeof buf, "%s@%llx", ((tyobj *)o)->cls->name, (unsigned long long)(uintptr_t)o);
+  int n = snprintf(buf, sizeof buf, "%s@%llx", ty_class_jname(((tyobj *)o)->cls), (unsigned long long)(uintptr_t)o);
   return ty_str_new(buf, n);
 }
 
@@ -3448,33 +3448,19 @@ static void move_number(fmtbuf *body, fmtbuf *t, const fmtflags *f) {
 
 static const char *arg_class(void *o) {
   if (!o) return "null";
-  return ((tyobj *)o)->cls->name;
-}
-static int arg_is_javalang(void *o) {
-  int i;
-  if (!o) return 0;
-  if (((tyobj *)o)->cls == TY_STRING) return 1;
-  for (i = 1; i <= 8; i++)
-    if (((tyobj *)o)->cls == TY_BOX[i]) return 1;
-  return 0;
+  return ty_class_jname(((tyobj *)o)->cls);
 }
 
 /* Java refuses an argument a conversion has no meaning for, and names the class
-   it got instead: "d != java.lang.Character". The exception is
-   IllegalFormatConversionException, which the runtime cannot raise, so its
-   message travels on IllegalArgumentException. */
+   it got instead: "d != java.lang.Character", and "d != java.util.ArrayList"
+   for one of its own containers. ty_class_jname is what makes both of those the
+   JDK's spelling -- this used to strip the package and put "java.lang." back on
+   by hand, which named String and the wrappers right and everything else after
+   this runtime. The exception is IllegalFormatConversionException, which the
+   runtime cannot raise, so its message travels on IllegalArgumentException. */
 static void bad_arg(char conv, void *o) {
   char msg[160];
-  const char *name = arg_class(o);
-  if (arg_is_javalang(o)) {
-    /* Java names its own classes by their binary name; here the class carries
-       this runtime's package, so the simple name is what is left of it */
-    const char *dot = strrchr(name, '.');
-    if (dot) name = dot + 1;
-    snprintf(msg, sizeof msg, "%c != java.lang.%s", conv, name);
-  } else {
-    snprintf(msg, sizeof msg, "%c != %s", conv, name);
-  }
+  snprintf(msg, sizeof msg, "%c != %s", conv, arg_class(o));
   fmt_abandon();
   ty_throw(ty_illarg(msg));
 }
