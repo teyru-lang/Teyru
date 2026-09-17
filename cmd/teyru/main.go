@@ -46,7 +46,10 @@ flags:
                 darwin/arm64. A target other than this machine's needs the
                 cross compiler for it on PATH (windows/amd64:
                 x86_64-w64-mingw32-gcc), and appends its output suffix.
-  -O0..-O3      optimisation level (default -O2)
+  -O0..-O3      optimisation level (default -O2; -O0 for run). At -O0 and
+                -O1 the standard library is compiled once into the user cache
+                and linked, instead of the whole program being optimised as
+                one; -O2 and above keep the whole-program build
   --llvm-ir <p> write the LLVM IR module to <p> (the backend is clang/LLVM)
   --backend <b> c (default) or llvm: which back end compiles the program.
                 The llvm back end emits the program's own LLVM module and
@@ -208,6 +211,15 @@ func run() int {
 	files = paths
 
 	if cmd == "run" {
+		// `run` builds to execute now, so it builds the way a build whose
+		// compile time is what matters does: -O0, which compiles the standard
+		// library once and links the object rather than putting the whole
+		// program through link-time optimisation (internal/driver's
+		// compileSplit). -O2 and above keep the whole-program build, and
+		// `teyru run -O2 prog.teyru` asks for that one explicitly.
+		if opts.Opt == "" {
+			opts.Opt = "-O0"
+		}
 		dir, err := os.MkdirTemp("", "teyru-build-")
 		if err != nil {
 			fail(err)

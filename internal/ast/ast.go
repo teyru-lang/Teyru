@@ -792,6 +792,20 @@ type Class struct {
 // IsInterface reports whether c is an interface.
 func (c *Class) IsInterface() bool { return c.Kind == KindInterface || c.Kind == KindAnnotation }
 
+// Prelude reports whether c is part of the standard library rather than part of
+// the program being compiled. The standard library is the files the compiler
+// ships under lib/, which the driver parses under the path "<lib>/<name>"; the
+// classes the compiler synthesizes for them -- a lambda in a library body, an
+// anonymous class -- carry the same file, and the array class carries none and
+// so belongs to the program's unit, which is where the entry point names it.
+//
+// The distinction is what a split build is built on: the standard library's own
+// translation unit must be the same bytes for every program, and this is the
+// line between what is the library's and what is the program's.
+func (c *Class) Prelude() bool {
+	return c != nil && c.File != nil && c.File.Src != nil && strings.HasPrefix(c.File.Src.Path, "<lib>")
+}
+
 // TypeVar is a generic type parameter symbol.
 type TypeVar struct {
 	Name  string
