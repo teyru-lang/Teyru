@@ -54,10 +54,27 @@ final class Byte extends Number implements Comparable<Byte> {
      the runtime owned the payload, and `valueOf` is the one factory. */
   private byte value
 
+  /* Java caches every byte, so `Byte.valueOf` answers the same object for all
+     256 values and `Byte a = 1; Byte b = 1; a == b` is true (JLS 5.1.7 requires
+     the cache for -128..127 and the JDK's ByteCache covers the whole range).
+     The array is built by a method rather than written out because the values
+     are the index minus 128, and the method is declared before the field
+     because a class's members are read top to bottom here. `new Byte()` and not
+     `valueOf` inside it: the cache cannot be filled by the factory that reads
+     it. */
+  private static Byte[] fillCache() {
+    Byte[] c = new Byte[256]
+    for (int i = 0 : i < 256 : i++) {
+      Byte b = new Byte()
+      b.value = (byte) (i - 128)
+      c[i] = b
+    }
+    return c
+  }
+  private static final Byte[] CACHE = fillCache()
+
   public static Byte valueOf(byte v) {
-    Byte b = new Byte()
-    b.value = v
-    return b
+    return CACHE[v + 128]
   }
   public static Byte valueOf(String s) {
     return valueOf(parseByte(s))
@@ -147,7 +164,23 @@ final class Short extends Number implements Comparable<Short> {
      the runtime owned the payload, and `valueOf` is the one factory. */
   private short value
 
+  /* Java's cache for Short, the same -128..127 range Integer and Long use, so
+     `Short a = 127; Short b = 127; a == b` is true and 128 is a fresh box. */
+  private static Short[] fillCache() {
+    Short[] c = new Short[256]
+    for (int i = 0 : i < 256 : i++) {
+      Short b = new Short()
+      b.value = (short) (i - 128)
+      c[i] = b
+    }
+    return c
+  }
+  private static final Short[] CACHE = fillCache()
+
   public static Short valueOf(short v) {
+    if (v >= -128 && v <= 127) {
+      return CACHE[v + 128]
+    }
     Short b = new Short()
     b.value = v
     return b
@@ -255,7 +288,27 @@ final class Integer extends Number implements Comparable<Integer> {
   private static native boolean parsable(String s, int radix)
   private static native int parseIntDigits(String s, int radix)
 
+  /* Java's Integer cache. It is what makes `Integer.valueOf(127) ==
+     Integer.valueOf(127)` true, and, because the compiler emits a call to this
+     method for every autoboxing site, what makes `Integer a = 127; Integer b =
+     127; a == b` true as well -- the identity is observable, so the box cannot
+     be a fresh allocation and the language says so. 128 and above are two
+     different objects, which the same test asserts. */
+  private static Integer[] fillCache() {
+    Integer[] c = new Integer[256]
+    for (int i = 0 : i < 256 : i++) {
+      Integer b = new Integer()
+      b.value = i - 128
+      c[i] = b
+    }
+    return c
+  }
+  private static final Integer[] CACHE = fillCache()
+
   public static Integer valueOf(int v) {
+    if (v >= -128 && v <= 127) {
+      return CACHE[v + 128]
+    }
     Integer b = new Integer()
     b.value = v
     return b
@@ -382,7 +435,22 @@ final class Long extends Number implements Comparable<Long> {
   private static native boolean parsableLong(String s, int radix)
   private static native long parseLongDigits(String s, int radix)
 
+  /* Java's Long cache, the same range and the same reason as Integer's. */
+  private static Long[] fillCache() {
+    Long[] c = new Long[256]
+    for (int i = 0 : i < 256 : i++) {
+      Long b = new Long()
+      b.value = i - 128
+      c[i] = b
+    }
+    return c
+  }
+  private static final Long[] CACHE = fillCache()
+
   public static Long valueOf(long v) {
+    if (v >= -128 && v <= 127) {
+      return CACHE[(int) v + 128]
+    }
     Long b = new Long()
     b.value = v
     return b
@@ -708,10 +776,28 @@ final class Character extends Object implements Comparable<Character> {
   private char value
 
   public static Character valueOf(char c) {
+    if (c <= 127) {
+      return CACHE[c]
+    }
     Character b = new Character()
     b.value = c
     return b
   }
+  /* Java's Character cache is 0..127, a smaller range than the numbers' -128..127
+     and for a related reason: the first 128 code points are the printing
+     characters of every encoding, so those are the ones a program compares by
+     identity. `Character.valueOf('a') == Character.valueOf('a')` is true and the
+     same comparison for a CJK character is false, both asserted by the test. */
+  private static Character[] fillCache() {
+    Character[] c = new Character[128]
+    for (int i = 0 : i < 128 : i++) {
+      Character b = new Character()
+      b.value = (char) i
+      c[i] = b
+    }
+    return c
+  }
+  private static final Character[] CACHE = fillCache()
   public static native boolean isDigit(char c)
   public static native boolean isLetter(char c)
   public static native boolean isLetterOrDigit(char c)
@@ -754,8 +840,22 @@ final class Boolean extends Object implements Comparable<Boolean> {
   /* Java's Boolean.TYPE: the class boolean.class denotes, so a program that writes one
      and the program that writes the other are holding the same object. */
   public static final Class TYPE = boolean.class
-  public static final Boolean TRUE = Boolean.valueOf(true)
-  public static final Boolean FALSE = Boolean.valueOf(false)
+
+  /* The two constants are built by a private factory rather than by
+     `Boolean.valueOf`, which cannot be used to make them because valueOf
+     answers them: that would be a static initializer reading the field it is
+     initializing. The version this replaces called valueOf(true) twice, and
+     valueOf allocated a fresh box every time, so TRUE and FALSE were two
+     objects nobody else ever got -- `Boolean a = true; Boolean b = true; a == b`
+     was false where Java's is true. The JDK writes the same two `new
+     Boolean(...)` constants for the same reason. */
+  private static Boolean make(boolean v) {
+    Boolean b = new Boolean()
+    b.value = v
+    return b
+  }
+  public static final Boolean TRUE = make(true)
+  public static final Boolean FALSE = make(false)
 
   /* The value is the wrapper's whole state, and `valueOf` is the only thing
      that fills it: no constructor is declared, so `new Boolean()` and
@@ -772,9 +872,10 @@ final class Boolean extends Object implements Comparable<Boolean> {
     return parseBoolean(s) ? TRUE : FALSE
   }
   public static Boolean valueOf(boolean v) {
-    Boolean b = new Boolean()
-    b.value = v
-    return b
+    if (v) {
+      return TRUE
+    }
+    return FALSE
   }
   public static String toString(boolean v) {
     return String.valueOf(v)
