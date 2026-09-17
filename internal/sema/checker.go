@@ -37,6 +37,11 @@ type Builtins struct {
 	// IndexOutOfBoundsExceptions, and neither is the other. The runtime throws
 	// it, so it is a builtin rather than just a prelude class.
 	SIOOBE *ast.Class
+	// StackOverflowError: what the prologue check every generated function
+	// begins with throws when the frame it is about to run is past the thread's
+	// stack limit. The runtime builds the object, so it is a builtin like the
+	// rest of the ones the runtime throws.
+	SOE *ast.Class
 	// java.lang.reflect's checked exceptions. Teyru does not check them --
 	// nothing here is checked -- but they are the classes the runtime throws
 	// and a program catches, so they are named like the rest.
@@ -481,6 +486,7 @@ func (c *Checker) initBuiltins() {
 		ArrayStore: get("ArrayStoreException"),
 		NPE:        get("NullPointerException"), AIOOBE: get("ArrayIndexOutOfBoundsException"),
 		SIOOBE:        get("StringIndexOutOfBoundsException"),
+		SOE:           get("StackOverflowError"),
 		ClassNotFound: get("ClassNotFoundException"), NoSuchField: get("NoSuchFieldException"),
 		NoSuchMethod: get("NoSuchMethodException"), IllAccess: get("IllegalAccessException"),
 		Invocation: get("InvocationTargetException"), Instantiation: get("InstantiationException"),

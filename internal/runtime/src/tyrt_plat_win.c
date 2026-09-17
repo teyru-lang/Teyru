@@ -182,6 +182,39 @@ void typlat_thread_stack_bounds(char **low, char **high) {
   }
 }
 
+/* --------------------------------------------------------- fatal faults */
+
+/* A stack that has run out is not a signal here: the kernel raises
+   EXCEPTION_STACK_OVERFLOW, and the handler runs on a stack of its own because
+   Windows gives every handler one. That is the whole of what
+   typlat_fault_altstack_install does on this platform -- there is no alternate
+   signal stack to install. */
+
+static int (*fault_reporter)(void *addr) = NULL;
+
+static LONG CALLBACK fault_filter(PEXCEPTION_POINTERS info) {
+  EXCEPTION_RECORD *r = info->ExceptionRecord;
+  if (r->ExceptionCode != EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
+  /* For a stack overflow the second information word is the stack limit the
+     thread ran into, which is the address the reporter is handed. */
+  void *addr = r->NumberParameters > 1 ? (void *)r->ExceptionInformation[1] : NULL;
+  if (fault_reporter && fault_reporter(addr)) return EXCEPTION_CONTINUE_SEARCH;
+  /* Not reported: let the system handle it, so the process dies the way it
+     would have without a handler. */
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void typlat_fault_handler_install(int (*on_fault)(void *addr)) {
+  fault_reporter = on_fault;
+  /* First in the chain, so that the message is printed by this runtime rather
+     than by whatever else the host process has installed. */
+  if (!AddVectoredExceptionHandler(1, fault_filter)) abort();
+}
+
+void typlat_fault_altstack_install(void) {
+  /* Nothing to do: see the comment above. */
+}
+
 /* ---------------------------------------------------------------- sockets */
 
 /* A Winsock error code as the runtime's own numbering. The mapping is not

@@ -1588,11 +1588,14 @@ class JsonWriter {
    RFC 8259 grammar and nothing else (see the header for what Gson's lenient
    reader would have accepted instead).
 
-   The nesting limit is not cosmetic. This reader recurses, and here a deep
-   enough document is a C stack overflow, not the StackOverflowError Gson
-   catches and reports; refusing past a fixed depth keeps a hostile document
-   from taking the process down. 255 is the default Gson 2.11 gives its
-   JsonReader. */
+   The nesting limit is a bound the format is read under rather than a stand-in
+   for one: this reader recurses, and a document nested past the limit is
+   refused with a JsonSyntaxException instead of a StackOverflowError, which
+   keeps a hostile document from spending the whole stack -- the error is
+   catchable now (the runtime throws it from the check every generated function
+   begins with), but a reader that answers "too deep" is more useful than one
+   that answers "the machine ran out". 255 is the default Gson 2.11 gives its
+   JsonReader, so a document this refuses is one Gson refuses too. */
 class JsonReader {
   private static final int MAX_DEPTH = 255
   private static final String REPLACEMENT = "?"

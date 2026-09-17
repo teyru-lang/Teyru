@@ -203,3 +203,44 @@ class UnsupportedOperationException extends RuntimeException {
     super(message)
   }
 }
+
+/* ---- errors ------------------------------------------------------------
+
+   Java splits Throwable in two: Exception and Error. An Error says the
+   *machine* failed, not the program's logic, and the idiom that reads it --
+   `catch (Error e)` or `catch (VirtualMachineError e)`, written by a server
+   loop that wants to survive one bad request -- catches nothing at all unless
+   the class is where Java puts it. StackOverflowError is the one of these this
+   runtime throws, from the prologue check in every generated function (the
+   other Error, AssertionError, is still on RuntimeException in this file and
+   is a compatibility gap of its own). */
+class Error extends Throwable {
+  public Error() {
+  }
+  public Error(String message) {
+    super(message)
+  }
+}
+
+/* The parent Java gives the errors the virtual machine raises when a resource
+   runs out: a stack, a heap. */
+class VirtualMachineError extends Error {
+  public VirtualMachineError() {
+  }
+  public VirtualMachineError(String message) {
+    super(message)
+  }
+}
+
+/* Thrown when a recursion went deeper than the stack allows. The runtime throws
+   this one itself -- from ty_stack_overflow, called by the check every generated
+   function begins with -- so its object is preallocated per thread: the frame it
+   is thrown from has the margin left and nothing else, and the throw path may
+   not allocate. */
+class StackOverflowError extends VirtualMachineError {
+  public StackOverflowError() {
+  }
+  public StackOverflowError(String message) {
+    super(message)
+  }
+}

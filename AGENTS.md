@@ -457,6 +457,53 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   方式量配置，數字本身就不成立，所以那條路的 0.0019 s 是崩潰不是加速，只跑一次、診斷、不重試。）
 ---
 
+- **遞迴過深的堆疊上限，以及執行期的兩個診斷開關（`tyrt.c`／`tyrt_thread.c`／`tyrt_plat_posix.c`／
+  `tyrt_plat_win.c`）**：遞迴到把堆疊用完時，Java 丟出可攔截的 `StackOverflowError`，機器則是
+  丟出結束行程的錯誤。這裡有兩層，缺一不可。第一層是**函式序言檢查**：每個產生的函式主體第一行
+  都是 `ty_stack_check()`（`tyrt.h` 的 `always_inline`；C 後端用 `__builtin_frame_address(0)`，
+  LLVM 後端用 `llvm.frameaddress.p0`），拿自己的框架位址跟執行緒區域變數 `ty_stack_limit` 比，
+  低於就呼叫 `ty_stack_overflow()`。`ty_stack_limit` 由 `stack_limit_init()` 在每個執行緒啟動時
+  設定，值是 `typlat_thread_stack_bounds` 回報的堆疊底端加 **256 KB 餘裕**；主執行緒與每一個
+  `Thread` 都一樣（`ty_thread_init`／`ty_thread_start`）。沒有呼叫的葉函式並不特別排除，因為
+  「省下來的那一行」換不到可觀測的好處，而少插一個地方就是少一個會漏的路徑。第二層是**保底**：
+  `typlat_fault_handler_install`（`ty_init` 呼叫一次）裝上 SIGSEGV 處理器，每個執行緒再用
+  `typlat_fault_altstack_install` 拿到自己的 `sigaltstack`；故障位址落在堆疊底端以下 64 KB 內
+  （`TY_STACK_GUARD_REACH`；實測 gcc 與 clang 在 64 KB 到 4 MB 的框架下都落在 17 KB 內）時，
+  `ty_stack_fault` 印出 `stack overflow in native code` 然後 `abort()`——**不從訊號處理器
+  longjmp**，那不是可靠的事。其餘的故障把預設動作裝回去重送，因此除錯工具看到的仍是原本的錯誤。
+  丟出的物件是**每個執行緒預先配置**的（`ty_stack_overflow_reserve`，產生的啟動碼與每個執行緒
+  啟動時各呼叫一次；`tythread.soe`，由收集器在 `ty_gc_locked` 標記為根），因為丟出的框架只剩
+  餘裕可用，配置會把配置器、堆鎖與安全點一起拉進最後 256 KB。餘裕要放得下**未攔截時的列印**：
+  那是產生的程式碼（`toString`）而它自己也開頭就是同一個檢查，所以以前會從「列印中」再丟一個、
+  無限遞迴到真的用完堆疊、什麼都沒印就死掉；現在 `print_uncaught` 會先把該執行緒的
+  `ty_stack_limit` 設成 NULL（報告是執行緒的最後一件事，之後不再回到程式的程式碼）。**量測**：
+  把 `TY_STACK_MARGIN` 逐級調小，未攔截的報告在 **4 KB** 餘裕下仍能完整印出，256 KB 是留給
+  「兩次檢查之間的框架可能很大」這件事的。已知限制：**gcc -O0 連結不了任何程式**（與本項無關、
+  早於 a84b32f）：產生的 C 保留著 dispatch slot 已被剪掉的函式主體，而那些主體呼叫 `ty_tls_*`，
+  gcc -O0 不像 clang 與 gcc ≥ -O1 會把沒人引用的 static 丟掉；因此 `scripts/stack-matrix.sh` 的
+  gcc -O0 那一格是 BLOCKED，不是通過。LLVM 後端不吃 `Thread`（`TY-INT-0100`，指名拒絕），
+  矩陣因此對它改用主執行緒的程式。
+- **這個機制的代價：`bench_fib` 長跑回退 32%（owner 已裁決，不是沒量到）**：同一台機器、
+  `/usr/bin/time -v` 量**建好的執行檔**、十次一批：`bench_fib` 放大到 fib(38) 是
+  **0.81 s → 1.07 s** 牆鐘（每次 81 ms → 107 ms），user 0.80 → 1.04。來源就是每次呼叫多一次
+  框架位址檢查（約 0.4 ns／呼叫，而 fib(38) 有約 6300 萬次呼叫）。計畫 §W4 的驗收寫「回退不超過
+  10%，超過就先做葉函式與 SCC 優化再測」，而**那兩個補救到不了 10%**：`fib` 不是葉函式（它呼叫
+  自己），而「只對呼叫圖裡在強連通分量內的函式插入」仍然會保留**每一個自我遞迴函式**的檢查——`fib`
+  正是那個自我遞迴函式，SCC 只有它一個。因此這一項以「機制落地、六格建置矩陣全綠、代價如實記錄」
+  收尾；回退幅度、理由與「不改計畫指定的做法」由 owner 記為裁決（2026-09-17），不是安靜接受。
+  還沒有試的方向（留給下一個量的人，不要當成未驗證的結論）：讓檢查本身更便宜——`__builtin_frame_address(0)`
+  會逼出 frame pointer 並可能擋掉內聯，改用區域變數的位址或 `__builtin_stack_address` 可能更省；
+  以及 D4 的備選（純保護頁＋訊號）每次呼叫零成本，但那樣就得從訊號處理器 longjmp 才能丟出可攔截的
+  `StackOverflowError`，而計畫明文禁止。
+- **執行期的兩個診斷開關（`tyrt.c` 的 `ty_gc_init`）**：`TEYRU_GC_STRESS=N` 讓**每 N 次配置**
+  強制收集一次（把 `ty_gc_threshold` 設成 -1，內聯快速路徑因此把每一次配置都交給
+  `ty_alloc_slow` 計數；N=1 就是每次配置都收集）；`TEYRU_GCTRACE=1` 讓每次收集在 stderr 印一行
+  `teyru gc: trigger=<budget|stress|explicit> pause=<毫秒>ms heap=<收集前kB>-><收集後kB>
+  live=<存活kB>`（`trigger` 是要求這次收集的人，`pause` 是世界停下來的時間，不含列印本身；
+  兩個大小取自 chunk 的 watermark 而不是 `gc_slabs`，後者還指著已經釋放掉的 slab）。
+  `TEYRU_GC_STRESS` 給了不是正整數的值會印一行說明並當作沒開，而不是安靜地不開。
+  W3 與 W14 的量測讀的就是這兩個開關。
+
 ## 11. 送出前檢查清單
 
 - [ ] `go build ./...`、`go vet ./...`、`go test ./... -count=1` 全綠（`tests/` submodule 已 checkout）

@@ -755,6 +755,7 @@ func (e *Emitter) emitMethod(cl *ast.Class, m *ast.Method, idx int) {
 	e.fnTry = blockHasTry(body)
 	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
 	e.indent++
+	e.stackCheck()
 	prevClass, prevRet := e.curClass, e.retType
 	prevStack := e.stackLocals
 	e.curClass = cl
@@ -957,6 +958,16 @@ func (e *Emitter) line(format string, args ...any) {
 	fmt.Fprintf(e.code, format, args...)
 }
 
+// stackCheck writes the first statement of a generated function body: the
+// address of the frame this function is about to run, against the thread's
+// stack limit. A function that finds itself past the limit throws a
+// StackOverflowError instead of running, which is what makes a recursion that
+// went too deep a Java error the program can catch rather than a fault that
+// ends the process. The check is ty_stack_check in
+// internal/runtime/src/tyrt.h, inlined into the function it guards so that
+// there is no frame between the frame that is measured and the limit.
+func (e *Emitter) stackCheck() { e.line("ty_stack_check();\n") }
+
 func (e *Emitter) tmpName() string {
 	e.tmp++
 	return fmt.Sprintf("_t%d", e.tmp)
@@ -972,6 +983,10 @@ func (e *Emitter) entry() string {
 	var b strings.Builder
 	main := e.prog.Main
 	b.WriteString("\nint main(int argc, char** argv) {\n  (void)argc; (void)argv;\n  ty_init();\n")
+	// main's own check, like every other generated function's: it can never
+	// answer for the frame it is in, and being the same shape as the rest is
+	// worth more than the line it would save to leave it out.
+	b.WriteString("  ty_stack_check();\n")
 	b.WriteString(e.clinitRefs())
 	b.WriteString("  TY_STRING = &cls_" + mangle(e.prog.Builtins.String.Full) + ";\n")
 	b.WriteString("  TY_OBJECT = &cls_" + mangle(e.prog.Builtins.Object.Full) + ";\n")
@@ -1000,6 +1015,7 @@ func (e *Emitter) entry() string {
 	for _, pair := range [][2]any{
 		{"TY_NPE", e.prog.Builtins.NPE}, {"TY_AIOOBE", e.prog.Builtins.AIOOBE},
 		{"TY_SIOOBE", e.prog.Builtins.SIOOBE},
+		{"TY_SOE", e.prog.Builtins.SOE},
 		{"TY_ARITH", e.prog.Builtins.Arith}, {"TY_CCE", e.prog.Builtins.CCE},
 		{"TY_NEGARR", e.prog.Builtins.NegArr}, {"TY_ASSERT", e.prog.Builtins.Assertion},
 		{"TY_ILLARG", e.prog.Builtins.IllArg}, {"TY_ILLSTATE", e.prog.Builtins.IllState},
@@ -1014,6 +1030,10 @@ func (e *Emitter) entry() string {
 			fmt.Fprintf(&b, "  %s = &cls_%s;\n", pair[0], mangle(cl.Full))
 		}
 	}
+	// The thread's StackOverflowError, before any generated function can run:
+	// the frame that throws it has the margin left and nothing else, so the
+	// object it throws has to exist already.
+	b.WriteString("  ty_stack_overflow_reserve();\n")
 	b.WriteString("  ty_clinit(&cls_" + mangle(e.prog.Builtins.Object.Full) + ");\n")
 	// Only the classes that actually have a static initializer are named here.
 	// ty_clinit on a class whose whole hierarchy has none is a no-op, but

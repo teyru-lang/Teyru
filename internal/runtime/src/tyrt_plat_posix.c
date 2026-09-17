@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,6 +169,66 @@ void typlat_thread_stack_bounds(char **low, char **high) {
   }
   pthread_attr_destroy(&attr);
 #endif
+}
+
+/* --------------------------------------------------------- fatal faults */
+
+/* Big enough for a handler that only formats a line, with the slack the API
+   asks for. SIGSTKSZ is not a constant here -- glibc makes it a sysconf call
+   -- so it cannot size an array, and the smallest stack the kernel accepts is
+   a few kilobytes on every system this builds for. */
+#define TY_ALTSTACK_BYTES (64 * 1024)
+
+/* The runtime's reporter, and whether one has been installed. Written once,
+   from ty_init, before any thread exists; read from the handler, which runs on
+   whatever thread faulted. */
+static int (*fault_reporter)(void *addr) = NULL;
+
+/* The handler. It does not longjmp and it does not return to the faulting
+   instruction: a handler entered because the stack ran out has nothing to
+   return to, and one that returned would fault again on the same address
+   forever. */
+static void fault_trampoline(int sig, siginfo_t *si, void *uc) {
+  (void)uc;
+  if (fault_reporter && fault_reporter(si ? si->si_addr : NULL)) return;
+  /* Not the fault this runtime reports. Put the default action back and take
+     the signal again, so the process dies the way it would have without a
+     handler, and a debugger or a core file sees the fault that actually
+     happened rather than a handler that swallowed it. */
+  signal(SIGSEGV, SIG_DFL);
+  raise(sig);
+}
+
+void typlat_fault_handler_install(int (*on_fault)(void *addr)) {
+  fault_reporter = on_fault;
+  /* SA_ONSTACK: run on the alternate stack, which is the only stack a thread
+     that exhausted its own has left. The handler's own signal is blocked for
+     the duration of the handler by default, which is what keeps a fault inside
+     the handler from re-entering it. */
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = fault_trampoline;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(SIGSEGV, &sa, NULL) != 0) abort();
+}
+
+void typlat_fault_altstack_install(void) {
+  char *p = (char *)malloc(TY_ALTSTACK_BYTES);
+  if (!p) abort();
+  /* The members are set one at a time and never in a positional initializer:
+     the order of stack_t's fields is not the same on every system (glibc puts
+     ss_flags before ss_size, the BSDs the other way round), and a struct whose
+     two sizes were swapped is a stack the kernel rejects. */
+  stack_t ss;
+  memset(&ss, 0, sizeof ss);
+  ss.ss_sp = p;
+  ss.ss_size = TY_ALTSTACK_BYTES;
+  ss.ss_flags = 0;
+  /* Never freed, and never installed over: this is the thread's alternate
+     stack for as long as the thread runs, and the thread cannot run again
+     after the last frame of its start function returns. */
+  if (sigaltstack(&ss, NULL) != 0) abort();
 }
 
 /* ---------------------------------------------------------------- sockets */

@@ -2004,6 +2004,7 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	e.indent = 0
 	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
 	e.indent++
+	e.stackCheck()
 	for i, pv := range m.ParamVars {
 		e.locals[pv] = fmt.Sprintf("a%d", i)
 	}
