@@ -219,6 +219,14 @@ void *ty_assertfail(const char *msg);
    back into the runtime. */
 /* class flags: the class has been initialised */
 #define TY_CLS_INIT 8
+/* a thread is running this class's initializer right now. Set and cleared under
+   the class's own monitor, which that thread holds for the whole initializer,
+   so the only thread that can find it set is the one that set it -- which is
+   what tells an initializer that reaches its own class (a cache built by the
+   factory that reads it) apart from a thread arriving while another one
+   initializes. The bit TY_CLS_INIT means "finished", and it is published only
+   once the initializer has returned; this one means "running". */
+#define TY_CLS_BUSY 32
 /* the class describes an array: its payload is a tyarr whose element slots the
    collector has to trace when the array holds references */
 #define TY_CLS_ARRAY 2
