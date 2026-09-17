@@ -137,21 +137,39 @@ result_lines() {
   comm -12 "$TMP/out.1" "$TMP/out.2" || true
 }
 
-# best_rss: runs the program $RUNS times and prints the smallest peak RSS in kB
-# (/usr/bin/time -v is GNU time; without it the measurement is skipped)
-best_rss() {
+# worst_rss: runs the program $RUNS times and prints the largest peak RSS in kB
+# (/usr/bin/time -v is GNU time; without it the measurement is skipped).
+#
+# Largest, not smallest. The timing columns are the smallest of RUNS because a
+# slow run is a run that was interfered with; a *small* memory reading is not the
+# same kind of evidence -- the same hello world measures 2,116 kB on about one run
+# in twenty and 4,200-4,450 kB on the rest, and the small reading means the run did
+# not fault its heap in rather than that the program needs less. A row whose
+# purpose is the program's footprint should therefore report the worst run, and
+# five runs is enough to land on the mode: the largest of five sits at 4,400-4,450
+# kB, while the smallest of five is the one that occasionally reads 2,116.
+#
+# The program is the direct child of /usr/bin/time, and the timeout wraps both:
+# `timeout LIMIT /usr/bin/time -v prog` reports prog's peak, while
+# `/usr/bin/time -v timeout LIMIT prog` reports the wrapper's, and the wrapper's
+# is a floor of about 9.9 MB rather than an offset -- `timeout 5 /bin/true` is
+# 9,892 kB against 1,424 kB for /bin/true, the same hello is 9,904 against 4,172,
+# and a Java hello that really does use 51 MB is unaffected. That floor is what
+# made this row say "5.1x less memory" for a program that differs by 12x, and it
+# also floors every light row of the long table.
+worst_rss() {
   [ -x /usr/bin/time ] || return 0
   i=0
   out=""
   while [ "$i" -lt "$RUNS" ]; do
-    v=$(/usr/bin/time -v timeout "$LIMIT" "$@" 2>&1 >/dev/null | awk -F': ' '/Maximum resident set size/ {print $2}')
+    v=$(timeout "$LIMIT" /usr/bin/time -v "$@" 2>&1 >/dev/null | awk -F': ' '/Maximum resident set size/ {print $2}')
     if [ -n "$v" ]; then
       out="$out$v
 "
     fi
     i=$((i+1))
   done
-  printf '%s' "$out" | sort -g | head -1
+  printf '%s' "$out" | sort -g | tail -1
 }
 
 # scale_of: the argument a benchmark gets at each scale. A program that does not
@@ -230,9 +248,9 @@ table() {
     fi
     if [ "$which" = long ]; then
       if [ -n "$scale" ]; then
-        r=$(best_rss "$exe" "$scale")
+        r=$(worst_rss "$exe" "$scale")
       else
-        r=$(best_rss "$exe")
+        r=$(worst_rss "$exe")
       fi
       printf '%-20s %9ss %9ss %10s %10skB\n' "$name" "$t" "${j:--}" "$ratio" "${r:-?}"
     else
@@ -277,7 +295,7 @@ chmod +x "$TMP/run100.sh"
 $BIN build -O2 -o "$TMP/hello" "$TMP/hello.teyru" >/dev/null
 startup=$(best "$TMP/run100.sh" "$TMP/hello")
 size=$(wc -c < "$TMP/hello" | tr -d ' ')
-rss=$(best_rss "$TMP/hello")
+rss=$(worst_rss "$TMP/hello")
 
 jstartup=""
 jrss=""
@@ -291,7 +309,7 @@ public class Hello {
 EOF
   if javac -d "$TMP" "$TMP/Hello.java" 2>/dev/null; then
     jstartup=$(best "$TMP/run100.sh" java -cp "$TMP" Hello)
-    jrss=$(best_rss java -cp "$TMP" Hello)
+    jrss=$(worst_rss java -cp "$TMP" Hello)
   fi
 fi
 
