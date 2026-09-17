@@ -1,0 +1,78 @@
+name: release
+
+# The only workflow in this repository.
+#
+# GitHub Actions is switched off for the project, so every check a CI would run
+# lives in this repository as a make target or a script instead -- `make ci`,
+# `make jdk-diff`, `make notices`, `tests/run.sh` -- and this workflow is the
+# one place they are called automatically, when a release is published: the
+# released tag is built, the whole suite is run against it, and the binaries are
+# attached to the release.
+#
+# Nothing here runs on a push or a pull request, and nothing else belongs in
+# .github/workflows.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build, test and publish the released tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          # tests/ is the teyru-lang/tests submodule and the suite is its data
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: set up the JDK the differential compares against
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: the C compilers the suite builds with
+        run: sudo apt-get update && sudo apt-get install -y clang gcc
+
+      - name: build the compiler
+        run: make build
+
+      - name: the checks a CI job would run (format, vet, the suite under clang and gcc)
+        run: make ci
+
+      - name: the JDK differential
+        run: make jdk-diff
+
+      - name: third-party notices and the tree agree
+        run: make notices
+
+      - name: build the release binaries
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%%/*}"
+            arch="${target##*/}"
+            ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            echo "building $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -o "dist/teyru-$tag-$os-$arch$ext" ./cmd/teyru
+          done
+          ls -l dist
+
+      - name: attach the binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber

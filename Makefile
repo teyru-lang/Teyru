@@ -8,7 +8,7 @@ BIN     ?= teyru
 OPT     ?= -O2
 PREFIX  ?= /usr/local
 
-.PHONY: all build test test-go test-programs submodule bench fmt vet lint notices check hooks clean install examples
+.PHONY: all build test test-go test-programs submodule bench fmt vet lint notices check ci jdk-diff progen hooks clean install examples
 
 all: build
 
@@ -53,6 +53,55 @@ test-programs: build submodule
 ## examples: run the example programs
 examples: build
 	@for f in examples/*.teyru; do echo "== $$f"; ./$(BIN) run $$f; done
+
+## ci: everything a CI job would run, here, by hand
+#
+# GitHub Actions is switched off for this project -- the one workflow in
+# .github/workflows runs when a release is published and calls these targets --
+# so the jobs a CI would run live here instead. `ci` is W1's minimal matrix:
+# the format and vet checks, the whole suite building with clang, and the whole
+# suite again building with gcc. TEYRU_JDK adds the JDK differential, which
+# needs a JDK 21 and is the only check here that compares against another
+# implementation rather than against this repository.
+#
+# The two compiler legs are serialised (-p 1 -parallel 1) because each program
+# in the suite is compiled and linked, and running sixteen of those at once on
+# a shared machine is how a timing measurement becomes noise.
+ci: lint
+	$(GO) test ./... -count=1 -timeout 45m -p 1 -parallel 1
+	@if command -v clang >/dev/null 2>&1 && command -v gcc >/dev/null 2>&1; then \
+	  echo "== the suite again, building with gcc"; \
+	  TEYRU_CC=gcc $(GO) test ./... -count=1 -timeout 45m -p 1 -parallel 1; \
+	else \
+	  echo "== only one C compiler is installed: the gcc leg of the matrix did not run"; \
+	fi
+	@if [ -n "$$TEYRU_JDK" ]; then \
+	  echo "== the JDK differential"; \
+	  $(GO) test -run TestJDKDiff -count=1 -v .; \
+	else \
+	  echo "== TEYRU_JDK is not set: the JDK differential did not run"; \
+	fi
+
+## jdk-diff: compile every translatable program with the JDK and compare
+#
+# The reference implementation is OpenJDK 21, and the comparison is stdout and
+# exit status. A program the Java printer refuses is not a failure: it is a
+# program the differential says nothing about, and the refusal is logged with
+# its reason. tests/jdk-diff-allow.txt holds the differences that are decided,
+# tests/known-failures.txt the ones a work item is going to remove.
+jdk-diff:
+	@test -n "$$TEYRU_JDK" || { \
+	  echo "jdk-diff: set TEYRU_JDK to a JDK 21 home:"; \
+	  echo "          TEYRU_JDK=/opt/jdk21/jdk-21.0.11+10 make jdk-diff"; exit 2; }
+	$(GO) test -run TestJDKDiff -count=1 -v .
+
+## progen: the random-program differential, 200 seeds
+#
+# internal/tools/progen generates the common subset of the language in both
+# spellings, compiles and runs both, and diffs them. The seeds are fixed so the
+# run is reproducible; -seeds and -start take any number locally.
+progen: build
+	$(GO) run ./internal/tools/progen -teyru ./$(BIN) -seeds 200
 
 ## bench: compile and time the benchmark programs
 bench: build
