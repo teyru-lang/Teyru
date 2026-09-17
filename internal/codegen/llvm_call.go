@@ -699,6 +699,19 @@ func (e *llvmEmitter) allocArray(f *fb, elem ast.Type, n int64) string {
 	case *ast.ArrayType:
 		refs = 1
 	case *ast.PrimType:
+		// A primitive array records the class of its element, as the C backend's
+		// elemClass does and for the same two reasons: it is what
+		// java.lang.reflect.Array reads to know which box to build, and it is
+		// what lets the runtime name the array when System.arraycopy refuses a
+		// copy -- "can not copy long[] into byte[]" is arr_elem_name, which has
+		// a->elemcls and nothing else to go on for a primitive. It is not a
+		// store check: a primitive array holds no references, so refs above
+		// stays 0 and a store into it is unchecked, exactly as in C.
+		//
+		// needPrimClass and not a bare symbol: the record has to be marked for
+		// emission as well as named, and these nine are synthesized rather than
+		// declared by the program (see emitPrimClassRecords).
+		elemCls = e.needPrimClass(t.Kind)
 	}
 	arr := e.rtCall(f, "ty_array_new", e.refType(), []lval{
 		value(strconv.FormatInt(n, 10), ast.TLong),
@@ -805,6 +818,12 @@ func (e *llvmEmitter) allocArrayN(f *fb, elem ast.Type, n string) string {
 		refs = 1
 	case *ast.ArrayType:
 		refs = 1
+	case *ast.PrimType:
+		// The promise of a primitive array is its element's class, as in
+		// allocArray above: the runtime names the array with it when
+		// System.arraycopy refuses a copy, and reflection reads it to know which
+		// box to build.
+		elemCls = e.needPrimClass(t.Kind)
 	}
 	arr := e.rtCall(f, "ty_array_new", e.refType(), []lval{
 		value(n, ast.TLong),
