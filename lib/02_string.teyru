@@ -252,10 +252,12 @@ class String extends Object implements Comparable<String> {
   }
 }
 
-/* StringBuilder is the mutable byte buffer behind string building and
-   String.format. It is allocated by the runtime (ty_sb_new, wired through
-   specialNew) rather than by generated code, so every native below casts its
-   receiver to the runtime's tySB.
+/* StringBuilder is the mutable buffer behind string building and String.format,
+   and the unit it is indexed by is the character: append, charAt, insert,
+   delete and length are all UTF-16 code units, which is the same unit String's
+   own read API is indexed by. It is allocated by the runtime (ty_sb_new, wired
+   through specialNew) rather than by generated code, so every native below
+   casts its receiver to the runtime's tySB.
 
    StringBuffer is the same class under its old, synchronized name: Java has
    both, they differ only in thread safety, and Teyru has no threads, so the
