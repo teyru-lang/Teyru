@@ -435,13 +435,14 @@ class ByteArrayOutputStream extends Object implements OutputStream, Writer {
  * still round-trip against itself, which is why the test for it is a hex dump of
  * the bytes on both sides and an expectation taken from javac.
  *
- * A lone surrogate is the one place this and Java agree about nothing. Java
- * writes the three-byte form of the surrogate itself, because its writeUTF is
- * defined over UTF-16 code units; here what reaches this class is the string's
- * bytes, and a lone surrogate is the one `?` the byte boundary writes for a
- * character that cannot be encoded. A string holding half a pair therefore comes
- * back as `?` and not as the half it was, which is written down here because a
- * round trip through a data stream is where a program would rely on it.
+ * Both directions are written over code units and not over the string's bytes,
+ * which is what makes the encoding Java's rather than an approximation of it. A
+ * lone surrogate is the case that shows why: Java writes the three-byte form of
+ * the surrogate itself and reads that form back as the surrogate, and a string
+ * here can hold one (the storage is WTF-8, where a surrogate with no partner is
+ * three bytes). Reaching for getBytes() instead answers a `?` -- once -- for
+ * that string and the round trip loses it, which is the bug this class had until
+ * the lib/** audit found it.
  *
  * The length check is Java's, message included: the count in front of the bytes
  * is an unsigned short, and a string that does not fit it is an exception rather
@@ -451,48 +452,44 @@ final class ModifiedUtf8 {
     if (s == null) {
       throw new NullPointerException("s")
     }
-    byte[] in = s.getBytes()
-    ByteArrayOutputStream out = new ByteArrayOutputStream(in.length + 4)
-    int i = 0
-    while (i < in.length) {
-      int c = in[i] & 255
-      int cp = c
-      int size = 1
-      /* One character at a time. A truncated sequence at the end of the string
-         is one character, which is what String.charAt would say about it. */
-      if (c >= 0xC0 && c < 0xE0 && i + 1 < in.length) {
-        cp = ((c & 0x1F) << 6) | (in[i + 1] & 0x3F)
-        size = 2
-      } else if (c >= 0xE0 && c < 0xF0 && i + 2 < in.length) {
-        cp = ((c & 0x0F) << 12) | ((in[i + 1] & 0x3F) << 6) | (in[i + 2] & 0x3F)
-        size = 3
-      } else if (c >= 0xF0 && i + 3 < in.length) {
-        cp = ((c & 0x07) << 18) | ((in[i + 1] & 0x3F) << 12) | ((in[i + 2] & 0x3F) << 6) |
-          (in[i + 3] & 0x3F)
-        size = 4
-      }
-      i = i + size
-      if (cp == 0) {
-        out.write(0xC0)
-        out.write(0x80)
-      } else if (cp < 0x80) {
-        out.write(cp)
-      } else if (cp < 0x800) {
-        two(out, cp)
-      } else if (cp < 0x10000) {
-        three(out, cp)
+    /* Java's writeUTF, as Java writes it: the unit is the string's UTF-16 code
+       unit and not a character, which is the whole of modified UTF-8's
+       difference from UTF-8. U+0000 is two bytes (0xC0 0x80); a character above
+       the BMP is the two three-byte halves of its surrogate pair rather than
+       the one four-byte sequence UTF-8 would spend; and a lone surrogate is
+       written as the surrogate itself, which is three bytes and which a string
+       here holds (WTF-8 spells it). Reading the string through getBytes()
+       instead would answer all three differently: the byte boundary writes one
+       `?` for a surrogate with no partner, and that is a substitution the
+       format has no use for. */
+    int strlen = s.length()
+    int utflen = 0
+    for (int i = 0 : i < strlen : i++) {
+      int c = s.charAt(i)
+      utflen = utflen + (c >= 0x0001 && c <= 0x007F ? 1 : (c > 0x07FF ? 3 : 2))
+    }
+    if (utflen > 65535) {
+      throw new UTFDataFormatException(tooLong(s, utflen))
+    }
+    byte[] out = new byte[utflen]
+    int at = 0
+    for (int i = 0 : i < strlen : i++) {
+      int c = s.charAt(i)
+      if (c >= 0x0001 && c <= 0x007F) {
+        out[at] = (byte) c
+        at = at + 1
+      } else if (c > 0x07FF) {
+        out[at] = (byte) (0xE0 | ((c >> 12) & 0x0F))
+        out[at + 1] = (byte) (0x80 | ((c >> 6) & 0x3F))
+        out[at + 2] = (byte) (0x80 | (c & 0x3F))
+        at = at + 3
       } else {
-        /* Above the BMP: two surrogate halves, each of them three bytes, which
-           is six bytes where UTF-8 would spend four. */
-        int v = cp - 0x10000
-        three(out, 0xD800 + (v >> 10))
-        three(out, 0xDC00 + (v & 0x3FF))
+        out[at] = (byte) (0xC0 | ((c >> 6) & 0x1F))
+        out[at + 1] = (byte) (0x80 | (c & 0x3F))
+        at = at + 2
       }
     }
-    if (out.size() > 65535) {
-      throw new UTFDataFormatException(tooLong(s, out.size()))
-    }
-    return out.toByteArray()
+    return out
   }
 
   /* Java's message, which names the string and not only the length: its
@@ -513,29 +510,31 @@ final class ModifiedUtf8 {
      structural checks are made with Java's messages, because they are what keeps
      a truncated frame from being read as text: a lead byte without its
      continuations, a continuation that is not 10xxxxxx, and a byte above 0xF0
-     that begins no sequence this encoding has. */
+     that begins no sequence this encoding has.
+
+     What comes out is characters, so each sequence is appended as the code unit
+     it spells and not as bytes to be decoded again: the two three-byte halves of
+     a surrogate pair are two appends that the builder joins into the one
+     character they are, and a half with no partner is that half -- Java's
+     readUTF answers the same char for the same bytes, and a string here can hold
+     it. */
   public static String decode(byte[] b, int off, int len) {
     if (b == null) {
       throw new NullPointerException("b")
     }
-    ByteArrayOutputStream out = new ByteArrayOutputStream(len)
+    StringBuilder out = new StringBuilder(len)
     int i = 0
     while (i < len) {
       int c = b[off + i] & 255
       if (c < 0x80) {
-        out.write(c)
+        out.append((char) c)
         i = i + 1
       } else if ((c & 0xE0) == 0xC0) {
         int c2 = at(b, off, len, i + 1)
         if ((c2 & 0xC0) != 0x80) {
           throw malformed(i + 2)
         }
-        int unit = ((c & 0x1F) << 6) | (c2 & 0x3F)
-        if (unit < 0x80) {
-          out.write(unit)
-        } else {
-          two(out, unit)
-        }
+        out.append((char) (((c & 0x1F) << 6) | (c2 & 0x3F)))
         i = i + 2
       } else if ((c & 0xF0) == 0xE0) {
         int c2 = at(b, off, len, i + 1)
@@ -547,31 +546,15 @@ final class ModifiedUtf8 {
              sequence, which is why they read differently in the source. */
           throw malformed(i + 2)
         }
-        int unit = ((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F)
-        if (unit >= 0xD800 && unit <= 0xDBFF) {
-          int low = lowSurrogateAt(b, off, len, i + 3)
-          if (low < 0) {
-            lone(out)
-            i = i + 3
-          } else {
-            int cp = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
-            four(out, cp)
-            i = i + 6
-          }
-        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
-          lone(out)
-          i = i + 3
-        } else {
-          three(out, unit)
-          i = i + 3
-        }
+        out.append((char) (((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F)))
+        i = i + 3
       } else {
         /* Java reports this one at the lead byte, not after it: its count is
            only advanced by the branches that know how long the sequence is. */
         throw malformed(i)
       }
     }
-    return Net.stringFrom(out.toByteArray())
+    return out.toString()
   }
 
   private static UTFDataFormatException malformed(int at) {
@@ -585,49 +568,6 @@ final class ModifiedUtf8 {
     return b[off + index] & 255
   }
 
-  /* The low half of a surrogate pair, or -1 when the next three bytes are not
-     one. This pair is the only place a well-formed string that arrived from Java
-     is encoded differently from UTF-8, so it is the only place this decoder has
-     to look at more than the character in hand. */
-  private static int lowSurrogateAt(byte[] b, int off, int len, int index) {
-    if (index + 2 >= len) {
-      return -1
-    }
-    int c1 = b[off + index] & 255
-    int c2 = b[off + index + 1] & 255
-    int c3 = b[off + index + 2] & 255
-    if ((c1 & 0xF0) != 0xE0 || (c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) {
-      return -1
-    }
-    int unit = ((c1 & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F)
-    if (unit < 0xDC00 || unit > 0xDFFF) {
-      return -1
-    }
-    return unit
-  }
-
-  // U+FFFD, for a surrogate that has no partner and so no UTF-8 spelling.
-  private static void lone(ByteArrayOutputStream out) {
-    three(out, 0xFFFD)
-  }
-
-  private static void two(ByteArrayOutputStream out, int cp) {
-    out.write(0xC0 | (cp >> 6))
-    out.write(0x80 | (cp & 0x3F))
-  }
-
-  private static void three(ByteArrayOutputStream out, int cp) {
-    out.write(0xE0 | (cp >> 12))
-    out.write(0x80 | ((cp >> 6) & 0x3F))
-    out.write(0x80 | (cp & 0x3F))
-  }
-
-  private static void four(ByteArrayOutputStream out, int cp) {
-    out.write(0xF0 | (cp >> 18))
-    out.write(0x80 | ((cp >> 12) & 0x3F))
-    out.write(0x80 | ((cp >> 6) & 0x3F))
-    out.write(0x80 | (cp & 0x3F))
-  }
 }
 
 // ---------------------------------------------------------------- the data streams
