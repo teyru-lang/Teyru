@@ -24,6 +24,10 @@ class RawResponse {
   public String statusLine = ""
   public int status = 0
   public String body = ""
+  // bodyBytes is the body as it arrived. `body` is those bytes read as text,
+  // which is what a test that compares a document wants; a test that compares
+  // an upload wants the bytes, because that is what the server was given.
+  public byte[] bodyBytes = new byte[0]
   // chunked is a fact about the wire the decoded body no longer shows: the
   // body arrived as chunks rather than with a length.
   public boolean chunked = false
@@ -145,10 +149,12 @@ class RawClient {
     }
     if (res.chunked) {
       res.body = readChunks()
+      res.bodyBytes = res.body.getBytes()
       return res
     }
     if (length > 0) {
-      res.body = Net.stringFrom(readFully(length), 0, length)
+      res.bodyBytes = readFully(length)
+      res.body = Net.stringFrom(res.bodyBytes, 0, length)
       return res
     }
     if (length == 0) {
@@ -166,6 +172,7 @@ class RawClient {
       b.append((char) c)
     }
     res.body = b.toString()
+    res.bodyBytes = res.body.getBytes()
     return res
   }
 
@@ -173,7 +180,14 @@ class RawClient {
   // client does with them: nothing, but it has to read them or the next answer
   // on the connection is read from the middle of this one.
   private String readChunks() {
-    StringBuilder b = new StringBuilder()
+    byte[] bytes = readChunkBytes()
+    return Net.stringFrom(bytes, 0, bytes.length)
+  }
+
+  // readChunkBytes is the same reading with the bytes kept, which is what a
+  // body that was not text needs: the bytes are what the server was asked for.
+  public byte[] readChunkBytes() {
+    ByteArrayOutputStream b = new ByteArrayOutputStream()
     while (true) {
       String size = in.readLine()
       if (size == null) {
@@ -193,10 +207,11 @@ class RawClient {
         }
         break
       }
-      b.append(Net.stringFrom(readFully(n), 0, n))
+      byte[] block = readFully(n)
+      b.write(block, 0, n)
       in.readLine()
     }
-    return b.toString()
+    return b.toByteArray()
   }
 
   // readHead reads a status line and the headers and stops there, which is what
