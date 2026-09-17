@@ -645,6 +645,51 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
     `checkTLS` 具名拒絕**（`TLS is not available for darwin/arm64: macOS ships SecureTransport…`），
     不會走到 C 編譯器，所以那一格要以新的方式重量。
 
+- **字串的讀取語意是 UTF-16 code unit，儲存是 WTF-8（W5 的第二塊：讀取 API）**：`tystr`
+  帶著兩個長度（`blen` 位元組、`ulen` code unit）與一個 ASCII 位元，`length`、`charAt`、
+  `substring`、`indexOf`／`lastIndexOf`、`compareTo`、`hashCode`、`String.format` 的寬度與
+  精度、`StringBuilder` 的每一個索引全部按 code unit 算，所以 `"中文".length()` 是 2、
+  `"ab中c".indexOf("c")` 是 3、`"中".compareTo("文")` 是 **-5978**（code unit 的差，不是正負
+  號）、`"中文".hashCode()` 是 646394。索引換算走**麵包屑**：字串自己的區塊裡每 64 個 code
+  unit 一格（`TY_STR_BC_OFF`／`TY_STR_NBC`，`str_build_bc` 首次使用時建立、以 release store
+  發布，兩個執行緒同時建也答同一個答案），ASCII 走 O(1) 快路徑。**這一段的代價**：同一台
+  機器、同一份 `examples/`、交錯 A/B（各 24 次取最小 CPU 時間，進入時 load 17.7）、
+  `bench_string` 短跑 0.0200 → 0.0200 秒（**1.000x**）、長跑（16,000,000）1.92 → 1.88 秒
+  （**0.979x，快 2%**），在 10% 預算之內，所以 **D1 的預設（WTF-8 + breadcrumb）成立，
+  compact strings 不需要**；`bench_string_cjk` 的兩邊答案已經一致
+  （`concat=2088890 walked=1000 sliced=4`，JDK 同一個數字），那一列現在印的是比值而不是
+  `!(out)`，它的前後數字仍在收（同一支 `ab.sh`）。牆鐘在這種負載下沒有意義：同一支 1.9 秒
+  CPU 的程式量到 128–158 秒牆鐘，所以上面引的是 CPU 時間。
+  **mid-pair 才是會錯的地方，三個都刻意處理了**：切開代理對的 `substring` 給的是 Java 給的
+  那個孤立代理（`"\uD83D\uDE00".substring(0,1)` 是 `"\uD83D"`，`getBytes()` 是 **1** 個
+  byte 的 `?`）；搜尋起點落在配對中間時，先逐 unit 比對那**一個**位置再看位元組，因為
+  `indexOf("\uDE00", 1)` 在 Java 是 1；開頭是低代理或結尾是高代理的針走 unit 掃描，因為
+  它的位元組不是乾草的位元組（`"😀".startsWith("\uD83D")` 是 true）。`compareTo` 因此把
+  補充平面排在 U+E000–U+FFFF **之前**（`"\uFFFF".compareTo("\uD800\uDC00")` 是 10239），
+  位元組序做不到這件事。`hashCode` 在 code unit 上算，**W6 的 HashMap 迭代順序可以直接
+  開工**。`StringBuilder`／`StringBuffer` 的緩衝區是 code unit（不是位元組），所以
+  `append(char)` 一次一個 unit、兩個半邊先後 append 就是那個字元、`reverse` 把配對整體翻轉
+  再修回來；`String(char[])`／`String(char[],int,int)`／`String(int[],int,int)`／
+  `valueOf(char[])`／`toCharArray`／`getChars`／`codePointAt`／`codePointBefore`／
+  `codePointCount`／`offsetByCodePoints`／`regionMatches`／`chars()`／`codePoints()`／
+  `subSequence` 都已提供（W7 的缺 API 清單）。位元組邊界只有**一個**寫出者
+  （`ty_str_write`）：`getBytes`、`println`、`System.out` 都把孤立代理寫成 JDK 編碼器寫的
+  一個 `?`。編譯期折疊與執行期必須同一套規則，所以 `util.StrConcat` 把折疊邊界上相遇的兩個
+  半邊併成 four-byte 序列（`("\uD83D" + "\uDE00").equals("😀")` 為真，這正是 equals／
+  switch／hash 靠的位元組等式），lexer 用 WTF-8 解 `char` 字面值（`'\uD83D'` 是那個 code
+  unit 而不是 U+FFFD），`emit-java` 把孤立代理印成轉義而非 U+FFFD。
+  **仍然不做的**（不是忘了）：`Character.isLetter`／`isWhitespace`／`isDigit`／`getType`／
+  `isSurrogate`／`charCount`、大小寫映射（`"ß".toUpperCase()` 應為 `SS`）、`strip()` 認
+  U+3000、`Integer.parseInt("１２３")`——這些是 Unicode 資料那一塊（W5 的第 4–6 項），
+  t230／t231／t236 仍以 known-failures 釘著；正則引擎逐 code unit 比對，所以
+  `"😀a".matches(".a")` 這裡是 false 而 JDK 是 true（Java 的 `.` 吃一個 code point），
+  但 `Matcher` 報的位移已經是 unit 索引；`offsetByCodePoints` 越界時丟的是
+  `StringIndexOutOfBoundsException`，JDK 丟父類別 `IndexOutOfBoundsException`（執行期沒有
+  父類別的 handle，用 `catch (IndexOutOfBoundsException)` 仍接得到）；`StringBuilder`
+  的 `setLength`／`setCharAt` 回傳 builder，Java 回傳 void（寬鬆的超集，先前就在）。
+  測試：`t249_string_utf16_reads` 與 `t250_string_utf16_builders`（期望輸出由
+  OpenJDK 21.0.11+10 跑 `.java.ref` 產生）。
+
 ## 11. 送出前檢查清單
 
 - [ ] `go build ./...`、`go vet ./...`、`go test ./... -count=1` 全綠（`tests/` submodule 已 checkout）
