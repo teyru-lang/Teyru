@@ -15,8 +15,10 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/teyru-lang/Teyru/internal/ast"
+	"github.com/teyru-lang/Teyru/internal/cache"
 	"github.com/teyru-lang/Teyru/internal/codegen"
 	"github.com/teyru-lang/Teyru/internal/java"
 	"github.com/teyru-lang/Teyru/internal/mod"
@@ -194,6 +196,27 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	if opts.Backend == BackendLLVM {
 		return compileLLVM(prog, opts, diags)
 	}
+	opt := opts.Opt
+	if opt == "" {
+		opt = "-O2"
+	}
+	cc := opts.CC
+	if cc == "" {
+		// The target's own compiler when it names one -- a cross compiler is not
+		// interchangeable with the host's -- and the host's own otherwise, which
+		// is the first of clang, gcc and cc that is on PATH, exactly as before.
+		cc = tgt.cc
+		if cc == "" {
+			cc = findCC()
+		}
+	}
+	// A debug build compiles the standard library once and links it, rather than
+	// putting the whole program in one translation unit and optimising across
+	// it (see compileSplit). The two are the same program: what differs is
+	// whether the optimiser sees the standard library's code from the inside.
+	if debugOpt(opt) {
+		return compileSplit(prog, opts, tgt, opt, cc)
+	}
 	csrc, link := codegen.Emit(prog)
 	// A program whose reachable code can call the TLS layer has to be linked
 	// against OpenSSL, and a target that has no OpenSSL for it is refused here,
@@ -228,20 +251,6 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	if opts.EmitC != "" {
 		if err := os.WriteFile(opts.EmitC, []byte(csrc), 0o644); err != nil {
 			return nil, err
-		}
-	}
-	opt := opts.Opt
-	if opt == "" {
-		opt = "-O2"
-	}
-	cc := opts.CC
-	if cc == "" {
-		// The target's own compiler when it names one -- a cross compiler is not
-		// interchangeable with the host's -- and the host's own otherwise, which
-		// is the first of clang, gcc and cc that is on PATH, exactly as before.
-		cc = tgt.cc
-		if cc == "" {
-			cc = findCC()
 		}
 	}
 	// The result reports each output as it is written, so a failure never
@@ -321,6 +330,295 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	}
 	res.Exe = exe
 	return res, nil
+}
+
+// ------------------------------------------------------------------ split builds
+//
+// A debug build does not put the standard library and the program in one
+// translation unit. The standard library's semantic checking and its generated
+// C are the same for every program that shares a prelude, a target, an
+// optimisation level and a back end, so they are done once and kept in the user
+// cache; each build then compiles its own unit against them and links. What
+// makes that worth doing is what the standard library costs: hello world's
+// generated C is 6.2 MB of which the program is 1.5 KB, so a build that
+// recompiles it every time spends its time on code every program shares.
+//
+// What it gives up is the whole-program view: the optimiser cannot inline the
+// standard library into the program, and prune.go decides which vtable slots
+// stay filled knowing both units but rewriting only the program's. That is why
+// this is the debug path and the default -O2 build is unchanged: a release build
+// keeps the whole-program optimisation, and its size and time are what they
+// were.
+//
+// debugOpt is the whole of the policy: the optimisation level decides.
+func debugOpt(opt string) bool {
+	switch opt {
+	case "-O0", "-O1", "-Og":
+		return true
+	}
+	return false
+}
+
+// compileSplit builds a program against a standard library compiled once.
+func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string) (*Result, error) {
+	rtDir, err := os.MkdirTemp("", "teyru-rt-")
+	if err != nil {
+		return nil, err
+	}
+	if !opts.KeptTemp {
+		defer os.RemoveAll(rtDir)
+	}
+	// The program's unit first: what it asks for -- reflection, above all --
+	// is what the standard library's unit has to carry, and the cache entry is
+	// keyed by it.
+	start := time.Now()
+	unit := codegen.EmitProgram(prog)
+	entry := preludeEntry(tgt, opt, cc, unit.Reflect)
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "teyru: the program's unit: %s\n", time.Since(start).Round(time.Millisecond))
+		start = time.Now()
+	}
+	libSrc, libObj, err := libraryUnit(entry, rtDir, cc, tgt, opt, unit)
+	if err != nil {
+		return nil, err
+	}
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "teyru: the standard library from %s: %s\n", libObj, time.Since(start).Round(time.Millisecond))
+		start = time.Now()
+	}
+	// Which vtable slots stay filled, and whether the program can reach the TLS
+	// layer, are questions about the whole program: the answer comes from
+	// reading both units, and only the program's is rewritten.
+	csrc, link := codegen.Prune(libSrc, unit.Source)
+	// A program whose reachable code can call the TLS layer has to be linked
+	// against OpenSSL, and a target that has no OpenSSL for it is refused here,
+	// by name and before anything is written, rather than by the linker later.
+	if err := checkTLS(tgt, link); err != nil {
+		return nil, err
+	}
+	rtC := writeRuntime(rtDir, tgt, link)
+	cfile := opts.CFile
+	if cfile == "" {
+		cfile = filepath.Join(rtDir, "program.c")
+	}
+	if err := os.MkdirAll(filepath.Dir(cfile), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(cfile, []byte(csrc), 0o644); err != nil {
+		return nil, err
+	}
+	if opts.EmitC != "" {
+		if err := os.WriteFile(opts.EmitC, []byte(csrc), 0o644); err != nil {
+			return nil, err
+		}
+	}
+	res := &Result{CFile: cfile, CSource: csrc}
+	if err := writeLLVMIR(cc, opt, cfile, rtDir, opts.EmitLLVM); err != nil {
+		return res, err
+	}
+	res.LLVMFile = opts.EmitLLVM
+	if opts.CSourceOnly {
+		return res, nil
+	}
+	exe := opts.Out
+	if tgt.suffix != "" && !strings.HasSuffix(exe, tgt.suffix) {
+		exe += tgt.suffix
+	}
+	// The same flags a build of one unit uses, plus the two that let the linker
+	// do what the optimiser is not there to do: every function and every object
+	// in its own section, and the linker dropping the sections nothing
+	// reachable refers to. Without them the standard library's unit would be
+	// linked whole -- every definition in it is a symbol the program may name,
+	// so none of them is file-local -- and a hello world would carry the
+	// standard library.
+	base := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
+		"-ffunction-sections", "-fdata-sections", "-I", rtDir, cfile, libObj}
+	base = append(base, strings.Fields(rtC)...)
+	base = append(base, opts.Native...)
+	base = append(base, tgt.cflags...)
+	base = append(base, tgt.ldflags...)
+	base = append(base, gcSectionsFlag(tgt)...)
+	base = append(base, "-o", exe, "-lm", "-lpthread")
+	if link.TLS {
+		base = append(base, tgt.tlsLibs...)
+	}
+	base = append(base, opts.Link...)
+	base = append(base, opts.ExtraCC...)
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "teyru: %s %s\n", cc, strings.Join(base, " "))
+	}
+	cmd := exec.Command(cc, base...)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return res, fmt.Errorf("C backend failed: %w", err)
+	}
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "teyru: compile and link: %s\n", time.Since(start).Round(time.Millisecond))
+	}
+	res.Exe = exe
+	return res, nil
+}
+
+// libraryUnit returns the standard library's source and the object to link it
+// from, taking both from the cache when they are there.
+//
+// The two always come from the same entry: an object and a source from
+// different builds would be a link that succeeds against definitions the
+// program's unit was not emitted for, which is the failure a cache must not
+// have. The entry is keyed by everything they were built from, and a file is
+// published by rename, so what is read is a whole artifact of some build.
+func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, unit codegen.Program) (string, string, error) {
+	writeRuntimeHeaders(rtDir)
+	if entry.Has(preludeHeader, "prelude.c", "prelude.o") {
+		hdr, ok := entry.Get(preludeHeader)
+		if !ok {
+			return "", "", fmt.Errorf("cache: %s is missing", preludeHeader)
+		}
+		src, ok := entry.Get("prelude.c")
+		if !ok {
+			return "", "", fmt.Errorf("cache: prelude.c is missing")
+		}
+		if err := os.WriteFile(filepath.Join(rtDir, preludeHeader), hdr, 0o644); err != nil {
+			return "", "", err
+		}
+		return string(src), entry.Path("prelude.o"), nil
+	}
+	// Nothing cached: the standard library is checked on its own, emitted, and
+	// compiled once. It is the same source the program's unit was checked with
+	// -- the driver parses lib/*.teyru as the first compilation units of every
+	// build -- and checking it alone is what says the two are independent of the
+	// program, which is the property the cache depends on.
+	diags := &source.Diagnostics{}
+	pa := sema.Check(parsePrelude(diags), diags)
+	if diags.HasErrors() {
+		return "", "", fmt.Errorf("the standard library does not check on its own: %s", diags.String())
+	}
+	lib := codegen.EmitLibrary(pa, codegen.LibraryOptions{Reflect: unit.Reflect})
+	if !sameStrings(lib.Literals, unit.PreludeLiterals) {
+		return "", "", fmt.Errorf("internal error: the standard library's string literals and the program's unit disagree "+
+			"(%d against %d); a literal is one object only if both agree which unit defines it. This is a compiler bug",
+			len(lib.Literals), len(unit.PreludeLiterals))
+	}
+	srcFile := filepath.Join(rtDir, "prelude.c")
+	hdrFile := filepath.Join(rtDir, preludeHeader)
+	if err := os.WriteFile(srcFile, []byte(lib.Source), 0o644); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(hdrFile, []byte(lib.Header), 0o644); err != nil {
+		return "", "", err
+	}
+	objFile := filepath.Join(rtDir, "prelude.o")
+	args := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
+		"-ffunction-sections", "-fdata-sections", "-I", rtDir, srcFile, "-c", "-o", objFile}
+	args = append(args, tgt.cflags...)
+	if err := exec.Command(cc, args...).Run(); err != nil {
+		return "", "", fmt.Errorf("the standard library's C backend failed: %w", err)
+	}
+	// A cache that cannot be written is not an error -- nor is there being no
+	// cache at all: the object stays where it was built and this build, at
+	// least, is a cold one.
+	if err := storeLibrary(entry, lib, objFile); err != nil {
+		return lib.Source, objFile, nil
+	}
+	return lib.Source, entry.Path("prelude.o"), nil
+}
+
+// storeLibrary puts the three files a standard library build produces into the
+// cache entry: the header and the source, which the next build needs to emit its
+// own unit and to read the library's call graph, and the object it links.
+func storeLibrary(entry *cache.Entry, lib codegen.Library, objFile string) error {
+	if entry == nil {
+		return fmt.Errorf("no cache")
+	}
+	if err := entry.Put(preludeHeader, []byte(lib.Header)); err != nil {
+		return err
+	}
+	if err := entry.Put("prelude.c", []byte(lib.Source)); err != nil {
+		return err
+	}
+	return entry.PutFile("prelude.o", objFile)
+}
+
+// preludeHeader is the header the standard library's unit declares and the
+// program's unit includes, and preludeHeaderFile likewise.
+const preludeHeader = "typrelude.h"
+
+// preludeEntry is the cache entry the standard library's unit and object live
+// in for one build's settings.
+func preludeEntry(tgt *target, opt, cc string, reflect bool) *cache.Entry {
+	return cache.Open().Lookup(cache.Key{
+		Compiler: cache.Build(version),
+		Runtime:  runtimeHash(tgt),
+		Prelude:  preludeHash(),
+		Target:   tgt.name,
+		Opt:      opt,
+		Backend:  BackendC,
+		// What the artifact depends on that is not in the sources: whether the
+		// program can reach reflection, which decides whether the member tables
+		// ship, and which C compiler built it, because two compilers produce
+		// different objects from the same source.
+		Variant: fmt.Sprintf("reflect=%v cc=%s", reflect, filepath.Base(cc)),
+	})
+}
+
+// preludeHash hashes the standard library's sources: the compiler's own copy of
+// lib/*.teyru, which is what its artifacts are built from.
+func preludeHash() string {
+	files := lib.Files()
+	parts := make([]cache.Named, 0, len(files))
+	for _, f := range files {
+		parts = append(parts, cache.Named{Name: f.Name, Data: []byte(f.Source)})
+	}
+	return cache.HashOf(parts)
+}
+
+// runtimeHash hashes the runtime's sources and headers. The standard library's
+// object is compiled against them, so a change to either is a different object.
+func runtimeHash(tgt *target) string {
+	return cache.HashOf([]cache.Named{
+		{Name: "tyrt.h", Data: []byte(tyrt.Header)},
+		{Name: "tyrt_plat.h", Data: []byte(tyrt.PlatHeader)},
+		{Name: "tyrt.c", Data: []byte(tyrt.Core)},
+		{Name: "tyrt2.c", Data: []byte(tyrt.Extra)},
+		{Name: "tyrt_net.c", Data: []byte(tyrt.Net)},
+		{Name: "tyrt_reflect.c", Data: []byte(tyrt.Reflect)},
+		{Name: "tyrt_thread.c", Data: []byte(tyrt.Thread)},
+		{Name: "tyrt_tls.c", Data: []byte(tyrt.TLS)},
+		{Name: tgt.platSrc, Data: []byte(tgt.platText)},
+	})
+}
+
+// writeRuntimeHeaders writes the runtime's headers into dir, which is what the
+// standard library's unit needs of the runtime: it includes tyrt.h and nothing
+// else, and it is compiled before what the whole program links is known.
+func writeRuntimeHeaders(dir string) {
+	must(os.WriteFile(filepath.Join(dir, "tyrt.h"), []byte(tyrt.Header), 0o644))
+	must(os.WriteFile(filepath.Join(dir, "tyrt_plat.h"), []byte(tyrt.PlatHeader), 0o644))
+}
+
+// gcSectionsFlag is how a target's linker is told to drop what nothing
+// reachable refers to. Only the split build passes it: it is what keeps a
+// debug build from carrying the standard library whole, and the release build
+// reaches the same place through link-time optimisation with the whole program
+// in view.
+func gcSectionsFlag(tgt *target) []string {
+	if strings.HasPrefix(tgt.name, "darwin/") {
+		return []string{"-Wl,-dead_strip"}
+	}
+	return []string{"-Wl,--gc-sections"}
+}
+
+// sameStrings reports whether two sorted lists of strings are the same list.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // BackendC and BackendLLVM are the two back ends. The C backend is the default:

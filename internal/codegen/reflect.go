@@ -246,7 +246,7 @@ func (e *Emitter) emitFieldTable(cl *ast.Class) string {
 			e.elementTypeExpr(f.Type)))
 	}
 	name := "fds_" + mangle(cl.Full)
-	fmt.Fprintf(&e.meta, "static const tyfield %s[] = {\n%s};\n", name, strings.Join(entries, ""))
+	fmt.Fprintf(e.meta, "%sconst tyfield %s[] = {\n%s};\n", e.link, name, strings.Join(entries, ""))
 	e.attach(cl, "fields", name, "tyfield", len(cl.Fields), "nfields")
 	return name
 }
@@ -274,14 +274,14 @@ func (e *Emitter) emitInvoker(cl *ast.Class, m *ast.Method) {
 	// Constructor.newInstance has no way to name either. Java has the same
 	// shape -- the enclosing instance is the constructor's first parameter
 	// there -- and says so rather than constructing half an object.
-	fmt.Fprintf(&e.fns, "static void* %s(void* self, void** a);\n", name)
+	fmt.Fprintf(e.fns, "%svoid* %s(void* self, void** a);\n", e.link, name)
 	// A lambda or anonymous class is built by the call site that wrote it,
 	// with the captured environment the checker handed it; it has no C
 	// constructor function at all, so there is nothing to call.
 	if m.IsCtor && (cl.Inner || len(e.prog.CapturedVars(cl)) > 0 || strings.HasPrefix(cl.Name, "$")) {
-		fmt.Fprintf(&e.meta,
-			"static void* %s(void* self, void** a) {\n  (void)self; (void)a;\n  ty_throw(ty_make_ex(TY_UNSUP, %s));\n  return NULL;\n}\n\n",
-			name, e.cstr("an inner or local class has no constructor reflection can call"))
+		fmt.Fprintf(e.meta,
+			"%svoid* %s(void* self, void** a) {\n  (void)self; (void)a;\n  ty_throw(ty_make_ex(TY_UNSUP, %s));\n  return NULL;\n}\n\n",
+			e.link, name, e.cstr("an inner or local class has no constructor reflection can call"))
 		return
 	}
 
@@ -291,17 +291,17 @@ func (e *Emitter) emitInvoker(cl *ast.Class, m *ast.Method) {
 	}
 
 	if m.IsCtor {
-		fmt.Fprintf(&e.meta, "static void* %s(void* self, void** a) {\n  (void)self;\n", name)
-		fmt.Fprintf(&e.meta, "  %s* o = (%s*)ty_alloc(sizeof(%s));\n", cname(cl), cname(cl), cname(cl))
-		fmt.Fprintf(&e.meta, "  o->obj.cls = &cls_%s;\n", mangle(cl.Full))
+		fmt.Fprintf(e.meta, "%svoid* %s(void* self, void** a) {\n  (void)self;\n", e.link, name)
+		fmt.Fprintf(e.meta, "  %s* o = (%s*)ty_alloc(sizeof(%s));\n", cname(cl), cname(cl), cname(cl))
+		fmt.Fprintf(e.meta, "  o->obj.cls = &cls_%s;\n", mangle(cl.Full))
 		if cl.ClInit != nil {
-			fmt.Fprintf(&e.meta, "  ty_clinit(&cls_%s);\n", mangle(cl.Full))
+			fmt.Fprintf(e.meta, "  ty_clinit(&cls_%s);\n", mangle(cl.Full))
 		}
 		sep := ""
 		if len(args) > 0 {
 			sep = ", "
 		}
-		fmt.Fprintf(&e.meta, "  %s(o%s%s);\n  return (void*)o;\n}\n\n", e.cfunc(m), sep, strings.Join(args, ", "))
+		fmt.Fprintf(e.meta, "  %s(o%s%s);\n  return (void*)o;\n}\n\n", e.cfunc(m), sep, strings.Join(args, ", "))
 		return
 	}
 
@@ -317,11 +317,11 @@ func (e *Emitter) emitInvoker(cl *ast.Class, m *ast.Method) {
 		recv = cname(m.Owner) + "*"
 		// Method.invoke with a null receiver answers what Java answers, rather
 		// than dereferencing the null the vtable lookup would read.
-		fmt.Fprintf(&e.meta, "static void* %s(void* self, void** a) {\n", name)
-		fmt.Fprintf(&e.meta, "  if (self == NULL) ty_throw(ty_make_ex(TY_NPE, %s));\n",
+		fmt.Fprintf(e.meta, "%svoid* %s(void* self, void** a) {\n", e.link, name)
+		fmt.Fprintf(e.meta, "  if (self == NULL) ty_throw(ty_make_ex(TY_NPE, %s));\n",
 			e.cstr("a method was invoked on a null receiver"))
 	} else {
-		fmt.Fprintf(&e.meta, "static void* %s(void* self, void** a) {\n  (void)self;\n", name)
+		fmt.Fprintf(e.meta, "%svoid* %s(void* self, void** a) {\n  (void)self;\n", e.link, name)
 	}
 	var ps []string
 	if recv != "" {
@@ -360,18 +360,18 @@ func (e *Emitter) emitInvoker(cl *ast.Class, m *ast.Method) {
 
 func (e *Emitter) emitInvokerBody(name string, m *ast.Method, call string) {
 	if isVoid(m.Result) {
-		fmt.Fprintf(&e.meta, "  %s;\n  return NULL;\n}\n\n", call)
+		fmt.Fprintf(e.meta, "  %s;\n  return NULL;\n}\n\n", call)
 		return
 	}
 	if kind := primKindOf(m.Result); kind != 0 {
-		fmt.Fprintf(&e.meta, "  %s r = %s;\n", e.ctype(m.Result), call)
+		fmt.Fprintf(e.meta, "  %s r = %s;\n", e.ctype(m.Result), call)
 		// The invoker hands the runtime an object, so a primitive result is
 		// boxed here -- through the wrapper's valueOf, the same call an
 		// autoboxing site in the program makes.
-		fmt.Fprintf(&e.meta, "  return (void*)(%s);\n}\n\n", e.boxedValue(ast.PrimKind(kind), "r"))
+		fmt.Fprintf(e.meta, "  return (void*)(%s);\n}\n\n", e.boxedValue(ast.PrimKind(kind), "r"))
 		return
 	}
-	fmt.Fprintf(&e.meta, "  return (void*)(%s);\n}\n\n", call)
+	fmt.Fprintf(e.meta, "  return (void*)(%s);\n}\n\n", call)
 }
 
 // argFn is the runtime's checked conversion for a primitive kind.
@@ -439,7 +439,7 @@ func (e *Emitter) emitMethodTable(cl *ast.Class) string {
 			for _, p := range m.Params {
 				types = append(types, e.typeClassExpr(p))
 			}
-			fmt.Fprintf(&e.meta, "static const tyclass* %s[] = {%s};\n", params, strings.Join(types, ", "))
+			fmt.Fprintf(e.meta, "%sconst tyclass* %s[] = {%s};\n", e.link, params, strings.Join(types, ", "))
 		}
 		kind := "TY_METH_INSTANCE"
 		switch {
@@ -466,7 +466,7 @@ func (e *Emitter) emitMethodTable(cl *ast.Class) string {
 				names = append(names, e.cstr(n))
 			}
 			pnames = "pnames_" + suffix
-			fmt.Fprintf(&e.meta, "static const char *const %s[] = {%s};\n", pnames, strings.Join(names, ", "))
+			fmt.Fprintf(e.meta, "%sconst char *const %s[] = {%s};\n", e.link, pnames, strings.Join(names, ", "))
 		}
 		if len(m.ParamAnnos) > 0 {
 			var lists, counts []string
@@ -480,8 +480,8 @@ func (e *Emitter) emitMethodTable(cl *ast.Class) string {
 			}
 			pannos = "pannos_" + suffix
 			pnannos = "pnannos_" + suffix
-			fmt.Fprintf(&e.meta, "static const tyannotation *const %s[] = {%s};\n", pannos, strings.Join(lists, ", "))
-			fmt.Fprintf(&e.meta, "static const int32_t %s[] = {%s};\n", pnannos, strings.Join(counts, ", "))
+			fmt.Fprintf(e.meta, "%sconst tyannotation *const %s[] = {%s};\n", e.link, pannos, strings.Join(lists, ", "))
+			fmt.Fprintf(e.meta, "%sconst int32_t %s[] = {%s};\n", e.link, pnannos, strings.Join(counts, ", "))
 		}
 		entries = append(entries, fmt.Sprintf(
 			"  {.name = %q, .fn = (void*)%s, .owner = &cls_%s, .ret = %s, .params = %s, .nparams = %d, .mods = %d, .kind = %s, .primret = %d, .annos = %s, .nannos = %d, .pannos = %s, .pnannos = %s, .pnames = %s},\n",
@@ -489,7 +489,7 @@ func (e *Emitter) emitMethodTable(cl *ast.Class) string {
 			javaMods(m.Mods), kind, primKindOf(m.Result), anns, nannos, pannos, pnannos, pnames))
 	}
 	name := "mds_" + mangle(cl.Full)
-	fmt.Fprintf(&e.meta, "static const tymethod %s[] = {\n%s};\n", name, strings.Join(entries, ""))
+	fmt.Fprintf(e.meta, "%sconst tymethod %s[] = {\n%s};\n", e.link, name, strings.Join(entries, ""))
 	e.attach(cl, "methods", name, "tymethod", len(entries), "nmethods")
 	return name
 }
@@ -506,7 +506,7 @@ func (e *Emitter) emitConstTable(cl *ast.Class) string {
 	// own constants -- so it pulls in no class a program was not already
 	// holding.
 	name := "cts_" + mangle(cl.Full)
-	fmt.Fprintf(&e.data, "static void* %s[%d];\n", name, len(cl.EnumConsts))
+	fmt.Fprintf(e.data, "%svoid* %s[%d];\n", e.link, name, len(cl.EnumConsts))
 	return name
 }
 
@@ -537,10 +537,26 @@ func (e *Emitter) forNameTable() (string, int) {
 		return "NULL", 0
 	}
 	name := "forname_all"
+	if e.split {
+		// The table is searched by Class.forName, whose body the library's unit
+		// carries, but it names the program's classes as well as the library's,
+		// so it cannot be part of a unit compiled once and shared. It is
+		// written into the program's unit inside the function that reads it,
+		// which is what keeps it from pinning every class it names: an array at
+		// file scope is a root, and one inside a function is dropped with it.
+		if e.forName == nil {
+			// the library's unit: the program's unit defines it
+			e.headerDecls += "\nvoid* ty_prog_forname(tystr* name, tyclass* clscls);\n"
+		} else {
+			fmt.Fprintf(e.forName, "\nvoid* ty_prog_forname(tystr* name, tyclass* clscls) {\n  static tyclass* %s[%d] = {%s}; %s\n  return ty_class_forname_in(name, %s, %d, clscls);\n}\n",
+				name, len(names), strings.Join(names, ", "), reflectOnly, name, len(names))
+		}
+		return "ty_prog_forname", 0
+	}
 	// The table is marked reflectOnly for the same reason an attachment is: it
 	// names every class of the program, and it does so for the reflective call
 	// that has not happened yet, not because the program's own code names them.
-	fmt.Fprintf(e.code, "static tyclass* %s[%d] = {%s}; %s\n",
+	fmt.Fprintf(e.code, "%styclass* %s[%d] = {%s}; %s\n", e.link,
 		name, len(names), strings.Join(names, ", "), reflectOnly)
 	return name, len(names)
 }
@@ -555,8 +571,16 @@ func (e *Emitter) forNameTable() (string, int) {
 // reach rather than what the program's own code calls. codegen/prune.go reads
 // the mark when it decides whether the program uses TLS.
 func (e *Emitter) attach(cl *ast.Class, field, table, elem string, n int, count string) {
-	e.metaInit = append(e.metaInit, fmt.Sprintf("cls_%s.%s = (%s*)%s; cls_%s.%s = %d; %s",
-		mangle(cl.Full), field, elem, table, mangle(cl.Full), count, n, reflectOnly))
+	line := fmt.Sprintf("cls_%s.%s = (%s*)%s; cls_%s.%s = %d; %s",
+		mangle(cl.Full), field, elem, table, mangle(cl.Full), count, n, reflectOnly)
+	// A prelude class's tables are defined by the library's unit in a split
+	// build, so they are attached by the library's install function; the
+	// program's own classes are attached by its entry point.
+	if e.split && cl.Prelude() {
+		e.libMeta = append(e.libMeta, line)
+		return
+	}
+	e.metaInit = append(e.metaInit, line)
 }
 
 // reflectMethodCount is how many entries a class's method table holds: every
@@ -754,7 +778,7 @@ func (e *Emitter) emitAnnoTable(suffix string, annos []*ast.Annotation) (string,
 		argsName := "NULL"
 		if len(args) > 0 {
 			argsName = fmt.Sprintf("annarg_%s_%d", suffix, i)
-			fmt.Fprintf(&e.meta, "static const tyannoarg %s[] = {\n%s};\n", argsName, strings.Join(args, ""))
+			fmt.Fprintf(e.meta, "%sconst tyannoarg %s[] = {\n%s};\n", e.link, argsName, strings.Join(args, ""))
 		}
 		entries = append(entries, fmt.Sprintf("  {.type = &cls_%s, .args = %s, .nargs = %d},\n",
 			mangle(cl.Full), argsName, len(args)))
@@ -763,7 +787,7 @@ func (e *Emitter) emitAnnoTable(suffix string, annos []*ast.Annotation) (string,
 		return "NULL", 0
 	}
 	name := "anns_" + suffix
-	fmt.Fprintf(&e.meta, "static const tyannotation %s[] = {\n%s};\n", name, strings.Join(entries, ""))
+	fmt.Fprintf(e.meta, "%sconst tyannotation %s[] = {\n%s};\n", e.link, name, strings.Join(entries, ""))
 	return name, len(entries)
 }
 

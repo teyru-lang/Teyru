@@ -21,7 +21,7 @@ const forNameKey = "Class.forNameOf(String)"
 
 func (e *Emitter) emitSynthetic(cl *ast.Class, m *ast.Method) {
 	e.indent = 0
-	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
+	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	e.stackCheck()
 	if nativeKey(m) == forNameKey {
@@ -29,8 +29,17 @@ func (e *Emitter) emitSynthetic(cl *ast.Class, m *ast.Method) {
 		// file scope -- see forNameTable -- so it is written here, in the body
 		// of the one function that reads it.
 		table, count := e.forNameTable()
-		e.line("return (C_%s*)ty_class_forname_in(a0, %s, %d, &cls_%s);\n",
-			mangle(m.Owner.Full), table, count, mangle(m.Owner.Full))
+		if e.split {
+			// The table is the program's unit's, and this body -- the standard
+			// library's -- reaches it through a call, because a table naming
+			// the program's classes cannot be part of a unit compiled once and
+			// shared by every program.
+			e.line("return (C_%s*)%s(a0, &cls_%s);\n",
+				mangle(m.Owner.Full), table, mangle(m.Owner.Full))
+		} else {
+			e.line("return (C_%s*)ty_class_forname_in(a0, %s, %d, &cls_%s);\n",
+				mangle(m.Owner.Full), table, count, mangle(m.Owner.Full))
+		}
 		e.indent--
 		e.code.WriteString("}\n\n")
 		return

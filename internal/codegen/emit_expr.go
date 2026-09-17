@@ -1,7 +1,9 @@
 package codegen
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -400,18 +402,86 @@ func (e *Emitter) literal(v *ast.Literal) string {
 	return "0"
 }
 
-// strLit interns a string literal into a static global.
+// strLit interns a string literal into a global object of the unit it is first
+// written in.
+//
+// One literal is one object, and that is a property rather than an
+// optimisation: `==` on two String references is a reference comparison, as in
+// Java, so two objects holding "abc" would make `s == "abc"` answer false where
+// the language says true. In a build of one translation unit the map below is
+// what holds that. In a split build the literal is named after its own text and
+// defined by whichever unit owns it -- the standard library's literals by the
+// library, the rest by the program -- so the two units share one object per
+// text rather than one per text per unit.
 func (e *Emitter) strLit(s string) string {
-	if id, ok := e.strings[s]; ok {
+	if !e.split {
+		if id, ok := e.strings[s]; ok {
+			return fmt.Sprintf("((tystr*)&S%d)", id)
+		}
+		id := len(e.strOrder)
+		e.strings[s] = id
+		e.strOrder = append(e.strOrder, s)
+		data := e.cstr(s)
+		fmt.Fprintf(e.data, "%stystr S%d = {{&cls_%s}, %d, %s};\n", e.link, id,
+			mangle(e.prog.Builtins.String.Full), len(s), data)
 		return fmt.Sprintf("((tystr*)&S%d)", id)
 	}
-	id := len(e.strOrder)
-	e.strings[s] = id
-	e.strOrder = append(e.strOrder, s)
-	data := e.cstr(s)
-	fmt.Fprintf(&e.data, "static tystr S%d = {{&cls_%s}, %d, %s};\n", id,
-		mangle(e.prog.Builtins.String.Full), len(s), data)
-	return fmt.Sprintf("((tystr*)&S%d)", id)
+	name := literalName(s)
+	if !e.defined[name] {
+		e.defined[name] = true
+		e.litDefs[name] = fmt.Sprintf("tystr %s = {{&cls_%s}, %d, %s};\n", name,
+			mangle(e.prog.Builtins.String.Full), len(s), e.cstr(s))
+		if e.lib {
+			// The library's unit defines every literal it meets, and declares
+			// it in the header so the program's unit can name it.
+			e.headerDecls += "extern tystr " + name + ";\n"
+		}
+	}
+	// A literal a standard library body uses is the library's to define, whether
+	// this unit meets it in a library body or in the program's own code: one
+	// literal is one object, and two units each defining their own would make
+	// `a == "abc"` answer false where the language says true.
+	if e.sideLib {
+		if !e.litPrelude[name] {
+			e.litPrelude[name] = true
+			e.libLiterals = append(e.libLiterals, s)
+		}
+	}
+	return "((tystr*)&" + name + ")"
+}
+
+// literalDefs returns the definitions of the literals this unit owns: the
+// library owns every literal its own bodies use, and the program owns the rest.
+// They are written at the end rather than where the literal was met, because
+// which unit owns one is not known until both halves of the emitter have run:
+// the class order puts the program's classes between the library's, and the
+// literal a library body uses may be met after the program's own code already
+// used the same text.
+func (e *Emitter) literalDefs(lib bool) string {
+	if !e.split {
+		return ""
+	}
+	names := make([]string, 0, len(e.litDefs))
+	for name := range e.litDefs {
+		if e.litPrelude[name] == lib {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(e.litDefs[name])
+	}
+	return b.String()
+}
+
+// literalName is the C name of the object holding one string literal. It is
+// derived from the literal's text so that the two units of a split build agree
+// on which object they mean without either having to be told: a literal is
+// named after what it holds, and the same text is one object.
+func literalName(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("S_%x", sum[:8])
 }
 
 func (e *Emitter) ident(v *ast.Ident) string {
@@ -2000,9 +2070,9 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	if lam == nil || m.IsCtor {
 		return
 	}
-	fmt.Fprintf(&e.fns, "static %s;\n", e.signature(m))
+	fmt.Fprintf(e.fns, "%s%s;\n", e.link, e.signature(m))
 	e.indent = 0
-	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
+	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	e.stackCheck()
 	for i, pv := range m.ParamVars {
