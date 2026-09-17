@@ -86,6 +86,24 @@ type bail struct{ r *Refusal }
 // it.
 func EmitLLVM(p *sema.Program) (ir string, ref *Refusal) {
 	e := newLLVMEmitter(p)
+	/* The collector is precise about the frames a compiler describes, and this
+	   back end describes none: it emits the program's own IR, where a reference
+	   can live in an SSA register or in an alloca of the back end's choosing,
+	   and it has no frame maps to hand the runtime. A program built with it
+	   would get a collector that believes its roots are exact and a back end
+	   that never said which words are references, and the failure that follows
+	   is a use-after-free that shows up as a wrong answer days later. So it is
+	   refused by name, the way every other construct outside this back end's
+	   subset is, and the refusal names the switch that puts the conservative
+	   collector back so the program can still be built. */
+	if !frameMapsOff {
+		return "", &Refusal{
+			Code: CodeLLVMUnsupported,
+			Thing: "frame maps: this back end does not say which of a frame's words hold references, and the " +
+				"collector now reads exactly what a compiler describes -- set TEYRU_NO_FRAME_MAPS=1 to build " +
+				"this program with the conservative collector instead",
+		}
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			b, ok := r.(bail)

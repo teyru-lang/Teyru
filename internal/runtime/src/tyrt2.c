@@ -68,6 +68,7 @@ void ty_clinit(tyclass *c) {
        ever reaches this class. */
     tycatch frame;
     frame.prev = ty_cur_catch;
+    frame.frames = ty_frames;
     frame.ex = NULL;
     ty_cur_catch = &frame;
     if (setjmp(frame.buf) == 0) {

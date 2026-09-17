@@ -169,6 +169,15 @@ static void park_point(char *anchor) {
      watermark trails behind it. The collector walks slabs by that watermark, so
      it has to be exact before the thread stops. */
   ty_heap_sync();
+  /* The frame chain as it is now. A stopped thread's stack is still while a
+     collection runs, so the chain it publishes here is the chain it has, and it
+     is read from another thread through this field because C11 has no way to
+     reach a thread-local of a thread that is not running. Unlike park_sp this is
+     the *current* value and not a low-water mark: park_sp only moves down
+     because a deeper value scans more, but a frame map that is not in the chain
+     is a root the precise walk does not take, so this one is published as it is
+     every time the thread stops. */
+  ty_self->frames = ty_frames;
   if (!ty_self->park_sp || (uintptr_t)anchor < (uintptr_t)ty_self->park_sp) {
     ty_self->park_sp = anchor;
   }
@@ -421,6 +430,7 @@ void *ty_thread_start(void *(*fn)(void *), void *arg) {
      program carries on. The frame is the same one generated try/catch uses. */
   tycatch frame;
   frame.prev = ty_cur_catch;
+  frame.frames = ty_frames;
   frame.ex = NULL;
   ty_cur_catch = &frame;
   if (setjmp(frame.buf) == 0) {

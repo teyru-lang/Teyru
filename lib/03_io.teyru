@@ -92,6 +92,12 @@ class System {
      there is no JVM behind this one. */
   public static native String getProperty(String key)
   public static native void gc()
+  /* The live set as of the last collection, in bytes: what the collector's own
+     mark phase reached, and 0 before the first collection. Teyru's own rather
+     than Java's -- there is no java.lang.System method for it -- and it exists
+     so that a test can state what a collection kept instead of inferring it
+     from the heap's size. */
+  public static native long liveBytes()
   public static String lineSeparator() {
     return getProperty("line.separator")
   }

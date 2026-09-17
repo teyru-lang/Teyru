@@ -291,7 +291,18 @@ func (e *Emitter) unboxAccessor(cl *ast.Class, k ast.PrimKind) *ast.Method {
 
 // ---------------------------------------------------------------- expressions
 
+// expr renders an expression, and -- when a frame map is being written for the
+// function it belongs to -- puts a value that was created during the expression
+// into a word of that map first; see frameTemp and frameWrap.
 func (e *Emitter) expr(x ast.Expr) string {
+	v := e.exprRaw(x)
+	if e.frameWrap(x) {
+		return e.frameTemp(x.GetType(), v)
+	}
+	return v
+}
+
+func (e *Emitter) exprRaw(x ast.Expr) string {
 	if x == nil {
 		return "0"
 	}
@@ -2002,6 +2013,8 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	}
 	fmt.Fprintf(&e.fns, "static %s;\n", e.signature(m))
 	e.indent = 0
+	restoreFrame := e.frameReset()
+	defer restoreFrame()
 	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
 	e.indent++
 	e.stackCheck()

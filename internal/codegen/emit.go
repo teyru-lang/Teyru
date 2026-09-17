@@ -7,6 +7,7 @@ package codegen
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -65,6 +66,21 @@ type Emitter struct {
 	// synthesizes; filled in while the function bodies are emitted and written
 	// out with the rest of the metadata, before them
 	primClasses map[ast.PrimKind]bool
+	// frameMap is set while the body of a function whose frame the collector has
+	// a map for is being emitted: it turns on the per-block kill stores (frames.go)
+	// and the frame prologue emitMappedBody writes around the body.
+	frameMap bool
+	// useNow collects the variables the statement being emitted mentions, which
+	// is what says where a reference's last use is. See emitBlockInner.
+	useNow map[*ast.Var]bool
+	// frameTemps are the frame-level words this function's body puts a value in
+	// flight into -- one per expression that creates an object where another
+	// expression may run before it is consumed. They are declared in the frame
+	// prologue and named by its map. See frameTemp.
+	frameTemps []string
+	// frameBase is how many words of the frame's map come before them: one per
+	// reference-typed parameter.
+	frameBase int
 }
 
 // finFrame is one try statement whose finally action must still run.
@@ -121,6 +137,9 @@ func Emit(p *sema.Program) (string, Link) {
 	// The last step is the one piece of reachability this back end decides for
 	// itself: a vtable holds the address of every method its class declares, and
 	// an address is what link-time optimisation cannot drop (see prune.go).
+	if p0 := os.Getenv("TEYRU_DUMP_C"); p0 != "" {
+		os.WriteFile(p0, []byte(out.String()), 0644)
+	}
 	src, tls := pruneVtables(out.String())
 	return src, Link{TLS: tls}
 }
@@ -771,27 +790,34 @@ func (e *Emitter) emitMethod(cl *ast.Class, m *ast.Method, idx int) {
 	for i, pv := range m.ParamVars {
 		e.locals[pv] = fmt.Sprintf("a%d", i)
 	}
-	if m.IsCtor {
-		e.emitCtorBody(cl, m)
-	} else if body != nil {
-		if m.Mods.Has(ast.ModSynchronized) {
-			// A synchronized method holds its monitor for the whole body, the
-			// way Java's does. The lock is the instance, or the class for a
-			// static method -- the same object Java locks, since a Class value
-			// in Teyru is that class's tyclass and there is exactly one per
-			// class. Until the runtime's monitors became real this modifier was
-			// parsed, kept for reflection and emitted as nothing at all.
-			e.syncBlock(syncMethodLock(cl, m), false, func() {
+	// The frame map is written around the body: the collector's precise view of
+	// this frame is what the prologue there declares and what the body fills in
+	// (frames.go). The stack check stays the first statement, before it.
+	e.frameTemps = nil
+	e.frameBase = len(e.funcParams(m))
+	e.emitMappedBody(e.cfunc(m), e.funcParams(m), func() {
+		if m.IsCtor {
+			e.emitCtorBody(cl, m)
+		} else if body != nil {
+			if m.Mods.Has(ast.ModSynchronized) {
+				// A synchronized method holds its monitor for the whole body, the
+				// way Java's does. The lock is the instance, or the class for a
+				// static method -- the same object Java locks, since a Class value
+				// in Teyru is that class's tyclass and there is exactly one per
+				// class. Until the runtime's monitors became real this modifier was
+				// parsed, kept for reflection and emitted as nothing at all.
+				e.syncBlock(syncMethodLock(cl, m), false, func() {
+					e.emitBlockInner(body)
+				})
+			} else {
 				e.emitBlockInner(body)
-			})
+			}
 		} else {
-			e.emitBlockInner(body)
+			// Only reachable for abstract or native methods with no implementation;
+			// fail loudly instead of returning an undefined value.
+			e.line("ty_unimplemented(%s);\n", e.cstr(cl.Full+"."+m.Name))
 		}
-	} else {
-		// Only reachable for abstract or native methods with no implementation;
-		// fail loudly instead of returning an undefined value.
-		e.line("ty_unimplemented(%s);\n", e.cstr(cl.Full+"."+m.Name))
-	}
+	})
 	e.indent--
 	e.code.WriteString("}\n\n")
 }

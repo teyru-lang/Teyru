@@ -114,6 +114,86 @@ typedef struct tychunk {
    this list can be reclaimed by a collection; a thread's private slab cannot,
    because the thread still walks it. */
 static tychunk *chunks = NULL;
+
+/* ------------------------------------------------------------------ frames */
+
+/* The chain of frame maps this thread is inside. tyrt.h's tyframe section has
+   the argument for what a map is and is not; what follows is the mechanics.
+
+   Two frames are mapped by one function each, they are pushed and popped in
+   order (one thread's stack is a stack), and the collector reads the chain of a
+   stopped thread through tythread.frames, which the thread publishes at every
+   stop point next to the stack pointer it parked at. */
+_Thread_local tyframe *ty_frames = NULL;
+
+/* Enter one generated frame: link its map into the chain and fill in what the
+   generated code cannot compute about its own frame.
+
+   `lo` is the frame's floor as nearly as this call can see it. This function is
+   called from the frame being mapped, so its own frame lies entirely below that
+   frame's own storage, and the caller's stack pointer when it called is the
+   frame's floor plus whatever the call itself pushed. Both x86-64 and arm64
+   build a frame record with the saved frame pointer and the return address at
+   the top of the frame, which puts the caller's stack pointer at
+   frame_address(0) + 16 in this frame; the eight bytes above that are the
+   return address the call pushed, and they are excluded too. Erring low is the
+   safe direction: an extent that reaches below the frame excludes words that
+   belong to the frame below it -- the registers *it* spilled, which is where a
+   value this frame holds only in a register would otherwise be found -- so the
+   constant here is one pointer, not two. */
+__attribute__((noinline)) void ty_frame_enter_(tyframe *f, void **slots, int32_t nslots, int32_t fno,
+                                                 char *frame_addr) {
+  f->prev = ty_frames;
+  f->slots = slots;
+  f->nslots = nslots;
+  f->cap = nslots;
+  f->fno = fno;
+  f->lo = (char *)__builtin_frame_address(0) + sizeof(void *);
+  f->hi = frame_addr + sizeof(void *);
+  /* The register half of the map. A callee-saved register is the caller's
+     value here, by the ABI; see tyrt.h's tyframe comment for why all of them
+     are taken rather than the ones that hold a reference. */
+  for (int32_t i = 0; i < TY_FRAME_REGS; i++) f->saved[i] = NULL;
+#if defined(__x86_64__)
+  /* Written as one store per register rather than as a local declared to live in
+     a named one: a `register ... asm("rbx")` variable reads as uninitialized to
+     clang and its -Wuninitialized, and there is nothing to initialize -- the
+     value is the register's. A memory output says exactly what is meant. */
+  __asm__ __volatile__("movq %%rbx, %0" : "=m"(f->saved[0]));
+  __asm__ __volatile__("movq %%r12, %0" : "=m"(f->saved[1]));
+  __asm__ __volatile__("movq %%r13, %0" : "=m"(f->saved[2]));
+  __asm__ __volatile__("movq %%r14, %0" : "=m"(f->saved[3]));
+  __asm__ __volatile__("movq %%r15, %0" : "=m"(f->saved[4]));
+#elif defined(__aarch64__)
+  __asm__ __volatile__("str x19, %0" : "=m"(f->saved[0]));
+  __asm__ __volatile__("str x20, %0" : "=m"(f->saved[1]));
+  __asm__ __volatile__("str x21, %0" : "=m"(f->saved[2]));
+  __asm__ __volatile__("str x22, %0" : "=m"(f->saved[3]));
+  __asm__ __volatile__("str x23, %0" : "=m"(f->saved[4]));
+  __asm__ __volatile__("str x24, %0" : "=m"(f->saved[5]));
+  __asm__ __volatile__("str x25, %0" : "=m"(f->saved[6]));
+  __asm__ __volatile__("str x26, %0" : "=m"(f->saved[7]));
+  __asm__ __volatile__("str x27, %0" : "=m"(f->saved[8]));
+  __asm__ __volatile__("str x28, %0" : "=m"(f->saved[9]));
+#endif
+  ty_frames = f;
+}
+
+void ty_frame_put(tyframe *f, int32_t k, void *p) {
+  if (k < 0 || k >= f->cap) {
+    fprintf(stderr, "teyru: frame %d records word %d of a map of %d\n", f->fno, k, f->cap);
+    abort();
+  }
+  f->slots[k] = p;
+}
+
+/* Leave it. Only the innermost frame may unlink itself: after a longjmp has
+   rewound the chain to the landing point, the frames it dropped still run their
+   epilogues as the stack unwinds under them, and each of those must leave the
+   chain alone rather than relink a dead frame's predecessor. */
+void ty_frame_leave(tyframe *f) {
+  if (ty_frames == f) ty_frames = f->prev;
+}
 static void **roots_static = NULL; /* addresses of global slots */
 static size_t nroots_static = 0, caproots_static = 0;
 int64_t ty_gc_threshold = 4 << 20;
@@ -137,6 +217,13 @@ static int gc_disabled = 0;
 static int64_t gc_stress_every = 0; /* 0: the byte budget, as always */
 static int64_t gc_stress_count = 0;
 static int gc_trace = 0;
+/* TEYRU_GC_VERIFY=1 reads the words inside every mapped frame that the map does
+   not name and reports each one that holds a live object. See verify_frame. */
+static int gc_verify = 0;
+/* TEYRU_GC_NOEXCL=1 keeps the conservative pass over the whole range: the
+   diagnostic that says whether a difference the maps make is what broke a
+   program. */
+static int gc_noexcl = 0;
 
 /* The slabs one collection walks: the shared list above, plus every registered
    thread's private slab (tyrt_thread.c). It is rebuilt at the start of each
@@ -429,6 +516,13 @@ static void collect_slabs(void) {
   gc_heap_span = hi ? (size_t)(hi - lo) : 0;
 }
 
+/* How much of a collection's root scan was precise and how much was
+   conservative: frames walked, words read out of a frame map, words read by the
+   conservative pass. Only TEYRU_GCTRACE reads them. */
+static int64_t gc_frames_walked = 0, gc_precise_words = 0, gc_conserv_words = 0;
+/* The range this collection scans: set before the walk, read by frame_map_ok. */
+static char *gc_scan_lo = NULL, *gc_scan_hi = NULL;
+
 /* Scans one thread's stack conservatively, from where that thread stopped (or
    from this frame, for the thread that is collecting) up to the top of its
    stack. `lo` is a lower bound on where the thread's live frames begin, and
@@ -436,7 +530,16 @@ static void collect_slabs(void) {
    an object keeps it, a word that names anything else is ignored. That is the
    conservative half of a conservative collector, and it is why an object stays
    alive for as long as any word of any stopped thread's stack happens to look
-   like its address. */
+   like its address.
+
+   What the frame maps changed is *where* this runs. It used to be the whole
+   range, generated frames included; now it is the complement of the mapped
+   extents, so the words inside a mapped frame that the map does not name are
+   left alone. Everything that is not a generated frame's own storage -- the
+   runtime's C frames, the platform's wait frames, the register spills a stop
+   point writes, the prologue above the outermost generated frame, and every
+   generated frame that emits no map -- is still read this way, which is what
+   keeps the runtime's own discipline exactly as it was. */
 static void scan_stack(char *lo, char *hi) {
   /* The scan steps a pointer at a time, so it has to start on a pointer
      boundary: a word read from a misaligned address is a value shifted by a few
@@ -453,6 +556,132 @@ static void scan_stack(char *lo, char *hi) {
   }
   for (char *q = lo; q + sizeof(void *) <= hi; q += sizeof(void *)) {
     mark_value(*(void **)q);
+    if (gc_trace) gc_conserv_words++;
+  }
+}
+
+/* Whether a frame record and the array it names are consistent. */
+static int frame_map_ok(tyframe *f, char *lo, char *hi) {
+  if (f->nslots < 0 || f->nslots > (1 << 16)) return 0;
+  if (f->nslots == 0) return 1;
+  if (!f->slots) return 0;
+  /* The words are the frame's own storage and the array that names them is too,
+     so both lie on the thread's stack -- between the bottom of the range being
+     scanned and the top of the thread's stack. A parameter is the one word that
+     is not: the ABI hands the callee an argument in the *caller's* outgoing
+     area, below the frame's own floor and so below the frame's extent, which is
+     why the test is against the stack and not against the extent. */
+  uintptr_t s = (uintptr_t)f->slots, e = s + (uintptr_t)f->nslots * sizeof(void *);
+  if (s < (uintptr_t)lo || e > (uintptr_t)hi) return 0;
+  for (int32_t i = 0; i < f->nslots; i++) {
+    uintptr_t p = (uintptr_t)f->slots[i];
+    if (p && (p < (uintptr_t)lo || p >= (uintptr_t)hi)) return 0;
+  }
+  return 1;
+}
+
+/* Marks one mapped frame: the words its map names, and the callee-saved
+   registers the ABI handed it at entry. Precise in the sense that matters --
+   every word here is one the compiler says holds a reference, or a register
+   whose value a reference could be in -- and it is the whole of what a mapped
+   frame contributes to the root set. Its other words are neither read nor
+   needed: the runtime's other frames are, and they are outside the extent. */
+static void mark_frame(tyframe *f) {
+  /* This frame's words are a contiguous array inside the frame, so a record
+     whose array is not inside the frame it names is not believed: it is one a
+     frame left in the chain without unlinking itself, whose storage has since
+     been reused. Nothing is lost by dropping it -- the words the map does not
+     describe are the conservative pass's, and a frame that cannot be described
+     is simply one the pass covers. */
+  if (!frame_map_ok(f, gc_scan_lo, gc_scan_hi)) {
+    if (gc_trace) fprintf(stderr, "teyru gc: frame %d has no usable map (n=%d slots=%p lo=%p hi=%p)\n", f->fno, f->nslots, (void*)f->slots, (void*)f->lo, (void*)f->hi);
+    return;
+  }
+  if (gc_trace)
+    fprintf(stderr, "  frame %d n=%d slots=%p lo=%p hi=%p\n", f->fno, f->nslots, (void *)f->slots,
+            (void *)f->lo, (void *)f->hi);
+  for (int32_t i = 0; i < f->nslots; i++) {
+    /* A word the prologue declared and no registration has filled yet: the
+       declaration it stands for is one this execution has not reached -- inside
+       a branch, or a loop body, or after the point that is collecting -- and a
+       frame's map is walked from the moment the frame is entered, so those
+       words are zero, and zero means there is no value yet rather than a value
+       at address zero. */
+    if (!f->slots[i]) continue;
+    mark_value(*(void **)f->slots[i]);
+    if (gc_trace) gc_precise_words++;
+  }
+  for (int32_t i = 0; i < TY_FRAME_REGS; i++) {
+    mark_value(f->saved[i]);
+    if (gc_trace) gc_precise_words++;
+  }
+  if (gc_trace) gc_frames_walked++;
+  if (gc_trace) gc_frames_walked++;
+}
+
+/* Whether a frame's recorded extent may be used to exclude words from the
+   conservative pass. A record whose bounds are inverted, outside the range
+   being scanned, or empty is ignored: the frame's words are then scanned the
+   old way, which is over-approximation and never a missing root. */
+static int extent_usable(tyframe *f, char *lo, char *hi) {
+  char *flo = (char *)f->lo, *fhi = (char *)f->hi;
+  if (!flo || !fhi) return 0;
+  if ((uintptr_t)flo >= (uintptr_t)fhi) return 0;
+  if ((uintptr_t)flo < (uintptr_t)lo || (uintptr_t)fhi > (uintptr_t)hi) return 0;
+  if (((uintptr_t)fhi - (uintptr_t)flo) > (16u << 20)) return 0;
+  return 1;
+}
+
+/* The conservative pass over one thread: everything in [lo, hi) that no mapped
+   frame covers. The chain runs from the innermost frame outwards, so the frames
+   are in increasing address order and the gaps between them are walked once, in
+   order, by a cursor that only moves up.
+
+   A frame the cursor has already passed -- one entirely below the point reached
+   so far, which a chain of records from two different stack depths would give --
+   is left alone rather than allowed to move the cursor back, so no word is
+   scanned twice and none is skipped. */
+static void scan_unmapped(tyframe *chain, char *lo, char *hi) {
+  char *cur = lo;
+  for (tyframe *f = chain; f; f = f->prev) {
+    if (!extent_usable(f, lo, hi)) continue;
+    char *flo = (char *)f->lo, *fhi = (char *)f->hi;
+    if ((uintptr_t)flo > (uintptr_t)cur) scan_stack(cur, flo);
+    if ((uintptr_t)fhi > (uintptr_t)cur) cur = fhi;
+  }
+  if ((uintptr_t)cur < (uintptr_t)hi) scan_stack(cur, hi);
+}
+
+/* What the maps do not cover, reported rather than ignored: TEYRU_GC_VERIFY=1
+   makes a collection read the words inside every mapped frame that the map does
+   not name and print each one that names a live object. It is the missing-root
+   check. A word there that names an object is one of two things -- a value the
+   compiler kept somewhere the map cannot name (a spill slot of its own, a
+   callee-saved register saved by a frame between two mapped ones), which is a
+   root the precise pass did not take and therefore a use-after-free waiting to
+   happen, or a stale word whose object is live anyway, which is only
+   retention -- and the two are the same word as far as this can tell. What the
+   report is for is that the first kind cannot appear quietly: the second kind
+   repeats the same object every collection and disappears when the map grows a
+   slot for it. */
+static void verify_frame(tyframe *f) {
+  if (!extent_usable(f, f->lo, f->hi)) return;
+  char *lo = (char *)((uintptr_t)f->lo & ~(uintptr_t)(sizeof(void *) - 1));
+  char *hi = (char *)f->hi;
+  for (char *q = lo; q + sizeof(void *) <= hi; q += sizeof(void *)) {
+    int named = 0;
+    for (int32_t i = 0; i < f->nslots; i++) {
+      if ((char *)f->slots[i] == q) {
+        named = 1;
+        break;
+      }
+    }
+    if (named) continue;
+    void *v = *(void **)q;
+    if (v && valid_obj((char *)v, NULL)) {
+      fprintf(stderr, "teyru gc: verify: frame %d word +%ld holds %p, which no map names\n", f->fno,
+              (long)(q - lo), v);
+    }
   }
 }
 
@@ -490,6 +719,7 @@ static void gc_collect(const char *trigger) {
   /* Counted by mark_value, the one place that sees every live object exactly
      once. */
   live_bytes = 0;
+  gc_frames_walked = gc_precise_words = gc_conserv_words = 0;
   /* roots: every thread's shadow stack, and its stack and registers */
   for (tythread *t = ty_thread_list(); t; t = t->next) {
     if (t->state == TY_TH_DONE) continue; /* its stack is going away with it */
@@ -504,7 +734,20 @@ static void gc_collect(const char *trigger) {
     char *hi = t->stack_top ? t->stack_top : t->park_sp + 0x10000;
     char *lo = t->park_sp - TY_PARK_MARGIN;
     if (t->stack_base && lo < t->stack_base) lo = t->stack_base;
-    scan_stack(lo, hi);
+    gc_scan_lo = lo;
+    gc_scan_hi = hi;
+    /* Its frames, precisely: the map of every generated frame it is inside, with
+       the registers each of them was entered with. `t->frames` is what the
+       thread published the last time it stopped, which is now -- it is stopped
+       at a stop point, and the chain it published there is the chain it has. */
+    for (tyframe *f = t->frames; f; f = f->prev) mark_frame(f);
+    /* And everything the maps do not cover, conservatively: the runtime's own
+       frames, the platform's wait frames, the register spills of the stop point,
+       and any generated frame that emitted no map. */
+    if (gc_noexcl) scan_stack(lo, hi); else scan_unmapped(t->frames, lo, hi);
+    if (gc_verify) {
+      for (tyframe *f = t->frames; f; f = f->prev) verify_frame(f);
+    }
   }
   /* roots: registered globals */
   for (size_t i = 0; i < nroots_static; i++) {
@@ -517,7 +760,13 @@ static void gc_collect(const char *trigger) {
   setjmp(regs);
   char *sp = (char *)&regs;
   char *hi = ty_self->stack_top ? ty_self->stack_top : sp + 0x10000;
-  scan_stack(sp, hi);
+  gc_scan_lo = sp;
+  gc_scan_hi = hi;
+  for (tyframe *f = ty_frames; f; f = f->prev) mark_frame(f);
+  if (gc_noexcl) scan_stack(sp, hi); else scan_unmapped(ty_frames, sp, hi);
+  if (gc_verify) {
+    for (tyframe *f = ty_frames; f; f = f->prev) verify_frame(f);
+  }
   /* trace */
   while (mark_sp) {
     void *o = mark_stack[--mark_sp];
@@ -593,9 +842,12 @@ static void gc_collect(const char *trigger) {
     /* After the world is running again: printing inside the stop would charge
        every other thread for the time it takes to write the line, and the pause
        the line reports would then include the writing of it. */
-    fprintf(stderr, "teyru gc: trigger=%s pause=%.3fms heap=%llukB->%llukB live=%llukB\n",
+    fprintf(stderr,
+            "teyru gc: trigger=%s pause=%.3fms heap=%llukB->%llukB live=%llukB"
+            " frames=%lld precise=%lld conservative=%lld\n",
             trigger, (double)stopped_for / 1e6, (unsigned long long)(before / 1024),
-            (unsigned long long)(after / 1024), (unsigned long long)(live_bytes / 1024));
+            (unsigned long long)(after / 1024), (unsigned long long)(live_bytes / 1024),
+            (long long)gc_frames_walked, (long long)gc_precise_words, (long long)gc_conserv_words);
   }
 }
 
@@ -606,6 +858,16 @@ void ty_gc(void) {
   gc_collect("explicit");
   ty_heap_unlock();
 }
+
+/* The live set as of the last collection, in bytes. System.liveBytes() is the
+   program's view of it, and the tests that check what a collection kept use it:
+   the number is the collector's own accounting -- the sizes of the blocks the
+   mark phase reached -- and not a measure taken around it, so "this object is
+   being kept alive" is a statement the collector makes rather than one a
+   program infers from the heap's size. Before the first collection it is 0,
+   which is also what an empty live set reports: a program that asks has to
+   collect first, and System.gc() is what does it. */
+int64_t ty_gc_live_bytes(void) { return live_bytes; }
 
 /* ------------------------------------------------------------------ allocation */
 
@@ -920,6 +1182,13 @@ void ty_gc_init(void) {
   }
   const char *trace = getenv("TEYRU_GCTRACE");
   gc_trace = trace && *trace && strcmp(trace, "0") != 0;
+  /* TEYRU_GC_VERIFY=1 checks the frame maps against the conservative pass: see
+     verify_frame. It costs a walk of every mapped frame's words per collection,
+     so it is for a diagnosis and not for a run. */
+  const char *verify = getenv("TEYRU_GC_VERIFY");
+  gc_verify = verify && *verify && strcmp(verify, "0") != 0;
+  const char *noexcl = getenv("TEYRU_GC_NOEXCL");
+  gc_noexcl = noexcl && *noexcl && strcmp(noexcl, "0") != 0;
 }
 
 void *ty_alloc_arr(int64_t len, size_t elemsize) {
@@ -981,6 +1250,18 @@ void ty_uncaught_thread(void *e, tythread *t) {
 void ty_throw(void *e) {
   if (!ty_cur_catch) ty_uncaught(e);
   ty_cur_catch->ex = (tyobj*)e;
+  /* The landing frame's map, not the call's. longjmp drops every frame between
+     here and the setjmp that armed this catch frame, and those frames' map
+     records are stack storage that is about to be reused by whatever runs next;
+     the chain has to be rewound to what it was when the catch was armed, or the
+     collector would walk dead frames and never reach the live ones below the
+     landing point -- the frames whose references it is the maps' job to find.
+     Rewinding here rather than in each landing pad is what makes it true for
+     every catch frame there is: generated code arms these frames and so does the
+     runtime (tyrt2.c, tyrt_reflect.c, tyrt_thread.c), and none of them has to
+     know that a collection exists. It happens before the jump so there is no
+     window in which the chain and the stack disagree. */
+  ty_frames = ty_cur_catch->frames;
   longjmp(ty_cur_catch->buf, 1);
 }
 
@@ -3634,7 +3915,13 @@ void ty_init(void) {
      stack. Installed here, before any thread exists, so that the process-wide
      half of it is installed exactly once and by a thread nothing else can race
      with. */
-  typlat_fault_handler_install(ty_stack_fault);
+  /* TEYRU_NO_FAULT_HANDLER=1 leaves the runtime's own SIGSEGV handler off, so
+     that a debugger or a sanitiser sees the fault the runtime would otherwise
+     report as a stack overflow or swallow as a re-raise. It is a diagnosis
+     switch and not a behaviour: the handler only ever turns a fault into a
+     message. */
+  const char *nofault = getenv("TEYRU_NO_FAULT_HANDLER");
+  if (!(nofault && *nofault && strcmp(nofault, "0") != 0)) typlat_fault_handler_install(ty_stack_fault);
   /* The main thread takes its place in the registry here, with the stack bounds
      the collector scans it by. Nothing has allocated yet: the first allocation
      is what takes the main thread's slab, exactly as it takes every other
