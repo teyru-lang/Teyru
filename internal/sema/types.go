@@ -234,11 +234,36 @@ func (c *Checker) substCT(ct *ast.ClassType, b map[*ast.TypeVar]ast.Type) *ast.C
 	return nt
 }
 
+// subPair is one comparison of the isSubtype path.
+type subPair struct{ a, b ast.Type }
+
 // isSubtype reports whether a is a subtype of b (ignoring unchecked warnings).
+//
+// A comparison that comes back to one already on the path is taken as holding:
+// the walk has reached a pair it is in the middle of deciding, so the type
+// structure is cyclic, and nothing further along the walk can settle it. The
+// shape that produces one is a type variable bound to a class that mentions it
+// -- `T extends C<T>` -- where `isSubtype(C<T>, T)` asks for
+// `isSubtype(T, C<T>)`, whose argument `typeArgOK` walks back to the pair it
+// started from. Reading that as false would reject every use of the bound,
+// which is what the cycle is made of; reading it as true is what the variable's
+// own declaration says.
 func (c *Checker) isSubtype(a, b ast.Type) bool {
 	if ast.IsError(a) || ast.IsError(b) {
 		return true
 	}
+	for _, p := range c.subPath {
+		if p.a == a && p.b == b {
+			return true
+		}
+	}
+	c.subPath = append(c.subPath, subPair{a, b})
+	ok := c.isSubtypeWalk(a, b)
+	c.subPath = c.subPath[:len(c.subPath)-1]
+	return ok
+}
+
+func (c *Checker) isSubtypeWalk(a, b ast.Type) bool {
 	switch y := b.(type) {
 	case *ast.PrimType:
 		x, ok := a.(*ast.PrimType)

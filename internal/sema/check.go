@@ -39,6 +39,13 @@ type methodCtx struct {
 	// unqualified call to one of their methods goes through the instance
 	// Lombok declares for the class, which is what @Helper is for.
 	helpers [][]helperRef
+	// deferred is the stack of arguments whose overload is being chosen right
+	// now, because an argument is given its type by the parameter it is passed
+	// to and working that out means resolving the argument's own call. A
+	// structure that comes back to an argument already on the stack would
+	// resolve it twice from inside its own resolution; the one in progress is
+	// what will type it, so the second visit is left to it.
+	deferred []ast.Expr
 }
 
 // helperRef is one @Helper local class in scope and the instance it is used
@@ -2655,11 +2662,14 @@ func (ctx *methodCtx) pickOverload(recv *ast.ClassType, cands []*ast.Method, arg
 		if a.GetType() != nil || isLambdaLike(a) {
 			continue
 		}
+		if ctx.deferredInFlight(a) {
+			continue
+		}
 		var want ast.Type
 		if only != nil && i < len(only.Params) && !only.Varargs {
 			want = ctx.c.subst(only.Params[i], ctx.c.recvBind(recv, only))
 		}
-		ctx.checkExpr(a, want)
+		ctx.checkDeferred(a, want)
 	}
 	best := ovScore{total: 1 << 30}
 	for phase := phaseStrict; phase <= phaseVarargs; phase++ {
@@ -2689,6 +2699,27 @@ func (ctx *methodCtx) pickOverload(recv *ast.ClassType, cands []*ast.Method, arg
 		}
 	}
 	return nil, best
+}
+
+// deferredInFlight reports whether the argument's own overload is already
+// being chosen further out. The type it will get is the one that resolution
+// arrives at, so resolving it again from inside itself would only ask the same
+// question again.
+func (ctx *methodCtx) deferredInFlight(a ast.Expr) bool {
+	for _, d := range ctx.deferred {
+		if d == a {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDeferred checks one argument against the parameter it was passed to,
+// with the argument marked as in flight for as long as that takes.
+func (ctx *methodCtx) checkDeferred(a ast.Expr, want ast.Type) {
+	ctx.deferred = append(ctx.deferred, a)
+	defer func() { ctx.deferred = ctx.deferred[:len(ctx.deferred)-1] }()
+	ctx.checkExpr(a, want)
 }
 
 // moreSpecific reports whether m1's parameters are strictly more specific than
@@ -2788,6 +2819,25 @@ func (ctx *methodCtx) checkInferred(m *ast.Method, s ovScore, args []ast.Expr) {
 		}
 	}
 	ctx.errf(pos, "TY-TYP-0095", "cannot infer the type arguments of %s(%s)", m.Name, argTypes(args))
+}
+
+// isUnsettledVar reports whether t is a type variable that is still a question:
+// nothing has been inferred for it, or what was inferred for it is another
+// variable. A variable is not a type argument, so binding one variable to
+// another records that the two are the same question without answering it --
+// and a variable bound to itself is not a type at all. The argument, which is a
+// type, is left to settle the variable instead.
+func isUnsettledVar(t ast.Type, bind map[*ast.TypeVar]ast.Type) bool {
+	v, ok := t.(*ast.TypeVarType)
+	if !ok {
+		return false
+	}
+	r, bound := bind[v.Var]
+	if !bound || r == nil {
+		return true
+	}
+	_, isVar := r.(*ast.TypeVarType)
+	return isVar
 }
 
 // mentionsTypeVar reports whether tv occurs in the signature of m.
@@ -3234,7 +3284,15 @@ func (c *Checker) inferTypeArg(param, arg ast.Type, bind map[*ast.TypeVar]ast.Ty
 			// argument. This is the contravariant direction of the same rule
 			// the `? extends` case above follows.
 			if tv, isVar := p.Bound.(*ast.TypeVarType); isVar && arg != nil {
-				if v, bound := bind[tv.Var]; bound && v == nil {
+				// A value that is itself an unsettled variable is not one: the
+				// argument is a type, so it is what the lower bound is asking
+				// about, and it replaces a binding that only pointed at another
+				// open question. `Collections.sort(xs, Comparator.nullsFirst(nat))`
+				// is where that showed: the call is checked against `Comparator<?
+				// super T>` before sort's own T is inferred, nullsFirst's T was
+				// bound to it, and the argument `Comparator<String>` then met a
+				// parameter asking whether String is a subtype of a bare T.
+				if v, bound := bind[tv.Var]; bound && (v == nil || isUnsettledVar(v, bind)) {
 					bind[tv.Var] = arg
 					return &ast.WildcardType{Bound: arg, Super: true}
 				}
@@ -3436,7 +3494,11 @@ func (ctx *methodCtx) checkCall(v *ast.Call, want ast.Type) {
 		// its T is String (JLS 18.5.2 reads the same constraint off the whole
 		// expression). A receiver whose type does not share a type variable
 		// with the result is unaffected: nothing matches and nothing binds.
-		ctx.checkExpr(v.Recv, nil)
+		var recvWant ast.Type
+		if _, isCall := v.Recv.(*ast.Call); isCall {
+			recvWant = want
+		}
+		ctx.checkExpr(v.Recv, recvWant)
 		rt = v.Recv.GetType()
 	}
 	for _, a := range v.Args {
@@ -3445,8 +3507,7 @@ func (ctx *methodCtx) checkCall(v *ast.Call, want ast.Type) {
 		// what settles a type variable only the parameter can determine, as in
 		// `collect(Collectors.toList())`.
 		_, nested := a.(*ast.Call)
-		_ = nested
-		if a.GetType() == nil && !isLambdaLike(a) {
+		if a.GetType() == nil && !isLambdaLike(a) && !nested {
 			ctx.checkExpr(a, nil)
 		}
 	}
