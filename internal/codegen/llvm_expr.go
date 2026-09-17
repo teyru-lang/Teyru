@@ -1437,7 +1437,11 @@ func (e *llvmEmitter) assign(f *fb, a *ast.Assign) lval {
 		out = e.compoundDiv(f, a, strings.TrimSuffix(a.Op, "="), cur, t)
 	case a.Op == "<<=" || a.Op == ">>=" || a.Op == ">>>=":
 		op := strings.TrimSuffix(a.Op, "=")
-		ot := shiftType(t)
+		// The width and the mask are the operation's, which the checker
+		// records: for a boxed target that is the unboxed target's own
+		// promoted type, so `Long l; l <<= 33` shifts a long by 33 and not an
+		// int by 33 & 31. coerce then unboxes the target and boxes the result.
+		ot := opTypeOf(a, t)
 		x := e.coerce(f, cur, ot)
 		y := e.coerce(f, e.expr(f, a.Y), ot)
 		width := llvmWidth(e.llvmType(ot))
@@ -1465,9 +1469,11 @@ func (e *llvmEmitter) assign(f *fb, a *ast.Assign) lval {
 	return out
 }
 
-// opTypeOf is the type a compound assignment's operation happens in. sema leaves
-// it unset for the compound forms, so the target's own type is what it is
-// performed in, which is also what C's `x +=` means.
+// opTypeOf is the type a compound assignment's operation happens in, which the
+// checker records for every compound form: the promoted type of the unboxed
+// operands (JLS 15.26.2). The target's own type is the fallback for an
+// assignment the checker reported an error for, which does not reach the back
+// end; it is what C's `x +=` means.
 func opTypeOf(a *ast.Assign, t ast.Type) ast.Type {
 	if a.OpType != nil {
 		return a.OpType

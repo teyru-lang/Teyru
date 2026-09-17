@@ -553,6 +553,12 @@ type (
 		Op     string // = += ...
 		X, Y   Expr
 		OpType Type
+		// TargetPrim is the type the target's value is read and written at:
+		// the unboxed type of a boxed target, and the target's own type when
+		// it is already primitive. It is what a back end unboxes a boxed
+		// compound-assignment target to and boxes the result back from
+		// (JLS 15.26.2 with 5.1.8 and 5.1.7).
+		TargetPrim Type
 	}
 	Cond struct {
 		ExprBase
