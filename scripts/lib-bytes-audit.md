@@ -289,3 +289,19 @@ that the next reader does not re-derive them:
 - The runtime's own byte/text boundary (`ty_str_write`, `ty_str_of_bytes`)
   is W5's second and third pieces and is tested by t249..t252.
 
+## The three failures `adf58e7` carried, and who fixed each
+
+The full suite on `adf58e7` said `337 passed, 3 failed, 3 known`. All three are
+named here because a failure that disappears without a name is a failure nobody
+owns; each has a test that holds it fixed.
+
+| case | what it was | fixed by | its test |
+|---|---|---|---|
+| `t94_java_lang` | a real mismatch: `o.toString().startsWith(o.getClass().getName() + "@")` answered `false`. `Class.getName()` had been made to answer the JDK's name by D8 while the default `toString` still answered `teyru.Object`. | `ae8022b fix(runtime): Object's default toString names the class the JDK way` — the commit message names this line, and the name now comes from `ty_class_jname` | `t94_java_lang` itself, line 202 |
+| `t165_json_container_elements` | a stale expectation: the compiler prints `field words: teyru.Array -> java.lang.String` and the `.expected` said `teyru.String`. The code follows D8 and the corpus line did not. | `4ac49a7 test: the field element type is the JDK name too` in `teyru-lang/tests`, pointed at by `9be8159`/`58be3b1` | `t165_json_container_elements` itself |
+| `t230_probe_core` | not a mismatch at all: the case **passes** while its `known-failures.txt` entry still listed it, and the rule is that a listed case which passes fails the run — the entry had become a lie | `e49b65b test: t230_probe_core is not a known failure any more` in `teyru-lang/tests`, pointed at by `44b3d9e`/`d7fde38` | `t230_probe_core` itself, which passes |
+
+Measured, not inferred: a compiler built from `adf58e7` with its own `tests`
+pointer reports exactly these three (`337 passed, 3 failed, 3 known`), `t230`'s
+output is byte-identical to its `.expected` on that revision, and `t94`'s diff
+is one line (`false` where the expectation has `true`).
