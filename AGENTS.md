@@ -156,6 +156,12 @@ source → lexer → parser → ast → sema → codegen
   `docs:`、`chore:`。
 - 一個提交做一件事；不要把改名、重構與新功能混在一起。
 - PR 描述要寫：動機、做法、如何驗證、已知限制。
+- **不得向任何不屬於 `teyru-lang` 的倉庫提交**，PR、issue、commit 皆然。這包括
+  **GitHub 的語言倉庫 `github-linguist/linguist`**（`.teyru` 要被 GitHub 辨識成語言
+  就是往那裡送；先前送過一次 `Add Teyru`，被關閉，那次的教訓是這種事不該由 agent
+  代勞）與我們拿來當規格參考的上游：OpenJDK、Go、Gson、tree-sitter、VS Code／Zed 等。
+  讀它們的原始碼、抄它們的設計是工作的一部分，往那裡送東西不是；要不要讓 GitHub
+  認得這個語言，由維護者自己決定。需要上游的東西就在本倉庫開 issue 說明。
 
 ---
 
