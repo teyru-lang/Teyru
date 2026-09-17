@@ -986,12 +986,18 @@ func writeRuntime(dir string, tgt *target, link codegen.Link) string {
 	must(os.WriteFile(c4, []byte(tyrt.Reflect), 0o644))
 	c5 := filepath.Join(dir, "tyrt_thread.c")
 	must(os.WriteFile(c5, []byte(tyrt.Thread), 0o644))
+	// The Unicode tables: data, not code, and generated (internal/tools/
+	// genunicode). They are compiled with every program because a program that
+	// touches a string at all may reach one of their readers, and the linker
+	// drops the tables a program never reads.
+	c9 := filepath.Join(dir, "tyrt_unicode.c")
+	must(os.WriteFile(c9, []byte(tyrt.Unicode), 0o644))
 	// The platform half of the runtime, and the one file that differs between
 	// targets: exactly one of the two is compiled, and which one is the target's
 	// business rather than the C compiler's.
 	c6 := filepath.Join(dir, tgt.platSrc)
 	must(os.WriteFile(c6, []byte(tgt.platText), 0o644))
-	files := c1 + " " + c2 + " " + c3 + " " + c4 + " " + c5 + " " + c6
+	files := c1 + " " + c2 + " " + c3 + " " + c4 + " " + c5 + " " + c6 + " " + c9
 	// The TLS file is the one part of the runtime a build may leave out, and
 	// leaving it out is the whole point of it being a file: it includes
 	// OpenSSL's headers and calls OpenSSL's functions, so a translation unit

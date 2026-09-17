@@ -259,9 +259,10 @@ double ty_min_double(double a, double b) { return a < b ? a : b; }
 int64_t ty_round(double v) { return (int64_t)floor(v + 0.5); }
 double ty_random(void) { return (double)rand() / ((double)RAND_MAX + 1.0); }
 int32_t ty_isnan(double v) { return isnan(v) ? 1 : 0; }
-int32_t ty_is_digit(uint16_t c) { return c >= '0' && c <= '9'; }
-int32_t ty_is_letter(uint16_t c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-int32_t ty_is_space(uint16_t c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+/* Character.isDigit and Character.isLetter are not here: they answer for the
+   whole of Unicode, from the generated tables, so they live beside those tables
+   in tyrt.c. What used to be here was an ASCII range test (and a ty_is_space
+   nothing called, which is gone with them). */
 
 /* The two clocks, both read through the platform layer: the wall clock, which
    System.currentTimeMillis means, and the monotonic one every deadline in the

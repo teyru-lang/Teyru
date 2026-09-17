@@ -104,7 +104,7 @@ tzdata；其餘的區域在沒有 tzdata 的主機（Windows，或沒裝 tzdata 
 的，不要手改；改執行期之後執行 `make notices` 重新產生）：
 
 <!-- BEGIN GENERATED: internal/runtime/src -->
-執行期目前有 11 個檔案：
+執行期目前有 12 個檔案：
 
 - `tyrt.c`
 - `tyrt.h`
@@ -117,6 +117,7 @@ tzdata；其餘的區域在沒有 tzdata 的主機（Windows，或沒裝 tzdata 
 - `tyrt_reflect.c`
 - `tyrt_thread.c`
 - `tyrt_tls.c`
+- `tyrt_unicode.c`
 <!-- END GENERATED: internal/runtime/src -->
 
 垃圾回收器、字串、陣列、例外與 box 類別都是本專案自行實作，沒有 Boehm GC、沒有 libgc、
@@ -127,15 +128,22 @@ tzdata；其餘的區域在沒有 tzdata 的主機（Windows，或沒裝 tzdata 
 
 ## 5. Unicode 資料與產生的查表
 
-`Character` 與大小寫映射需要 Unicode 的資料，所以倉庫會帶著 Unicode 15.0 的資料檔
-（`UnicodeData.txt`、`SpecialCasing.txt`、`CaseFolding.txt`、`PropList.txt` 與同批的其他檔案）
-以及由它們產生、入庫的兩級查表。這些檔案依 **Unicode License v3**（UNICODE LICENSE V3，
-Copyright © 1991-2024 Unicode, Inc.，條文見 <https://www.unicode.org/license.txt>）散布，
-著作權聲明隨檔案保留。
+`Character` 與大小寫映射需要 Unicode 的資料，所以倉庫帶著 Unicode 15.0 的三個標準資料檔
+—— `internal/tools/genunicode/data/UnicodeData.txt`（類別、簡單大小寫映射、數字值）、
+`SpecialCasing.txt`（一對多的完整大小寫映射）與 `PropList.txt`（White_Space、
+Other_Uppercase／Other_Lowercase／Other_Alphabetic、Ideographic）—— 以及由它們產生、入庫
+的兩級查表 `internal/runtime/src/tyrt_unicode.c`（產生器是 `internal/tools/genunicode`，
+`make unicode-tables` 重跑它，`go test ./internal/tools/genunicode` 盯著樹裡的檔案與資料
+一致）。同批的 `CaseFolding.txt`、`DerivedCoreProperties.txt` 等檔案樹裡沒有：這個執行期
+不需要 case folding，也不需要用 DerivedCoreProperties 推導的性質。這些檔案依
+**Unicode License v3**（UNICODE LICENSE V3，Copyright © 1991-2024 Unicode, Inc.，條文見
+<https://www.unicode.org/license.txt>）散布，著作權聲明隨檔案保留。
 
 版本固定 15.0 是為了與參考實作對齊：JDK 21 用的是 Unicode 15.0，所以 `Character.isLetter`
-與大小寫映射的答案以它為準。這一段在資料檔入庫前後都成立；`scripts/check-notices.sh` 會在樹裡
-出現這些資料檔時要求本節已經列名。
+與大小寫映射的答案以它為準（`Character.isWhitespace` 與 `Character.digit` 不是任何一個檔案的
+性質，是 JDK 自己的答案，兩者在 `internal/tools/genunicode` 裡寫明並由
+`tests/programs/t251_unicode_tables` 對 JDK 逐個碼點驗證）。
+`scripts/check-notices.sh` 會在樹裡出現這些資料檔時要求本節已經列名。
 
 ---
 
