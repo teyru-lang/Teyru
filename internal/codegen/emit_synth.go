@@ -21,6 +21,8 @@ const forNameKey = "Class.forNameOf(String)"
 
 func (e *Emitter) emitSynthetic(cl *ast.Class, m *ast.Method) {
 	e.indent = 0
+	restoreFrame := e.frameReset()
+	defer restoreFrame()
 	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	e.stackCheck()

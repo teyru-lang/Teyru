@@ -66,6 +66,8 @@ func (e *Emitter) emitClInit(cl *ast.Class) {
 	m := cl.ClInit
 	fmt.Fprintf(e.fns, "%s%s;\n", e.link, e.signature(m))
 	e.indent = 0
+	restoreFrame := e.frameReset()
+	defer restoreFrame()
 	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	if cl.Super != nil {
