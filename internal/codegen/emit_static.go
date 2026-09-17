@@ -19,7 +19,15 @@ func (e *Emitter) emitStaticFields(cl *ast.Class) {
 			continue
 		}
 		ct := e.ctype(f.Type)
-		fmt.Fprintf(&e.data, "static %s %s = %s;\n", ct, staticName(cl, f), zeroOf(ct))
+		if e.split && !e.lib && e.sideLib {
+			// A standard library global is defined by the library's unit and
+			// named from the program's through the header.
+			return
+		}
+		fmt.Fprintf(e.data, "%s%s %s = %s;\n", e.link, ct, staticName(cl, f), zeroOf(ct))
+		if e.split && e.lib {
+			e.headerDecls += fmt.Sprintf("extern %s %s;\n", ct, staticName(cl, f))
+		}
 	}
 }
 
@@ -33,9 +41,15 @@ func (e *Emitter) emitStaticFields(cl *ast.Class) {
 // pointer, and the collector reads a whole pointer word from every address it
 // is handed: registering an int32 global made it read four bytes of whatever
 // global followed (found by running the test programs under AddressSanitizer).
-func (e *Emitter) clinitRefs() string {
+func (e *Emitter) clinitRefs(prelude bool) string {
 	var b []byte
 	for _, cl := range e.prog.Classes {
+		// One translation unit holds both halves, so there is nothing to
+		// separate: the split build is the one that registers the standard
+		// library's roots from the library's own unit (see emitLibraryInstall).
+		if e.split && cl.Prelude() != prelude {
+			continue
+		}
 		for _, f := range cl.Fields {
 			if f.Mods.Has(ast.ModStatic) && e.isRef(f.Type) {
 				b = append(b, []byte("\tty_gc_register_static((void*)&"+staticName(cl, f)+");\n")...)
@@ -51,9 +65,9 @@ func (e *Emitter) emitClInit(cl *ast.Class) {
 		return
 	}
 	m := cl.ClInit
-	fmt.Fprintf(&e.fns, "static %s;\n", e.signature(m))
+	fmt.Fprintf(e.fns, "%s%s;\n", e.link, e.signature(m))
 	e.indent = 0
-	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
+	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	if cl.Super != nil {
 		e.line("ty_clinit(&cls_%s);\n", mangle(cl.Super.Class.Full))

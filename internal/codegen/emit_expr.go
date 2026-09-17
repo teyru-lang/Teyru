@@ -1,7 +1,9 @@
 package codegen
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -400,10 +402,76 @@ func (e *Emitter) literal(v *ast.Literal) string {
 	return "0"
 }
 
-// strLit interns a string literal into a static global whose bytes live in the
-// object, which is the shape the runtime gives a string it allocates itself:
-// the header, the bytes, their terminator, and room for the breadcrumb table
-// the first index operation fills in.
+// strLit interns a string literal into a global object of the unit it is first
+// written in.
+//
+// One literal is one object, and that is a property rather than an
+// optimisation: `==` on two String references is a reference comparison, as in
+// Java, so two objects holding "abc" would make `s == "abc"` answer false where
+// the language says true. In a build of one translation unit the map below is
+// what holds that. In a split build the literal is named after its own text and
+// defined by whichever unit owns it -- the standard library's literals by the
+// library, the rest by the program -- so the two units share one object per
+// text rather than one per text per unit.
+//
+// The bytes live in the object, which is the shape the runtime gives a string
+// it allocates itself: the header, the bytes, their terminator, and room for
+// the breadcrumb table the first index operation fills in (see literalDef).
+func (e *Emitter) strLit(s string) string {
+	if !e.split {
+		if id, ok := e.strings[s]; ok {
+			return fmt.Sprintf("((tystr*)&S%d)", id)
+		}
+		id := len(e.strOrder)
+		e.strings[s] = id
+		e.strOrder = append(e.strOrder, s)
+		e.data.WriteString(e.literalDef(fmt.Sprintf("S%d", id), s, true))
+		return fmt.Sprintf("((tystr*)&S%d)", id)
+	}
+	name := literalName(s)
+	if !e.defined[name] {
+		e.defined[name] = true
+		// The library's unit declares the literals it defines in the header, so
+		// both units see one type and one object; every other unit declares the
+		// type beside the definition it compiles.
+		e.litDefs[name] = e.literalDef(name, s, !e.lib)
+		if e.lib {
+			e.headerDecls += literalDecl(name, s) + "extern struct " + name + "_s " + name + ";\n"
+		}
+	}
+	// A literal a standard library body uses is the library's to define, whether
+	// this unit meets it in a library body or in the program's own code: one
+	// literal is one object, and two units each defining their own would make
+	// `a == "abc"` answer false where the language says true.
+	if e.sideLib {
+		if !e.litPrelude[name] {
+			e.litPrelude[name] = true
+			e.libLiterals = append(e.libLiterals, s)
+		}
+	}
+	return "((tystr*)&" + name + ")"
+}
+
+// literalDecl is the declaration of the type holding one string literal's
+// bytes: the header, the bytes and their terminator, and room for the
+// breadcrumb table. The type belongs to the literal because the table's length
+// is the text's, and the bytes are in the object so that a literal is one
+// allocation-free object (see strLit).
+func literalDecl(name, s string) string {
+	l := literalLayoutOf(s)
+	var b strings.Builder
+	fmt.Fprintf(&b, "struct %s_s { tystr h; char b[%d];", name, len(s)+1)
+	if l.nbc > 0 {
+		fmt.Fprintf(&b, " int32_t bc[%d];", l.nbc)
+	}
+	fmt.Fprintf(&b, " };\n")
+	return b.String()
+}
+
+// literalDef is the definition of the object holding one string literal, by the
+// C name it is known as. decl says whether the type goes with it: a unit that
+// includes the header has the type already, because the unit that defines the
+// object declared it there.
 //
 // The two lengths and the ASCII bit are known here and written into the
 // initialiser, so nothing measures a literal at start-up. The breadcrumbs are
@@ -421,37 +489,82 @@ func (e *Emitter) literal(v *ast.Literal) string {
 // being initialized" -- and GCC makes it an error where clang only warns, so an
 // unconditional `{0}` is C that one of the two compilers this project builds
 // with refuses.
-func (e *Emitter) strLit(s string) string {
-	if id, ok := e.strings[s]; ok {
-		return fmt.Sprintf("((tystr*)&S%d)", id)
+func (e *Emitter) literalDef(name, s string, decl bool) string {
+	l := literalLayoutOf(s)
+	var b strings.Builder
+	if decl {
+		b.WriteString(literalDecl(name, s))
 	}
-	id := len(e.strOrder)
-	e.strings[s] = id
-	e.strOrder = append(e.strOrder, s)
+	// The breadcrumb table is a member only where the layout has one, and the
+	// initialiser says so (see the comment above).
+	bcInit := ""
+	if l.nbc > 0 {
+		bcInit = ", {0}"
+	}
+	// `h`'s own first member is an aggregate (`tyobj`, one pointer), so the
+	// braces around it are written out: without them GCC and clang both report
+	// -Wmissing-braces on every literal in the program, which is the one
+	// diagnostic -Wall -Wextra has to say about this construct.
+	fmt.Fprintf(&b, "%sstruct %s_s %s = {{{&cls_%s}, %d, %d, %du}, %s%s};\n", e.link, name, name,
+		mangle(e.prog.Builtins.String.Full), len(s), l.units, l.flags, e.cstr(s), bcInit)
+	fmt.Fprintf(&b, "_Static_assert(offsetof(struct %s_s, b) == sizeof(tystr), \"a literal's bytes follow its header\");\n", name)
+	if l.nbc > 0 {
+		fmt.Fprintf(&b, "_Static_assert(offsetof(struct %s_s, bc) == TY_STR_BC_OFF(%d), \"a literal's breadcrumbs sit where TY_STR_BC looks\");\n", name, len(s))
+	}
+	return b.String()
+}
+
+// literalLayout is what a literal's C layout is computed from, in one place:
+// the declaration and the definition have to agree about it, and the static
+// assertions in the definition are what checks that they do.
+type literalLayout struct {
+	units int // code units
+	flags int // the string header's flags
+	nbc   int // breadcrumb entries
+}
+
+// literalLayoutOf measures one literal's text the way the runtime reads it.
+func literalLayoutOf(s string) literalLayout {
 	units, ascii := util.StringUnits(s)
 	flags := 0
 	if ascii {
 		flags = util.StrFlagASCII
 	}
-	nbc := util.StrBreadcrumbs(units, ascii)
-	fmt.Fprintf(&e.data, "struct S%d_s { tystr h; char b[%d];", id, len(s)+1)
-	bcInit := ""
-	if nbc > 0 {
-		fmt.Fprintf(&e.data, " int32_t bc[%d];", nbc)
-		bcInit = ", {0}"
+	return literalLayout{units: units, flags: flags, nbc: util.StrBreadcrumbs(units, ascii)}
+}
+
+// literalDefs returns the definitions of the literals this unit owns: the
+// library owns every literal its own bodies use, and the program owns the rest.
+// They are written at the end rather than where the literal was met, because
+// which unit owns one is not known until both halves of the emitter have run:
+// the class order puts the program's classes between the library's, and the
+// literal a library body uses may be met after the program's own code already
+// used the same text.
+func (e *Emitter) literalDefs(lib bool) string {
+	if !e.split {
+		return ""
 	}
-	fmt.Fprintf(&e.data, " };\n")
-	// `h`'s own first member is an aggregate (`tyobj`, one pointer), so the
-	// braces around it are written out: without them GCC and clang both report
-	// -Wmissing-braces on every literal in the program, which is the one
-	// diagnostic -Wall -Wextra has to say about this construct.
-	fmt.Fprintf(&e.data, "static struct S%d_s S%d = {{{&cls_%s}, %d, %d, %du}, %s%s};\n", id, id,
-		mangle(e.prog.Builtins.String.Full), len(s), units, flags, e.cstr(s), bcInit)
-	fmt.Fprintf(&e.data, "_Static_assert(offsetof(struct S%d_s, b) == sizeof(tystr), \"a literal's bytes follow its header\");\n", id)
-	if nbc > 0 {
-		fmt.Fprintf(&e.data, "_Static_assert(offsetof(struct S%d_s, bc) == TY_STR_BC_OFF(%d), \"a literal's breadcrumbs sit where TY_STR_BC looks\");\n", id, len(s))
+	names := make([]string, 0, len(e.litDefs))
+	for name := range e.litDefs {
+		if e.litPrelude[name] == lib {
+			names = append(names, name)
+		}
 	}
-	return fmt.Sprintf("((tystr*)&S%d)", id)
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(e.litDefs[name])
+	}
+	return b.String()
+}
+
+// literalName is the C name of the object holding one string literal. It is
+// derived from the literal's text so that the two units of a split build agree
+// on which object they mean without either having to be told: a literal is
+// named after what it holds, and the same text is one object.
+func literalName(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("S_%x", sum[:8])
 }
 
 func (e *Emitter) ident(v *ast.Ident) string {
@@ -2135,9 +2248,9 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	if lam == nil || m.IsCtor {
 		return
 	}
-	fmt.Fprintf(&e.fns, "static %s;\n", e.signature(m))
+	fmt.Fprintf(e.fns, "%s%s;\n", e.link, e.signature(m))
 	e.indent = 0
-	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
+	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	e.stackCheck()
 	for i, pv := range m.ParamVars {
