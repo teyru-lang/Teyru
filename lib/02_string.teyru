@@ -9,13 +9,17 @@ package teyru
    failures, the regex guard -- stays on this side of the boundary, where the
    exception classes exist.
 
-   charAt and length are byte-oriented: a Teyru string is UTF-8 bytes and a
-   `char` is one byte of it. That is the pre-existing convention of the runtime
-   (see ty_str_charat) and every method here keeps to it, so toCharArray,
-   charAt and substring agree with each other even though none of them agrees
-   with Java for a non-ASCII string. */
+   A string is stored as WTF-8 and carries both of its lengths: the bytes it
+   takes and the UTF-16 code units they spell. WTF-8 is what lets a string hold
+   a surrogate with no partner -- "\uD800" is a string Java has -- and a high
+   surrogate followed by its low one is stored as the one four-byte sequence
+   they are as a code point. The constructors that take bytes decode them the
+   way the JDK's UTF-8 decoder does, replacing anything ill-formed with U+FFFD,
+   and getBytes encodes the way its UTF-8 encoder does. */
 class String extends Object implements Comparable<String> {
   public native String(String original)
+  public native String(byte[] bytes)
+  public native String(byte[] bytes, int offset, int length)
   public native int length()
   public native boolean isEmpty()
   public native boolean isBlank()

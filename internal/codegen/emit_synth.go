@@ -10,7 +10,7 @@ import (
 
 // nativeKey identifies a native (runtime-implemented) method precisely.
 func nativeKey(m *ast.Method) string {
-	return m.Owner.Name + "." + util.Signature(m.Name, m.Params)
+	return m.Owner.Name + "." + util.KeySignature(m.Name, m.Params)
 }
 
 // emitSynthetic writes the C body of a compiler-synthesized method.

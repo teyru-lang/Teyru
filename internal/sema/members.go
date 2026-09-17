@@ -431,23 +431,15 @@ func nativeName(cl *ast.Class, m *ast.Method) string {
 	return b.String()
 }
 
-// nativeParam is the symbol component of one parameter type: a primitive keeps
-// its single letter and a class its simple name, but an array carries its
-// element descriptor after the `A`.
-//
-// A bare `A` for every array (which is what util.Descriptor renders) is not
-// injective: `size(int[])`, `size(A)` and `size(A[])` all became
-// tyn_Foo_size_A, so two overloads shared one C function and one of them ran
-// the other's code. `int[]` is `AI` and `int[][]` is `AAI` now. Primitive,
-// class and type-variable parameters keep their encoding, so the symbols
-// tests/native and docs/native.md prescribe for those still hold; the table in
-// docs/native.md has to say `A` plus the element descriptor for arrays.
-func nativeParam(t ast.Type) string {
-	if at, ok := t.(*ast.ArrayType); ok {
-		return "A" + nativeParam(at.Elem)
-	}
-	return util.Descriptor(t)
-}
+// nativeParam is the symbol component of one parameter type. The rule is
+// util.ParamDescriptor's: an array carries its element descriptor after the `A`,
+// because a bare `A` for every array is not injective -- `size(int[])` and
+// `size(A)` were both tyn_Foo_size_A, so two overloads shared one C function
+// and one of them ran the other's code. Primitive, class and type-variable
+// parameters keep their encoding, so the symbols tests/native and
+// docs/native.md prescribe for those still hold; the table in docs/native.md
+// has to say `A` plus the element descriptor for arrays.
+func nativeParam(t ast.Type) string { return util.ParamDescriptor(t) }
 
 func (c *Checker) resolveFieldDecl(cl *ast.Class, env *typeEnv, d *ast.FieldDecl, isIface bool) {
 	if d.Type.Name == "var" || d.Type.Name == "val" {

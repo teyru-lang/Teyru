@@ -400,7 +400,18 @@ func (e *Emitter) literal(v *ast.Literal) string {
 	return "0"
 }
 
-// strLit interns a string literal into a static global.
+// strLit interns a string literal into a static global whose bytes live in the
+// object, which is the shape the runtime gives a string it allocates itself:
+// the header, the bytes, their terminator, and room for the breadcrumb table
+// the first index operation fills in.
+//
+// The two lengths and the ASCII bit are known here and written into the
+// initialiser, so nothing measures a literal at start-up. The breadcrumbs are
+// left zeroed rather than computed: they are only wanted by a string that gets
+// indexed, and the object is writable, so the runtime can build them where they
+// stand. The static assertions tie this struct's offsets to the macros the
+// runtime reaches through -- a literal is the one string the compiler lays out
+// and the runtime reads.
 func (e *Emitter) strLit(s string) string {
 	if id, ok := e.strings[s]; ok {
 		return fmt.Sprintf("((tystr*)&S%d)", id)
@@ -408,9 +419,23 @@ func (e *Emitter) strLit(s string) string {
 	id := len(e.strOrder)
 	e.strings[s] = id
 	e.strOrder = append(e.strOrder, s)
-	data := e.cstr(s)
-	fmt.Fprintf(&e.data, "static tystr S%d = {{&cls_%s}, %d, %s};\n", id,
-		mangle(e.prog.Builtins.String.Full), len(s), data)
+	units, ascii := util.StringUnits(s)
+	flags := 0
+	if ascii {
+		flags = util.StrFlagASCII
+	}
+	nbc := util.StrBreadcrumbs(units, ascii)
+	fmt.Fprintf(&e.data, "struct S%d_s { tystr h; char b[%d];", id, len(s)+1)
+	if nbc > 0 {
+		fmt.Fprintf(&e.data, " int32_t bc[%d];", nbc)
+	}
+	fmt.Fprintf(&e.data, " };\n")
+	fmt.Fprintf(&e.data, "static struct S%d_s S%d = {{&cls_%s, %d, %d, %du}, %s, {0}};\n", id, id,
+		mangle(e.prog.Builtins.String.Full), len(s), units, flags, e.cstr(s))
+	fmt.Fprintf(&e.data, "_Static_assert(offsetof(struct S%d_s, b) == sizeof(tystr), \"a literal's bytes follow its header\");\n", id)
+	if nbc > 0 {
+		fmt.Fprintf(&e.data, "_Static_assert(offsetof(struct S%d_s, bc) == TY_STR_BC_OFF(%d), \"a literal's breadcrumbs sit where TY_STR_BC looks\");\n", id, len(s))
+	}
 	return fmt.Sprintf("((tystr*)&S%d)", id)
 }
 

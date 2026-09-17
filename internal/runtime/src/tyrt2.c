@@ -186,7 +186,7 @@ tystr *ty_class_name(void *c) {
 
 tystr *ty_str_ident(tystr *s) { return s; }
 
-tystr *ty_str_copy(tystr *s) { return s ? ty_str_new(s->data, s->len) : NULL; }
+tystr *ty_str_copy(tystr *s) { return s ? ty_str_new(TY_STR_DATA(s), s->blen) : NULL; }
 
 /* Identity hash of an object or array, used where no user hashCode exists.
    The address is stable because the collector never moves objects. */
@@ -210,14 +210,14 @@ int32_t ty_str_eq_obj(tystr *a, void *b) {
 
 tystr *ty_str_sub_from(tystr *s, int32_t from) {
   if (!s) return NULL;
-  if (from < 0 || from > s->len) ty_throw((tyobj *)ty_sioobe(from, s ? s->len : 0));
-  return ty_str_sub(s, from, (int32_t)s->len);
+  if (from < 0 || from > s->blen) ty_throw((tyobj *)ty_sioobe(from, s ? s->blen : 0));
+  return ty_str_sub(s, from, (int32_t)s->blen);
 }
 
-int64_t ty_str_tolong(tystr *s) { return s ? strtoll(s->data, NULL, 10) : 0; }
-double ty_str_todouble(tystr *s) { return s ? strtod(s->data, NULL) : 0; }
-float ty_str_tofloat(tystr *s) { return s ? (float)strtod(s->data, NULL) : 0; }
-int32_t ty_str_tobool(tystr *s) { return s && strcmp(s->data, "true") == 0; }
+int64_t ty_str_tolong(tystr *s) { return s ? strtoll(TY_STR_DATA(s), NULL, 10) : 0; }
+double ty_str_todouble(tystr *s) { return s ? strtod(TY_STR_DATA(s), NULL) : 0; }
+float ty_str_tofloat(tystr *s) { return s ? (float)strtod(TY_STR_DATA(s), NULL) : 0; }
+int32_t ty_str_tobool(tystr *s) { return s && strcmp(TY_STR_DATA(s), "true") == 0; }
 
 /* ---- boxing helpers ---------------------------------------------------- */
 
@@ -330,9 +330,9 @@ static void sb_ensure(tySB *sb, int64_t extra) {
 void *ty_sb_append_str(void *p, tystr *s) {
   tySB *sb = (tySB *)p;
   if (!s) return p;
-  sb_ensure(sb, s->len);
-  memcpy(sb->buf + sb->len, s->data, (size_t)s->len);
-  sb->len += s->len;
+  sb_ensure(sb, s->blen);
+  memcpy(sb->buf + sb->len, TY_STR_DATA(s), (size_t)s->blen);
+  sb->len += s->blen;
   return p;
 }
 void *ty_sb_append_int(void *p, int64_t v) { return ty_sb_append_str(p, ty_str_of_long(v)); }
@@ -392,7 +392,7 @@ static FILE *ty_ps_out(void *self) {
 
 void ty_ps_print_str(void *self, tystr *s) {
   FILE *f = ty_ps_out(self);
-  if (s) fwrite(s->data, 1, (size_t)s->len, f);
+  if (s) fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, f);
   else fputs("null", f);
 }
 void ty_ps_println_str(void *self, tystr *s) {
@@ -403,7 +403,7 @@ void ty_ps_print_int(void *self, int64_t v) { fprintf(ty_ps_out(self), "%lld", (
 void ty_ps_println_int(void *self, int64_t v) { fprintf(ty_ps_out(self), "%lld\n", (long long)v); }
 void ty_ps_print_double(void *self, double v) {
   tystr *s = ty_str_of_double(v);
-  fwrite(s->data, 1, (size_t)s->len, ty_ps_out(self));
+  fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, ty_ps_out(self));
 }
 void ty_ps_println_double(void *self, double v) {
   ty_ps_print_double(self, v);
@@ -411,7 +411,7 @@ void ty_ps_println_double(void *self, double v) {
 }
 void ty_ps_print_float(void *self, float v) {
   tystr *s = ty_str_of_float(v);
-  fwrite(s->data, 1, (size_t)s->len, ty_ps_out(self));
+  fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, ty_ps_out(self));
 }
 void ty_ps_println_float(void *self, float v) {
   ty_ps_print_float(self, v);
@@ -420,7 +420,7 @@ void ty_ps_println_float(void *self, float v) {
 void ty_ps_print_char(void *self, uint16_t c) {
   FILE *f = ty_ps_out(self);
   if (c < 0x80) fputc((int)c, f);
-  else fputs(ty_str_of_char(c)->data, f);
+  else fputs(TY_STR_DATA(ty_str_of_char(c)), f);
 }
 void ty_ps_println_char(void *self, uint16_t c) {
   ty_ps_print_char(self, c);

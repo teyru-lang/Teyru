@@ -50,13 +50,13 @@ var nativeNetTable = registerNativeNet(map[string]nativeFn{
 	// The read returns however many bytes the kernel had, 0 at end of stream,
 	// or a negative code -- never a short count pretending to be the whole
 	// request, and never 0 for a timeout.
-	"Net.read0(I,A,I,I)": {
+	"Net.read0(I,AB,I,I)": {
 		fn:    "ty_net_read",
 		proto: "int32_t ty_net_read(int32_t, tyarr *, int32_t, int32_t)",
 	},
 	// The write loops until the last byte is out. A short write reported as
 	// success is the classic truncation bug this entry exists to prevent.
-	"Net.write0(I,A,I,I)": {
+	"Net.write0(I,AB,I,I)": {
 		fn:    "ty_net_write_all",
 		proto: "int32_t ty_net_write_all(int32_t, tyarr *, int32_t, int32_t)",
 	},
@@ -109,9 +109,11 @@ var nativeNetTable = registerNativeNet(map[string]nativeFn{
 		fn:    "ty_net_is_unknown_host",
 		proto: "int32_t ty_net_is_unknown_host(int32_t)",
 	},
-	// The byte[] a protocol is read as, on its way back to being a String. The
+	// The byte[] a protocol is read as, on its way back to being a String: the
+	// bytes are decoded as UTF-8 and anything ill-formed in them becomes U+FFFD,
+	// which is what a read that stopped in the middle of a sequence needs. The
 	// array never outlives the call, so it needs no root either.
-	"Net.stringFrom(A,I,I)": {
+	"Net.stringFrom(AB,I,I)": {
 		fn:    "ty_net_bytes_to_str",
 		proto: "tystr *ty_net_bytes_to_str(tyarr *, int32_t, int32_t)",
 	},
@@ -155,11 +157,11 @@ var nativeNetTable = registerNativeNet(map[string]nativeFn{
 	// The same contract as Net.read0 and Net.write0, over a session: a read
 	// returns what the record had, 0 at the end of the stream and a negative
 	// code on failure, and a write loops until the last byte is out.
-	"Net.tlsRead0(I,A,I,I)": {
+	"Net.tlsRead0(I,AB,I,I)": {
 		fn:    "ty_tls_read",
 		proto: "int32_t ty_tls_read(int32_t, tyarr *, int32_t, int32_t)",
 	},
-	"Net.tlsWrite0(I,A,I,I)": {
+	"Net.tlsWrite0(I,AB,I,I)": {
 		fn:    "ty_tls_write_all",
 		proto: "int32_t ty_tls_write_all(int32_t, tyarr *, int32_t, int32_t)",
 	},
@@ -205,17 +207,17 @@ var nativeNetTable = registerNativeNet(map[string]nativeFn{
 	// side made; the C refuses an array that is not an int[] rather than
 	// writing through the wrong one. `A` is the int[]: the descriptor for any
 	// array is the same character, and the helper checks the element size.
-	"Fs.list0(String,A)": {
+	"Fs.list0(String,AI)": {
 		fn:    "ty_file_list",
 		proto: "tyarr *ty_file_list(tystr *, tyarr *)",
 	},
-	"Fs.readBytes0(String,A)": {
+	"Fs.readBytes0(String,AB)": {
 		fn:    "ty_file_read_bytes",
 		proto: "tyarr *ty_file_read_bytes(tystr *, tyarr *)",
 	},
 	// The append flag is an int32_t on the C side and a boolean here, which is
 	// the same width by construction: Teyru's boolean is int32_t everywhere.
-	"Fs.writeBytes0(String,A,I,I,Z)": {
+	"Fs.writeBytes0(String,AB,I,I,Z)": {
 		fn:    "ty_file_write_bytes",
 		proto: "int32_t ty_file_write_bytes(tystr *, tyarr *, int32_t, int32_t, int32_t)",
 	},

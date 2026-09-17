@@ -960,9 +960,9 @@ static void print_uncaught(void *p, const char *where, int wherelen) {
      the report runs in, and it is far more than a toString needs. */
   ty_stack_limit = NULL;
   tystr *s = ((tystr *(*)(void *))e->cls->vtable[0])(e);
-  char *msg = s ? s->data : (char *)"?";
+  char *msg = s ? TY_STR_DATA(s) : (char *)"?";
   fprintf(stderr, "Exception in thread \"%.*s\" %.*s\n", wherelen, where,
-          (int)(s ? s->len : 1), msg);
+          (int)(s ? s->blen : 1), msg);
 }
 
 void ty_uncaught(void *p) {
@@ -975,7 +975,7 @@ void ty_uncaught(void *p) {
    does not -- and the thread's name is what says which thread it was. */
 void ty_uncaught_thread(void *e, tythread *t) {
   tystr *name = t ? t->name : NULL;
-  print_uncaught(e, name ? name->data : "main", name ? (int)name->len : 4);
+  print_uncaught(e, name ? TY_STR_DATA(name) : "main", name ? (int)name->blen : 4);
 }
 
 void ty_throw(void *e) {
@@ -1123,57 +1123,221 @@ void ty_itab_slow(void) {
 
 /* ------------------------------------------------------------------ strings */
 
-tystr *ty_str_new(const char *data, int64_t len) {
-  tystr *s = (tystr *)ty_alloc(sizeof(tystr) + (size_t)len + 1);
+/* The bytes of a string the runtime builds are canonical WTF-8. Three rules
+   hold everywhere below.
+
+   A code point below 0x10000 is one code unit and one sequence of one, two or
+   three bytes; a surrogate that stands alone is that same three-byte form, so
+   UTF-8's reserved encoding of D800..DFFF is load-bearing here rather than
+   malformed. An astral code point is two code units and one four-byte
+   sequence. And a high surrogate followed by its low one is always stored as
+   that four-byte sequence and never as the two three-byte ones, which is what
+   makes byte equality and UTF-16 equality the same relation: ty_str_eq,
+   ty_str_cmp and the hash stay byte operations, and a string built by
+   substring or by appending one char at a time is byte-identical to the same
+   text written as one literal. */
+
+/* The length in bytes of the sequence that starts at p. */
+static int seq_len(const char *p) {
+  unsigned char a = (unsigned char)p[0];
+  if (a < 0x80) return 1;
+  if ((a & 0xE0) == 0xC0) return 2;
+  if ((a & 0xF0) == 0xE0) return 3;
+  return 4;
+}
+
+/* The same, held inside the string. A string this file builds is canonical, so
+   a sequence never runs past the last byte and the clamp never bites; a string
+   built from a byte range by an older byte-oriented helper can hold a truncated
+   sequence, and a walk that trusted the lead byte would then read past the
+   object. The clamp is what makes that a wrong answer rather than a fault. */
+static int seq_len_in(const char *d, int64_t n, int64_t at) {
+  int len = seq_len(d + at);
+  return at + len > n ? (int)(n - at) : len;
+}
+
+/* The code point the sequence at p encodes, given its length in bytes. A lone
+   surrogate decodes to itself; a four-byte sequence is a whole code point. */
+static int32_t seq_cp(const char *p, int n) {
+  unsigned char a = (unsigned char)p[0];
+  switch (n) {
+    case 1: return a;
+    case 2: return ((a & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+    case 3:
+      return ((a & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) |
+             ((unsigned char)p[2] & 0x3F);
+    default:
+      return ((a & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) |
+             (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
+  }
+}
+
+/* Writes cp as WTF-8 and answers the number of bytes: four above 0xFFFF, the
+   three-byte form for a surrogate, two or one below. */
+static int seq_put(char *p, int32_t cp) {
+  if (cp < 0x80) {
+    p[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    p[0] = (char)(0xC0 | (cp >> 6));
+    p[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    p[0] = (char)(0xE0 | (cp >> 12));
+    p[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    p[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  p[0] = (char)(0xF0 | (cp >> 18));
+  p[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  p[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  p[3] = (char)(0x80 | (cp & 0x3F));
+  return 4;
+}
+
+/* The UTF-16 length of the bytes, and whether they are all ASCII. Heads are
+   what is counted, and a four-byte sequence is the one that is two units. The
+   ASCII test runs a word at a time because it is the common answer and the
+   answer the whole read API is fast for. */
+static int64_t str_measure(const char *data, int64_t len, int *ascii) {
+  const unsigned char *d = (const unsigned char *)data;
+  int64_t i = 0, u = 0;
+  int plain = 1;
+  while (i + 8 <= len) {
+    uint64_t w;
+    memcpy(&w, d + i, 8);
+    if (w & UINT64_C(0x8080808080808080)) break;
+    i += 8;
+    u += 8;
+  }
+  for (; i < len; i++) {
+    unsigned char c = d[i];
+    if (c < 0x80) {
+      u++;
+    } else if ((c & 0xC0) != 0x80) {
+      plain = 0;
+      u++;
+      if (c >= 0xF0) u++;
+    }
+  }
+  *ascii = plain;
+  return u;
+}
+
+/* One string, one allocation: the header, the bytes, their terminator, and the
+   breadcrumb table's space (which this leaves unbuilt). Callers that already
+   know both lengths come here directly; ty_str_new measures first. */
+static tystr *str_alloc(int64_t blen, int64_t ulen, int ascii) {
+  size_t nbc = ascii ? 0 : (size_t)(ulen >> 6) + 1;
+  size_t pad = ascii ? 0 : 3; /* room to align the table after the NUL */
+  tystr *s = (tystr *)ty_alloc(sizeof(tystr) + (size_t)blen + 1 + pad + nbc * sizeof(int32_t));
   s->obj.cls = TY_STRING;
-  s->len = len;
-  s->data = (char *)s + sizeof(tystr);
-  if (data) memcpy(s->data, data, (size_t)len);
-  s->data[len] = 0;
+  s->blen = blen;
+  s->ulen = (int32_t)ulen;
+  s->flags = ascii ? TY_SF_ASCII : 0;
+  return s;
+}
+
+tystr *ty_str_new(const char *data, int64_t len) {
+  int ascii;
+  int64_t ulen;
+  tystr *s;
+  if (!data) {
+    /* An uninitialised string: the caller writes the bytes itself, so there is
+       nothing to measure yet. The header claims the worst case -- every byte a
+       sequence of its own -- which is what keeps the breadcrumb space large
+       enough for whatever ends up written, and the caller is responsible for
+       writing exactly `len` bytes and no NUL among them. */
+    s = str_alloc(len, len, 0);
+    TY_STR_DATA(s)[len] = 0;
+    return s;
+  }
+  ulen = str_measure(data, len, &ascii);
+  s = str_alloc(len, ulen, ascii);
+  memcpy(TY_STR_DATA(s), data, (size_t)len);
+  TY_STR_DATA(s)[len] = 0;
   return s;
 }
 
 tystr *ty_str_intern(const char *data) { return ty_str_new(data, (int64_t)strlen(data)); }
 
+/* ---- index conversion -------------------------------------------------- */
+
+/* Whether the last code unit is a high surrogate with no low one after it, and
+   whether the first is a low surrogate with no high one before it. The pair of
+   tests is what ty_str_concat and the builder use to join the halves; both are
+   three-byte-sequence tests, since a paired surrogate is never stored alone. */
+static int str_ends_high(tystr *a) {
+  const char *d = TY_STR_DATA(a);
+  int64_t n = a->blen;
+  if (n < 3) return 0;
+  unsigned char c1 = (unsigned char)d[n - 3], c2 = (unsigned char)d[n - 2], c3 = (unsigned char)d[n - 1];
+  if ((c1 & 0xF0) != 0xE0 || (c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) return 0;
+  int32_t cp = ((c1 & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
+  return cp >= 0xD800 && cp <= 0xDBFF;
+}
+static int str_starts_low(tystr *b) {
+  const unsigned char *d = (const unsigned char *)TY_STR_DATA(b);
+  if (b->blen < 3) return 0;
+  if ((d[0] & 0xF0) != 0xE0 || (d[1] & 0xC0) != 0x80 || (d[2] & 0xC0) != 0x80) return 0;
+  int32_t cp = ((d[0] & 0x0F) << 12) | ((d[1] & 0x3F) << 6) | (d[2] & 0x3F);
+  return cp >= 0xDC00 && cp <= 0xDFFF;
+}
+
 int64_t ty_str_len(tystr *s) {
   if (!s) ty_npe();
-  return s->len;
+  return s->blen;
 }
 
 tystr *ty_str_concat(tystr *a, tystr *b) {
   if (!a) a = ty_str_intern("null");
   if (!b) b = ty_str_intern("null");
-  tystr *r = (tystr *)ty_alloc(sizeof(tystr) + (size_t)(a->len + b->len) + 1);
-  r->obj.cls = TY_STRING;
-  r->len = a->len + b->len;
-  r->data = (char *)r + sizeof(tystr);
-  memcpy(r->data, a->data, (size_t)a->len);
-  memcpy(r->data + a->len, b->data, (size_t)b->len);
-  r->data[r->len] = 0;
+  /* A high surrogate ending one half and the low surrogate starting the other
+     are one character, not two, and the bytes have to say so. It costs two
+     16-bit compares and only pays off for a string built a char at a time --
+     which is exactly what `+` in a loop does. */
+  int join = str_ends_high(a) && str_starts_low(b);
+  const char *da = TY_STR_DATA(a), *db = TY_STR_DATA(b);
+  int64_t na = join ? a->blen - 3 : a->blen;
+  int64_t nb = join ? b->blen - 3 : b->blen;
+  tystr *r = str_alloc(na + nb + (join ? 4 : 0), a->ulen + b->ulen - (join ? 2 : 0),
+                       TY_STR_ASCII(a) && TY_STR_ASCII(b));
+  char *out = TY_STR_DATA(r);
+  memcpy(out, da, (size_t)na);
+  if (join) {
+    int32_t hi = seq_cp(da + na, 3), lo = seq_cp(db, 3);
+    out += seq_put(out + na, 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+  } else {
+    out += na;
+  }
+  memcpy(out, db + (join ? 3 : 0), (size_t)nb);
+  TY_STR_DATA(r)[r->blen] = 0;
   return r;
 }
 
 int32_t ty_str_eq(tystr *a, tystr *b) {
   if (a == b) return 1;
   if (!a || !b) return 0;
-  if (a->len != b->len) return 0;
-  return memcmp(a->data, b->data, (size_t)a->len) == 0;
+  if (a->blen != b->blen) return 0;
+  return memcmp(TY_STR_DATA(a), TY_STR_DATA(b), (size_t)a->blen) == 0;
 }
 
 int32_t ty_str_cmp(tystr *a, tystr *b) {
   if (a == b) return 0;
   if (!a) return -1;
   if (!b) return 1;
-  int64_t n = a->len < b->len ? a->len : b->len;
-  int r = memcmp(a->data, b->data, (size_t)n);
+  int64_t n = a->blen < b->blen ? a->blen : b->blen;
+  int r = memcmp(TY_STR_DATA(a), TY_STR_DATA(b), (size_t)n);
   if (r) return r;
-  return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
+  return a->blen < b->blen ? -1 : (a->blen > b->blen ? 1 : 0);
 }
 
 int32_t ty_str_hash(tystr *s) {
   if (!s) ty_npe();
   int32_t h = 0;
-  for (int64_t i = 0; i < s->len; i++) h = 31 * h + (unsigned char)s->data[i];
+  for (int64_t i = 0; i < s->blen; i++) h = 31 * h + (unsigned char)TY_STR_DATA(s)[i];
   return h;
 }
 
@@ -1330,64 +1494,64 @@ tystr *ty_str_of_obj(void *o) {
 
 tystr *ty_str_upper(tystr *s) {
   if (!s) return NULL;
-  tystr *r = ty_str_new(s->data, s->len);
-  for (int64_t i = 0; i < r->len; i++)
-    if (r->data[i] >= 'a' && r->data[i] <= 'z') r->data[i] -= 32;
+  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
+  for (int64_t i = 0; i < r->blen; i++)
+    if (TY_STR_DATA(r)[i] >= 'a' && TY_STR_DATA(r)[i] <= 'z') TY_STR_DATA(r)[i] -= 32;
   return r;
 }
 tystr *ty_str_lower(tystr *s) {
   if (!s) return NULL;
-  tystr *r = ty_str_new(s->data, s->len);
-  for (int64_t i = 0; i < r->len; i++)
-    if (r->data[i] >= 'A' && r->data[i] <= 'Z') r->data[i] += 32;
+  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
+  for (int64_t i = 0; i < r->blen; i++)
+    if (TY_STR_DATA(r)[i] >= 'A' && TY_STR_DATA(r)[i] <= 'Z') TY_STR_DATA(r)[i] += 32;
   return r;
 }
 tystr *ty_str_trim(tystr *s) {
   if (!s) return NULL;
-  int64_t a = 0, b = s->len;
-  while (a < b && (unsigned char)s->data[a] <= ' ') a++;
-  while (b > a && (unsigned char)s->data[b - 1] <= ' ') b--;
-  return ty_str_new(s->data + a, b - a);
+  int64_t a = 0, b = s->blen;
+  while (a < b && (unsigned char)TY_STR_DATA(s)[a] <= ' ') a++;
+  while (b > a && (unsigned char)TY_STR_DATA(s)[b - 1] <= ' ') b--;
+  return ty_str_new(TY_STR_DATA(s) + a, b - a);
 }
 tystr *ty_str_sub(tystr *s, int32_t from, int32_t to) {
   if (!s) return NULL;
-  if (from < 0) { ty_throw((tyobj *)ty_sioobe(from, s->len)); }
-  if (to > s->len) { ty_throw((tyobj *)ty_sioobe(to, s->len)); }
-  if (from > to) { ty_throw((tyobj *)ty_sioobe(to, s->len)); }
-  return ty_str_new(s->data + from, to - from);
+  if (from < 0) { ty_throw((tyobj *)ty_sioobe(from, s->blen)); }
+  if (to > s->blen) { ty_throw((tyobj *)ty_sioobe(to, s->blen)); }
+  if (from > to) { ty_throw((tyobj *)ty_sioobe(to, s->blen)); }
+  return ty_str_new(TY_STR_DATA(s) + from, to - from);
 }
 int32_t ty_str_indexof(tystr *s, tystr *sub) {
   if (!s || !sub) ty_npe();
-  if (sub->len == 0) return 0;
-  for (int64_t i = 0; i + sub->len <= s->len; i++)
-    if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return (int32_t)i;
+  if (sub->blen == 0) return 0;
+  for (int64_t at = 0; at + sub->blen <= s->blen; at++)
+    if (memcmp(TY_STR_DATA(s) + at, TY_STR_DATA(sub), (size_t)sub->blen) == 0) return (int32_t)at;
   return -1;
 }
 int32_t ty_str_charat(tystr *s, int32_t i) {
-  if (!s || i < 0 || i >= s->len) ty_throw((tyobj *)ty_sioobe(i, s ? s->len : 0));
-  return (unsigned char)s->data[i];
+  if (!s || i < 0 || i >= s->blen) ty_throw((tyobj *)ty_sioobe(i, s ? s->blen : 0));
+  return (unsigned char)TY_STR_DATA(s)[i];
 }
 int32_t ty_str_contains(tystr *s, tystr *sub) { return ty_str_indexof(s, sub) >= 0; }
 int32_t ty_str_starts(tystr *s, tystr *p) {
   if (!s || !p) return 0;
-  return p->len <= s->len && memcmp(s->data, p->data, (size_t)p->len) == 0;
+  return p->blen <= s->blen && memcmp(TY_STR_DATA(s), TY_STR_DATA(p), (size_t)p->blen) == 0;
 }
 int32_t ty_str_ends(tystr *s, tystr *p) {
   if (!s || !p) return 0;
-  return p->len <= s->len && memcmp(s->data + s->len - p->len, p->data, (size_t)p->len) == 0;
+  return p->blen <= s->blen && memcmp(TY_STR_DATA(s) + s->blen - p->blen, TY_STR_DATA(p), (size_t)p->blen) == 0;
 }
 tystr *ty_str_replace(tystr *s, uint16_t a, uint16_t b) {
   if (!s) return NULL;
-  tystr *r = ty_str_new(s->data, s->len);
-  for (int64_t i = 0; i < r->len; i++)
-    if ((unsigned char)r->data[i] == (a & 0xFF)) r->data[i] = (char)b;
+  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
+  for (int64_t i = 0; i < r->blen; i++)
+    if ((unsigned char)TY_STR_DATA(r)[i] == (a & 0xFF)) TY_STR_DATA(r)[i] = (char)b;
   return r;
 }
 int32_t ty_str_isempty(tystr *s) {
   if (!s) ty_npe();
-  return s->len == 0;
+  return s->blen == 0;
 }
-int32_t ty_str_toint(tystr *s) { return s ? (int32_t)strtoll(s->data, NULL, 10) : 0; }
+int32_t ty_str_toint(tystr *s) { return s ? (int32_t)strtoll(TY_STR_DATA(s), NULL, 10) : 0; }
 
 /* ------------------------------------------------------------------ patterns */
 
@@ -1558,7 +1722,7 @@ float ty_unbox_float(void *o) {
 
 /* ------------------------------------------------------------------ output */
 
-void ty_print_str(tystr *s) { if (s) fwrite(s->data, 1, (size_t)s->len, stdout); else fputs("null", stdout); }
+void ty_print_str(tystr *s) { if (s) fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, stdout); else fputs("null", stdout); }
 void ty_println_str(tystr *s) { ty_print_str(s); putchar('\n'); }
 void ty_print_int(int64_t v) { printf("%lld", (long long)v); }
 void ty_println_int(int64_t v) { printf("%lld\n", (long long)v); }
@@ -1575,7 +1739,7 @@ void ty_print_float(float v) { ty_print_str(ty_str_of_float(v)); }
 void ty_println_float(float v) { ty_print_float(v); putchar('\n'); }
 void ty_print_char(uint16_t c) {
   if (c < 0x80) putchar((int)c);
-  else fputs(ty_str_of_char(c)->data, stdout);
+  else fputs(TY_STR_DATA(ty_str_of_char(c)), stdout);
 }
 void ty_println_char(uint16_t c) { ty_print_char(c); putchar('\n'); }
 void ty_print_bool(int32_t v) { fputs(v ? "true" : "false", stdout); }
@@ -1767,7 +1931,7 @@ double ty_math_cbrt(double x) {
    is what Java's getenv answers. */
 tystr *ty_getenv(tystr *name) {
   if (!name) ty_npe();
-  char *v = getenv(name->data);
+  char *v = getenv(TY_STR_DATA(name));
   return v ? ty_str_intern(v) : NULL;
 }
 
@@ -1776,7 +1940,7 @@ tystr *ty_getenv(tystr *name) {
    unknown, which is the same answer Java gives for a key it does not know. */
 tystr *ty_get_property(tystr *key) {
   if (!key) ty_npe();
-  const char *k = key->data;
+  const char *k = TY_STR_DATA(key);
   if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
   if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
   if (strcmp(k, "path.separator") == 0) return ty_str_intern(":");
@@ -2140,12 +2304,12 @@ static int parse_int(const char *d, int64_t n, int32_t radix, int64_t limit_pos,
 int32_t ty_str_parsable_int(tystr *s, int32_t radix) {
   int64_t v;
   if (!s) return 0;
-  return parse_int(s->data, s->len, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
+  return parse_int(TY_STR_DATA(s), s->blen, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
 }
 int64_t ty_str_parsable_long(tystr *s, int32_t radix) {
   int64_t v;
   if (!s) return 0;
-  return parse_int(s->data, s->len, radix, -INT64_MAX, INT64_MIN, &v);
+  return parse_int(TY_STR_DATA(s), s->blen, radix, -INT64_MAX, INT64_MIN, &v);
 }
 /* The two conversions below run only on a string the parsable test above has
    already accepted, so the failure return is unreachable and the value is the
@@ -2156,13 +2320,13 @@ int64_t ty_str_parsable_long(tystr *s, int32_t radix) {
 int32_t ty_str_toint_radix(tystr *s, int32_t radix) {
   int64_t v = 0;
   if (!s) ty_npe();
-  parse_int(s->data, s->len, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
+  parse_int(TY_STR_DATA(s), s->blen, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
   return (int32_t)v;
 }
 int64_t ty_str_tolong_radix(tystr *s, int32_t radix) {
   int64_t v = 0;
   if (!s) ty_npe();
-  parse_int(s->data, s->len, radix, -INT64_MAX, INT64_MIN, &v);
+  parse_int(TY_STR_DATA(s), s->blen, radix, -INT64_MAX, INT64_MIN, &v);
   return v;
 }
 
@@ -2219,49 +2383,49 @@ static int parsable_float_str(const char *d, int64_t n) {
   return parsable_dec_part(d, i, end);
 }
 int32_t ty_str_parsable_double(tystr *s) {
-  return s ? parsable_float_str(s->data, s->len) : 0;
+  return s ? parsable_float_str(TY_STR_DATA(s), s->blen) : 0;
 }
 int32_t ty_str_parsable_float(tystr *s) {
-  return s ? parsable_float_str(s->data, s->len) : 0;
+  return s ? parsable_float_str(TY_STR_DATA(s), s->blen) : 0;
 }
 /* The conversion itself is strtod/strtof, which are correctly rounded -- the
    same rounding Java's reader performs, and the reason a value read here and
    printed with %f matches what Java prints. The trailing f/F/d/D suffix needs
    no handling: strtod stops at it. Java's two spellings of the special values
    stop at nothing, since strtod reads "Infinity" and "NaN" too. */
-double ty_str_todouble_val(tystr *s) { return s ? strtod(s->data, NULL) : 0.0; }
-float ty_str_tofloat_val(tystr *s) { return s ? strtof(s->data, NULL) : 0.0f; }
+double ty_str_todouble_val(tystr *s) { return s ? strtod(TY_STR_DATA(s), NULL) : 0.0; }
+float ty_str_tofloat_val(tystr *s) { return s ? strtof(TY_STR_DATA(s), NULL) : 0.0f; }
 
 /* --------------------------------------------------------------- String */
 
 int32_t ty_str_cmp_ic(tystr *a, tystr *b) {
   int64_t i = 0, n;
   if (!a || !b) ty_npe();
-  n = a->len < b->len ? a->len : b->len;
+  n = a->blen < b->blen ? a->blen : b->blen;
   for (; i < n; i++) {
-    int32_t x = ty_char_lower((unsigned char)a->data[i]);
-    int32_t y = ty_char_lower((unsigned char)b->data[i]);
+    int32_t x = ty_char_lower((unsigned char)TY_STR_DATA(a)[i]);
+    int32_t y = ty_char_lower((unsigned char)TY_STR_DATA(b)[i]);
     if (x != y) return x - y;
   }
-  return (int32_t)(a->len - b->len);
+  return (int32_t)(a->blen - b->blen);
 }
 int32_t ty_str_eq_ic(tystr *a, tystr *b) {
   if (a == b) return 1;
-  if (!a || !b || a->len != b->len) return 0;
+  if (!a || !b || a->blen != b->blen) return 0;
   return ty_str_cmp_ic(a, b) == 0;
 }
 int32_t ty_str_starts_from(tystr *s, tystr *p, int32_t from) {
   if (!s || !p) ty_npe();
-  if (from < 0 || from > s->len - p->len) return 0;
-  return memcmp(s->data + from, p->data, (size_t)p->len) == 0;
+  if (from < 0 || from > s->blen - p->blen) return 0;
+  return memcmp(TY_STR_DATA(s) + from, TY_STR_DATA(p), (size_t)p->blen) == 0;
 }
 /* A search for a code point above 0xFF can never match a byte, so it answers
    -1 without walking the string: the runtime's chars are bytes. */
 static int64_t find_byte(tystr *s, int32_t c, int64_t from) {
   int64_t i;
   if (c < 0 || c > 0xFF) return -1;
-  for (i = from; i < s->len; i++)
-    if ((unsigned char)s->data[i] == (unsigned char)c) return i;
+  for (i = from; i < s->blen; i++)
+    if ((unsigned char)TY_STR_DATA(s)[i] == (unsigned char)c) return i;
   return -1;
 }
 int32_t ty_str_indexof_ch(tystr *s, int32_t c) {
@@ -2277,14 +2441,14 @@ int32_t ty_str_indexof_from(tystr *s, tystr *sub, int32_t from) {
   int64_t i;
   if (!s || !sub) ty_npe();
   if (from < 0) from = 0;
-  if (sub->len == 0) return from <= s->len ? from : (int32_t)s->len;
-  for (i = from; i + sub->len <= s->len; i++)
-    if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return (int32_t)i;
+  if (sub->blen == 0) return from <= s->blen ? from : (int32_t)s->blen;
+  for (i = from; i + sub->blen <= s->blen; i++)
+    if (memcmp(TY_STR_DATA(s) + i, TY_STR_DATA(sub), (size_t)sub->blen) == 0) return (int32_t)i;
   return -1;
 }
 int32_t ty_str_lastindexof(tystr *s, tystr *sub) {
   if (!s || !sub) ty_npe();
-  return ty_str_lastindexof_from(s, sub, (int32_t)s->len);
+  return ty_str_lastindexof_from(s, sub, (int32_t)s->blen);
 }
 /* Java's lastIndexOf answers the largest k <= from at which the needle starts,
    and for a needle that is empty that is min(from, length) -- the loop below
@@ -2292,32 +2456,32 @@ int32_t ty_str_lastindexof(tystr *s, tystr *sub) {
 int32_t ty_str_lastindexof_from(tystr *s, tystr *sub, int32_t from) {
   int64_t i;
   if (!s || !sub) ty_npe();
-  if (from > s->len) from = (int32_t)s->len;
+  if (from > s->blen) from = (int32_t)s->blen;
   if (from < 0) return -1;
   i = (int64_t)from;
-  if (i + sub->len > s->len) i = s->len - sub->len;
+  if (i + sub->blen > s->blen) i = s->blen - sub->blen;
   for (; i >= 0; i--)
-    if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return (int32_t)i;
+    if (memcmp(TY_STR_DATA(s) + i, TY_STR_DATA(sub), (size_t)sub->blen) == 0) return (int32_t)i;
   return -1;
 }
 int32_t ty_str_lastindexof_ch(tystr *s, int32_t c) {
   if (!s) ty_npe();
-  return ty_str_lastindexof_ch_from(s, c, (int32_t)s->len);
+  return ty_str_lastindexof_ch_from(s, c, (int32_t)s->blen);
 }
 int32_t ty_str_lastindexof_ch_from(tystr *s, int32_t c, int32_t from) {
   int64_t i;
   if (!s) ty_npe();
   if (c < 0 || c > 0xFF) return -1;
-  if (from > s->len) from = (int32_t)s->len;
+  if (from > s->blen) from = (int32_t)s->blen;
   for (i = from; i >= 0; i--)
-    if ((unsigned char)s->data[i] == (unsigned char)c) return (int32_t)i;
+    if ((unsigned char)TY_STR_DATA(s)[i] == (unsigned char)c) return (int32_t)i;
   return -1;
 }
 int32_t ty_str_isblank(tystr *s) {
   int64_t i;
   if (!s) ty_npe();
-  for (i = 0; i < s->len; i++)
-    if (!ty_is_whitespace((unsigned char)s->data[i])) return 0;
+  for (i = 0; i < s->blen; i++)
+    if (!ty_is_whitespace((unsigned char)TY_STR_DATA(s)[i])) return 0;
   return 1;
 }
 /* strip is Java's strip: the whitespace isWhitespace accepts, and nothing else.
@@ -2325,26 +2489,26 @@ int32_t ty_str_isblank(tystr *s) {
    with the same method in Java. */
 static int64_t strip_left(tystr *s) {
   int64_t i = 0;
-  while (i < s->len && ty_is_whitespace((unsigned char)s->data[i])) i++;
+  while (i < s->blen && ty_is_whitespace((unsigned char)TY_STR_DATA(s)[i])) i++;
   return i;
 }
 static int64_t strip_right(tystr *s) {
-  int64_t b = s->len;
-  while (b > 0 && ty_is_whitespace((unsigned char)s->data[b - 1])) b--;
+  int64_t b = s->blen;
+  while (b > 0 && ty_is_whitespace((unsigned char)TY_STR_DATA(s)[b - 1])) b--;
   return b;
 }
 tystr *ty_str_strip(tystr *s) {
   if (!s) ty_npe();
-  return ty_str_new(s->data + strip_left(s), strip_right(s) - strip_left(s));
+  return ty_str_new(TY_STR_DATA(s) + strip_left(s), strip_right(s) - strip_left(s));
 }
 tystr *ty_str_strip_leading(tystr *s) {
   if (!s) ty_npe();
   int64_t a = strip_left(s);
-  return ty_str_new(s->data + a, s->len - a);
+  return ty_str_new(TY_STR_DATA(s) + a, s->blen - a);
 }
 tystr *ty_str_strip_trailing(tystr *s) {
   if (!s) ty_npe();
-  return ty_str_new(s->data, strip_right(s));
+  return ty_str_new(TY_STR_DATA(s), strip_right(s));
 }
 /* Java's repeat: a negative count is an IllegalArgumentException, a count of
    zero is the empty string, and the result is the receiver repeated. */
@@ -2353,8 +2517,8 @@ tystr *ty_str_repeat(tystr *s, int32_t n) {
   int64_t i;
   if (!s) ty_npe();
   if (n < 0) ty_throw((tyobj *)ty_illarg("count is negative"));
-  r = ty_str_new(NULL, (int64_t)n * s->len);
-  for (i = 0; i < n; i++) memcpy(r->data + i * s->len, s->data, (size_t)s->len);
+  r = ty_str_new(NULL, (int64_t)n * s->blen);
+  for (i = 0; i < n; i++) memcpy(TY_STR_DATA(r) + i * s->blen, TY_STR_DATA(s), (size_t)s->blen);
   return r;
 }
 /* replace(String, String) is a literal replacement done left to right, and the
@@ -2366,65 +2530,55 @@ tystr *ty_str_replace_str(tystr *s, tystr *a, tystr *b) {
   char *p;
   tystr *r;
   if (!s || !a || !b) ty_npe();
-  if (a->len == 0) {
-    n = b->len * (s->len + 1) + s->len;
+  if (a->blen == 0) {
+    n = b->blen * (s->blen + 1) + s->blen;
   } else {
-    while (i + a->len <= s->len) {
-      if (memcmp(s->data + i, a->data, (size_t)a->len) == 0) { n += b->len; i += a->len; }
+    while (i + a->blen <= s->blen) {
+      if (memcmp(TY_STR_DATA(s) + i, TY_STR_DATA(a), (size_t)a->blen) == 0) { n += b->blen; i += a->blen; }
       else { n++; i++; }
     }
-    n += s->len - i;
+    n += s->blen - i;
   }
   r = ty_str_new(NULL, n);
-  p = r->data;
-  if (a->len == 0) {
-    for (i = 0; i <= s->len; i++) {
-      memcpy(p, b->data, (size_t)b->len); p += b->len;
-      if (i < s->len) *p++ = s->data[i];
+  p = TY_STR_DATA(r);
+  if (a->blen == 0) {
+    for (i = 0; i <= s->blen; i++) {
+      memcpy(p, TY_STR_DATA(b), (size_t)b->blen); p += b->blen;
+      if (i < s->blen) *p++ = TY_STR_DATA(s)[i];
     }
   } else {
     i = 0;
-    while (i + a->len <= s->len) {
-      if (memcmp(s->data + i, a->data, (size_t)a->len) == 0) {
-        memcpy(p, b->data, (size_t)b->len); p += b->len;
-        i += a->len;
+    while (i + a->blen <= s->blen) {
+      if (memcmp(TY_STR_DATA(s) + i, TY_STR_DATA(a), (size_t)a->blen) == 0) {
+        memcpy(p, TY_STR_DATA(b), (size_t)b->blen); p += b->blen;
+        i += a->blen;
       } else {
-        *p++ = s->data[i++];
+        *p++ = TY_STR_DATA(s)[i++];
       }
     }
-    for (at = i; at < s->len; at++) *p++ = s->data[at];
+    for (at = i; at < s->blen; at++) *p++ = TY_STR_DATA(s)[at];
   }
   return r;
 }
 
 /* -------------------------------------------------------------- char[] */
 
-/* A char is one byte in this runtime, so the two views are element for element:
-   toCharArray widens each byte, getBytes narrows it back, and String.valueOf
-   reads a char[] the same way. The array carries the element class the declared
-   result promises, so an array store into it is checked like any other. */
 tyarr *ty_str_tochararray(tystr *s) {
   tyarr *a;
   int64_t i;
   if (!s) ty_npe();
-  a = ty_array_new(s->len, 2);
-  for (i = 0; i < s->len; i++) ((uint16_t *)a->data)[i] = (uint16_t)(unsigned char)s->data[i];
+  a = ty_array_new(s->blen, 2);
+  for (i = 0; i < s->blen; i++) ((uint16_t *)a->data)[i] = (uint16_t)(unsigned char)TY_STR_DATA(s)[i];
   return a;
 }
-tyarr *ty_str_getbytes(tystr *s) {
-  tyarr *a;
-  int64_t i;
-  if (!s) ty_npe();
-  a = ty_array_new(s->len, 1);
-  for (i = 0; i < s->len; i++) ((int8_t *)a->data)[i] = (int8_t)s->data[i];
-  return a;
-}
+
 tystr *ty_str_of_chars(tyarr *chars) {
   tystr *r;
   int64_t i;
   if (!chars) ty_npe();
   r = ty_str_new(NULL, chars->len);
-  for (i = 0; i < chars->len; i++) r->data[i] = (char)(uint8_t)((uint16_t *)chars->data)[i];
+  for (i = 0; i < chars->len; i++)
+    TY_STR_DATA(r)[i] = (char)(uint8_t)((uint16_t *)chars->data)[i];
   return r;
 }
 tystr *ty_str_of_chars_part(tyarr *chars, int32_t off, int32_t count) {
@@ -2433,8 +2587,207 @@ tystr *ty_str_of_chars_part(tyarr *chars, int32_t off, int32_t count) {
   if (!chars) ty_npe();
   if (off < 0 || count < 0 || off > chars->len - count) ty_sioobe(off, chars->len);
   r = ty_str_new(NULL, count);
-  for (i = 0; i < count; i++) r->data[i] = (char)(uint8_t)((uint16_t *)chars->data)[off + i];
+  for (i = 0; i < count; i++)
+    TY_STR_DATA(r)[i] = (char)(uint8_t)((uint16_t *)chars->data)[off + i];
   return r;
+}
+
+/* The UTF-8 bytes of the string, encoded the way the JDK's UTF-8 encoder does.
+   The storage is already UTF-8 for everything a string can hold except a
+   surrogate without a partner, which UTF-8 has no encoding for, so the walk is
+   a copy that turns those into the one byte the JDK puts there: '?'. */
+tyarr *ty_str_getbytes(tystr *s) {
+  const char *d;
+  int64_t i, n = 0;
+  tyarr *a;
+  char *out;
+  if (!s) ty_npe();
+  d = TY_STR_DATA(s);
+  for (i = 0; i < s->blen;) {
+    int len = seq_len_in(d, s->blen, i);
+    if (len == 3) {
+      int32_t cp = seq_cp(d + i, 3);
+      n += (cp >= 0xD800 && cp <= 0xDFFF) ? 1 : 3;
+    } else {
+      n += len;
+    }
+    i += len;
+  }
+  a = ty_array_new(n, 1);
+  out = a->data;
+  for (i = 0; i < s->blen;) {
+    int len = seq_len_in(d, s->blen, i);
+    if (len == 3) {
+      int32_t cp = seq_cp(d + i, 3);
+      if (cp >= 0xD800 && cp <= 0xDFFF) {
+        *out++ = '?';
+        i += 3;
+        continue;
+      }
+    }
+    memcpy(out, d + i, (size_t)len);
+    out += len;
+    i += len;
+  }
+  return a;
+}
+
+/* ---- bytes to a string: java.nio.charset.UTF_8's decoder -------------- */
+
+/* The value utf8_next answers for a byte sequence that is not a character. The
+   decoder replaces it with U+FFFD; the constant is not a code point. */
+#define UTF8_BAD 0x7FFFFFFF
+
+/* One step of the decoder: the code point the sequence at `at` spells, and how
+   many bytes it took. An ill-formed sequence consumes its maximal subpart --
+   the longest prefix that could still have been a sequence -- so "\xE4\xB8"
+   truncated is one replacement and "\xE4" before an 'A' is one replacement
+   followed by the 'A'. That is the JDK's decoder, and these are its cases:
+   only a wrong *continuation* is rejected at the second byte, so a lead that
+   could still have become a well-formed sequence is carried to the third, and
+   a surrogate -- which three bytes can spell, and UTF-8 does not allow -- is
+   rejected once the code point is known rather than by its lead byte. */
+static int32_t utf8_next(const unsigned char *d, int64_t n, int64_t at, int *used) {
+  unsigned char b1 = d[at];
+  if (b1 < 0x80) {
+    *used = 1;
+    return b1;
+  }
+  if (b1 < 0xC2) { /* a continuation with nothing before it, or an overlong lead */
+    *used = 1;
+    return UTF8_BAD;
+  }
+  if (b1 < 0xE0) {
+    if (at + 1 >= n || (d[at + 1] & 0xC0) != 0x80) {
+      *used = 1;
+      return UTF8_BAD;
+    }
+    *used = 2;
+    return ((b1 & 0x1F) << 6) | (d[at + 1] & 0x3F);
+  }
+  if (b1 < 0xF0) {
+    if (at + 1 >= n) {
+      *used = 1;
+      return UTF8_BAD;
+    }
+    /* 0xE0 followed by a continuation below 0xA0 is overlong, and that much is
+       known from the second byte alone; anything else that is a continuation
+       could still be a character, so it is carried to the third byte. */
+    if ((b1 == 0xE0 && (d[at + 1] & 0xE0) == 0x80) || (d[at + 1] & 0xC0) != 0x80) {
+      *used = 1;
+      return UTF8_BAD;
+    }
+    if (at + 2 >= n) {
+      *used = 2;
+      return UTF8_BAD;
+    }
+    if ((d[at + 2] & 0xC0) != 0x80) {
+      *used = 2;
+      return UTF8_BAD;
+    }
+    {
+      int32_t cp = ((b1 & 0x0F) << 12) | ((d[at + 1] & 0x3F) << 6) | (d[at + 2] & 0x3F);
+      if (cp >= 0xD800 && cp <= 0xDFFF) {
+        *used = 3;
+        return UTF8_BAD;
+      }
+      *used = 3;
+      return cp;
+    }
+  }
+  if (b1 < 0xF5) {
+    int lo = b1 == 0xF0 ? 0x90 : 0x80; /* 0xF0 below 0x90 would be overlong */
+    int hi = b1 == 0xF4 ? 0x8F : 0xBF; /* above 0x10FFFF is not a code point */
+    if (at + 1 >= n || d[at + 1] < lo || d[at + 1] > hi) {
+      *used = 1;
+      return UTF8_BAD;
+    }
+    if (at + 2 >= n || (d[at + 2] & 0xC0) != 0x80) {
+      *used = 2;
+      return UTF8_BAD;
+    }
+    if (at + 3 >= n || (d[at + 3] & 0xC0) != 0x80) {
+      *used = 3;
+      return UTF8_BAD;
+    }
+    {
+      int32_t cp = ((b1 & 0x07) << 18) | ((d[at + 1] & 0x3F) << 12) | ((d[at + 2] & 0x3F) << 6) |
+                   (d[at + 3] & 0x3F);
+      if (cp > 0x10FFFF) { /* 0xF5..0xF7 lead here, with four bytes of them */
+        *used = 4;
+        return UTF8_BAD;
+      }
+      *used = 4;
+      return cp;
+    }
+  }
+  *used = 1;
+  return UTF8_BAD;
+}
+
+/* Bytes from outside the runtime become a string here, and everything that is
+   not a well-formed UTF-8 sequence becomes U+FFFD: a socket's half-finished
+   write, a file that is not text, a name in an encoding that is not this one.
+   Nothing downstream then has to wonder whether a string's bytes are
+   sequences, which is what makes the index arithmetic above safe. */
+tystr *ty_str_of_utf8(const char *d, int64_t n) {
+  const unsigned char *p = (const unsigned char *)d;
+  int64_t at = 0, blen = 0, ulen = 0;
+  int ascii = 1;
+  tystr *s;
+  char *out;
+  while (at < n) {
+    int used;
+    int32_t cp = utf8_next(p, n, at, &used);
+    at += used;
+    if (cp == UTF8_BAD) {
+      blen += 3;
+      ulen += 1;
+      ascii = 0;
+    } else if (cp < 0x80) {
+      blen += 1;
+      ulen += 1;
+    } else if (cp < 0x800) {
+      blen += 2;
+      ulen += 1;
+      ascii = 0;
+    } else if (cp < 0x10000) {
+      blen += 3;
+      ulen += 1;
+      ascii = 0;
+    } else {
+      blen += 4;
+      ulen += 2;
+      ascii = 0;
+    }
+  }
+  s = str_alloc(blen, ulen, ascii);
+  out = TY_STR_DATA(s);
+  for (at = 0; at < n;) {
+    int used;
+    int32_t cp = utf8_next(p, n, at, &used);
+    at += used;
+    out += seq_put(out, cp == UTF8_BAD ? 0xFFFD : cp);
+  }
+  *out = 0;
+  return s;
+}
+
+/* byte[] (a range of it) to a String, for String(byte[]),
+   String(byte[],int,int) and the prelude's own Net.stringFrom. The range check
+   is Java's: the offset may equal the length, a count that runs past the end is
+   an IndexOutOfBoundsException naming the length. */
+tystr *ty_str_of_bytes(tyarr *b, int32_t off, int32_t len) {
+  if (!b) ty_npe();
+  if (off < 0 || len < 0 || off > b->len - len) ty_sioobe(off, b->len);
+  return ty_str_of_utf8((const char *)b->data + off, len);
+}
+
+/* String(byte[]): the whole array, checked against the array's own length so
+   that a null array is a NullPointerException and not a read of nothing. */
+tystr *ty_str_of_bytes_all(tyarr *b) {
+  if (!b) ty_npe();
+  return ty_str_of_utf8((const char *)b->data, b->len);
 }
 
 /* intern keeps one object per content. Java's pool is the literal pool as well,
@@ -2475,7 +2828,7 @@ tystr *ty_str_interned(tystr *s) {
   }
   h = (uint32_t)ty_str_hash(s) % (uint32_t)intern_cap;
   for (e = intern_tab[h]; e; e = e->next)
-    if (e->s->len == s->len && memcmp(e->s->data, s->data, (size_t)s->len) == 0) return e->s;
+    if (e->s->blen == s->blen && memcmp(TY_STR_DATA(e->s), TY_STR_DATA(s), (size_t)s->blen) == 0) return e->s;
   e = (ty_intern *)malloc(sizeof(ty_intern));
   e->s = s;
   e->next = intern_tab[h];
@@ -2531,7 +2884,7 @@ static tySB *sb_checked(void *p, int64_t at, int64_t hi) {
 void *ty_sb_insert_str(void *p, int32_t at, tystr *s) {
   tySB *sb = sb_checked(p, at, ((tySB *)p)->len);
   if (!s) ty_npe();
-  lang_sb_insert_raw(sb, at, s->data, s->len);
+  lang_sb_insert_raw(sb, at, TY_STR_DATA(s), s->blen);
   return p;
 }
 void *ty_sb_insert_obj(void *p, int32_t at, void *o) {
@@ -2618,7 +2971,7 @@ void *ty_sb_replace(void *p, int32_t from, int32_t to, tystr *s) {
   if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
   if (to > sb->len) ty_sioobe(to, sb->len);
   ty_sb_delete(p, from, to);
-  lang_sb_insert_raw(sb, from, s->data, s->len);
+  lang_sb_insert_raw(sb, from, TY_STR_DATA(s), s->blen);
   return p;
 }
 void *ty_sb_reverse(void *p) {
@@ -2647,9 +3000,9 @@ void *ty_sb_set_length(void *p, int32_t n) {
 }
 static int32_t sb_find(tySB *sb, tystr *s, int64_t from) {
   int64_t i;
-  if (s->len == 0) return from <= sb->len ? (int32_t)from : -1;
-  for (i = from; i + s->len <= sb->len; i++)
-    if (memcmp(sb->buf + i, s->data, (size_t)s->len) == 0) return (int32_t)i;
+  if (s->blen == 0) return from <= sb->len ? (int32_t)from : -1;
+  for (i = from; i + s->blen <= sb->len; i++)
+    if (memcmp(sb->buf + i, TY_STR_DATA(s), (size_t)s->blen) == 0) return (int32_t)i;
   return -1;
 }
 int32_t ty_sb_indexof(void *p, tystr *s) {
@@ -2670,9 +3023,9 @@ int32_t ty_sb_lastindexof(void *p, tystr *s) {
   int64_t i;
   if (!sb) ty_npe();
   if (!s) ty_npe();
-  if (s->len == 0) return (int32_t)sb->len;
-  for (i = sb->len - s->len; i >= 0; i--)
-    if (memcmp(sb->buf + i, s->data, (size_t)s->len) == 0) return (int32_t)i;
+  if (s->blen == 0) return (int32_t)sb->len;
+  for (i = sb->len - s->blen; i >= 0; i--)
+    if (memcmp(sb->buf + i, TY_STR_DATA(s), (size_t)s->blen) == 0) return (int32_t)i;
   return -1;
 }
 tystr *ty_sb_substring(void *p, int32_t from) {
@@ -3164,7 +3517,7 @@ static void bad_width(tystr *fmt, int64_t spec0, int64_t speclen) {
   char msg[80];
   int64_t n = speclen;
   if (n > 76) n = 76;
-  memcpy(msg, fmt->data + spec0, (size_t)n);
+  memcpy(msg, TY_STR_DATA(fmt) + spec0, (size_t)n);
   msg[n] = 0;
   fmt_abandon();
   ty_throw(ty_illarg(msg));
@@ -3267,7 +3620,7 @@ static void *next_arg(tyarr *args, int64_t *ai, int64_t fixed, tystr *fmt, int64
 missing:
   if (n > 48) n = 48;
   memcpy(msg, "Format specifier '", 18);
-  memcpy(msg + 18, fmt->data + spec0, (size_t)n);
+  memcpy(msg + 18, TY_STR_DATA(fmt) + spec0, (size_t)n);
   msg[18 + n] = '\'';
   msg[19 + n] = 0;
   fmt_abandon();
@@ -3288,7 +3641,7 @@ static void *pick_arg(tyarr *args, int64_t *ai, int64_t fixed, void **last, int 
       int64_t n = speclen;
       if (n > 48) n = 48;
       memcpy(msg, "Format specifier '", 18);
-      memcpy(msg + 18, fmt->data + spec0, (size_t)n);
+      memcpy(msg + 18, TY_STR_DATA(fmt) + spec0, (size_t)n);
       msg[18 + n] = '\'';
       msg[19 + n] = 0;
       fmt_abandon();
@@ -3319,9 +3672,9 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
   fmt_base = fmt_live_n;
   fmtb_init(&out);
   fmt_hold(&out);
-  while (i < fmt->len) {
+  while (i < fmt->blen) {
     fmtflags f;
-    char conv, c = fmt->data[i];
+    char conv, c = TY_STR_DATA(fmt)[i];
     int64_t spec0;
     int32_t P;
     if (c != '%') {
@@ -3338,14 +3691,14 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
     relative = 0;
     {
       int64_t save = i, idx = 0;
-      while (i < fmt->len && TY_ASCII_DIGIT(fmt->data[i])) {
-        idx = idx * 10 + (fmt->data[i] - '0');
+      while (i < fmt->blen && TY_ASCII_DIGIT(TY_STR_DATA(fmt)[i])) {
+        idx = idx * 10 + (TY_STR_DATA(fmt)[i] - '0');
         i++;
       }
-      if (i > save && i < fmt->len && fmt->data[i] == '$') {
+      if (i > save && i < fmt->blen && TY_STR_DATA(fmt)[i] == '$') {
         fixed = idx - 1;
         i++;
-      } else if (i == save && i < fmt->len && fmt->data[i] == '<') {
+      } else if (i == save && i < fmt->blen && TY_STR_DATA(fmt)[i] == '<') {
         /* `%<` names the previous argument, so it is read where the "N$"
            would have been */
         relative = 1;
@@ -3360,8 +3713,8 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
       char fc;
       int *slot;
       const char *at;
-      if (i >= fmt->len) ty_unimplemented("String.format: conversion is cut short");
-      fc = fmt->data[i];
+      if (i >= fmt->blen) ty_unimplemented("String.format: conversion is cut short");
+      fc = TY_STR_DATA(fmt)[i];
       at = strchr("-#+ 0,(", fc);
       if (!at) break;
       switch ((int)(at - "-#+ 0,(")) {
@@ -3386,25 +3739,25 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
     {
       int32_t w = 0;
       int has = 0;
-      while (i < fmt->len && TY_ASCII_DIGIT(fmt->data[i])) {
+      while (i < fmt->blen && TY_ASCII_DIGIT(TY_STR_DATA(fmt)[i])) {
         has = 1;
-        w = w * 10 + (fmt->data[i] - '0');
+        w = w * 10 + (TY_STR_DATA(fmt)[i] - '0');
         i++;
       }
       if (has) f.width = w;
     }
     P = -1;
-    if (i < fmt->len && fmt->data[i] == '.') {
+    if (i < fmt->blen && TY_STR_DATA(fmt)[i] == '.') {
       int32_t pr = 0;
       i++;
-      while (i < fmt->len && TY_ASCII_DIGIT(fmt->data[i])) {
-        pr = pr * 10 + (fmt->data[i] - '0');
+      while (i < fmt->blen && TY_ASCII_DIGIT(TY_STR_DATA(fmt)[i])) {
+        pr = pr * 10 + (TY_STR_DATA(fmt)[i] - '0');
         i++;
       }
       P = pr;
     }
-    if (i >= fmt->len) ty_unimplemented("String.format: conversion is cut short");
-    conv = fmt->data[i];
+    if (i >= fmt->blen) ty_unimplemented("String.format: conversion is cut short");
+    conv = TY_STR_DATA(fmt)[i];
     i++;
     /* Java gives an integer or a character conversion no precision to work
        with, and says so with the offending number as the message */
@@ -3451,20 +3804,20 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
           tystr *s = o ? ty_unsigned_string_int(
                              ((int32_t(*)(void *))((tyobj *)o)->cls->vtable[1])(o), 16)
                        : ty_str_intern("null");
-          body = s->data;
-          blen = s->len;
+          body = TY_STR_DATA(s);
+          blen = s->blen;
           if (P >= 0 && blen > P) blen = P;
         } else if (conv == 'c' || conv == 'C') {
           /* a null argument prints as "null" here too, which is why the
              character is fetched only once there is an argument to fetch it
              from */
           tystr *s = o ? ty_str_of_char((uint16_t)char_arg(conv, o)) : ty_str_intern("null");
-          body = s->data;
-          blen = s->len;
+          body = TY_STR_DATA(s);
+          blen = s->blen;
         } else {
           tystr *s = ty_str_of_obj(o);
-          body = s->data;
-          blen = s->len;
+          body = TY_STR_DATA(s);
+          blen = s->blen;
           if (P >= 0 && blen > P) blen = P;
         }
         if (conv == 'S' || conv == 'H' || conv == 'C' || conv == 'B') {

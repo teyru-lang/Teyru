@@ -111,9 +111,9 @@
    wrong one. ty_str_new guarantees the terminator, so the length check is a
    test for an embedded NUL and nothing else. */
 static const char *ty_cstr(tystr *s) {
-  if (!s || !s->data) return NULL;
-  if ((int64_t)strlen(s->data) != s->len) return NULL;
-  return s->data;
+  if (!s) return NULL;
+  if ((int64_t)strlen(TY_STR_DATA(s)) != s->blen) return NULL;
+  return TY_STR_DATA(s);
 }
 
 /* A byte array is the only array this file reads or writes. The element size is
@@ -330,10 +330,10 @@ int32_t ty_net_write_all(int32_t fd, tyarr *buf, int32_t off, int32_t len) {
 int32_t ty_net_write_str(int32_t fd, tystr *s) {
   if (fd < 0) return -EINVAL;
   if (!s) return -EINVAL;
-  int64_t len = s->len;
+  int64_t len = s->blen;
   if (len <= 0) return 0;
   if (len > INT32_MAX) return -EINVAL;
-  const char *p = s->data;
+  const char *p = TY_STR_DATA(s);
   int32_t done = 0;
   while (done < (int32_t)len) {
     int64_t n = typlat_socket_send(fd, p + done, (int32_t)len - done);
@@ -432,17 +432,17 @@ tystr *ty_net_strerror(int32_t code) {
   return ty_str_new(buf, (int64_t)strlen(buf));
 }
 
-/* A byte[] as a String. The prelude has no way to build one from bytes -- its
-   only conversions are String.valueOf for the primitives and String(Object) --
-   and a socket that writes a request line back out as an answer needs exactly
-   this. ty_str_new copies the bytes, so the array can be reused or collected
+/* A byte[] as a String, which is Net.stringFrom in the prelude. The bytes are
+   decoded as UTF-8 and anything ill-formed becomes U+FFFD, exactly as
+   String(byte[]) does in Java: a network read can stop in the middle of a
+   sequence, and a string holding the halves of one would be a string whose
+   length and bytes disagree, which is what the read API must never see.
+   ty_str_of_bytes copies what it keeps, so the array can be reused or collected
    the moment this returns and nothing here holds a reference across an
-   allocation. The bytes are not decoded: one byte is one character, which for
-   UTF-8 and for HTTP's own ASCII grammar is the identity. */
+   allocation. */
 tystr *ty_net_bytes_to_str(tyarr *b, int32_t off, int32_t len) {
   if (!ty_is_bytes(b)) return NULL;
-  if (off < 0 || len < 0 || (int64_t)off + len > b->len) return NULL;
-  return ty_str_new(b->data + off, (int64_t)len);
+  return ty_str_of_bytes(b, off, len);
 }
 
 int32_t ty_net_is_timeout(int32_t code) { return code == TY_NET_TIMEOUT; }
@@ -720,7 +720,7 @@ int32_t ty_file_write_str(tystr *path, tystr *s, int32_t append) {
   if (!s) return -EINVAL;
   int fd = typlat_open_write(p, append);
   if (fd < 0) return -errno;
-  int32_t r = ty_write_fd(fd, s->data, s->len);
+  int32_t r = ty_write_fd(fd, TY_STR_DATA(s), s->blen);
   if (r < 0) {
     int e = -r;
     (void)close(fd);
@@ -738,9 +738,9 @@ tystr *ty_file_temp_dir(tystr *prefix) {
   typlat_temp_root(base, sizeof base);
   char pfx[TY_PREFIX_MAX];
   size_t k = 0;
-  if (prefix && prefix->data) {
-    for (int64_t i = 0; i < prefix->len && k + 1 < sizeof pfx; i++) {
-      char c = prefix->data[i];
+  if (prefix && TY_STR_DATA(prefix)) {
+    for (int64_t i = 0; i < prefix->blen && k + 1 < sizeof pfx; i++) {
+      char c = TY_STR_DATA(prefix)[i];
       /* A slash in the prefix would turn the template into a different
          directory, and mkdtemp would then create it somewhere the caller did
          not ask for. */
