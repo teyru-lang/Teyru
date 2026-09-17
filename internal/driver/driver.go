@@ -18,6 +18,7 @@ import (
 
 	"github.com/teyru-lang/Teyru/internal/ast"
 	"github.com/teyru-lang/Teyru/internal/codegen"
+	"github.com/teyru-lang/Teyru/internal/java"
 	"github.com/teyru-lang/Teyru/internal/mod"
 	"github.com/teyru-lang/Teyru/internal/parser"
 	tyrt "github.com/teyru-lang/Teyru/internal/runtime"
@@ -74,7 +75,11 @@ type Result struct {
 	// it: the C itself is scaffolding and only a path the caller passed with -c
 	// outlives the build.
 	CSource string
-	Diags   *source.Diagnostics
+	// Java is the equivalent Java source, and is set only by EmitJava. It
+	// carries the class to run and the name the file must have, because javac
+	// ties both of those to the source rather than to a flag.
+	Java  *java.Result
+	Diags *source.Diagnostics
 }
 
 // Compile turns Teyru sources into a native executable.
@@ -1025,6 +1030,14 @@ func must(err error) {
 }
 
 func findCC() string {
+	// TEYRU_CC names the C compiler a build uses, which is what runs the test
+	// suite's gcc leg: clang is preferred when both are installed, so without a
+	// way to say "gcc" the second half of the matrix could not be run at all.
+	if cc := os.Getenv("TEYRU_CC"); cc != "" {
+		if _, err := exec.LookPath(cc); err == nil {
+			return cc
+		}
+	}
 	for _, c := range []string{"clang", "gcc", "cc"} {
 		if _, err := exec.LookPath(c); err == nil {
 			return c

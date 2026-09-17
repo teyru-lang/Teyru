@@ -21,6 +21,7 @@ usage:
   teyru run   [flags] <paths...> [-- args...]  compile and run
   teyru emit  [flags] <paths...>   print the generated C
   teyru emit-llvm [flags] <paths...>  print the LLVM IR the backend feeds to LLVM
+  teyru emit-java [flags] <paths...>  print the equivalent Java source
   teyru get <module>@<version>     fetch a module into the cache and require it
   teyru mod init <module-path>     write teyru.mod for a new module
   teyru mod tidy                   make teyru.mod and teyru.sum match the sources
@@ -59,6 +60,12 @@ flags:
   --native-header <p>  write the C prototypes of every native method to <p>;
                        stops there unless --native is also given
   -v            verbose
+
+emit-java prints the program as the Java source it stands for, and refuses, by
+name and with the reason, what has no Java spelling: native properties, native
+methods, the Lombok and Spring and Gson shaped layers, and the parts of the
+standard library Java has no class for. It prints one compilation unit, so a
+program of several packages is refused too.
 `
 
 func main() {
@@ -176,7 +183,7 @@ func run() int {
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 		return 0
-	case "build", "run", "emit", "emit-llvm":
+	case "build", "run", "emit", "emit-llvm", "emit-java":
 	default:
 		fmt.Fprintf(os.Stderr, "teyru: unknown command %q\n", cmd)
 		fmt.Print(usage)
@@ -231,6 +238,26 @@ func run() int {
 		// executable an `emit-llvm` run would produce: asking for the IR used to
 		// fail outright when that unrequested link failed
 		opts.CSourceOnly = true
+	}
+
+	if cmd == "emit-java" {
+		// The Java printer is the other half of the JDK differential: it prints
+		// the program's own files as the Java they stand for, refusing by name
+		// what has no Java spelling rather than printing something that only
+		// looks like the program.
+		res, err := driver.EmitJava(files, opts)
+		if err != nil {
+			if res != nil && res.Diags != nil && len(res.Diags.List) > 0 {
+				fmt.Fprint(os.Stderr, res.Diags.String())
+			}
+			fail(err)
+		}
+		if res.Java != nil && len(res.Java.Refusals) > 0 {
+			fmt.Fprint(os.Stderr, res.Diags.String())
+			fail(fmt.Errorf("cannot emit Java for this program: %d feature(s) have no Java spelling", len(res.Java.Refusals)))
+		}
+		os.Stdout.WriteString(res.Java.Text)
+		return 0
 	}
 
 	start := time.Now()
