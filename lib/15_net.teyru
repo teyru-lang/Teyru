@@ -106,6 +106,17 @@ class EOFException extends IOException {
   }
 }
 
+// Raised by readLine(max) when a line does not end within the limit it was
+// given. How long a line may be is the protocol's business -- a request line, a
+// header, a chunk size line -- so this reader says only that the line it was
+// asked for is longer than the caller said it could be, and the caller turns
+// that into whatever its protocol answers.
+class LineTooLongException extends IOException {
+  public LineTooLongException(String message) {
+    super(message)
+  }
+}
+
 // The TLS layer's failures, cut the same way the socket's are: one base for
 // everything that can go wrong inside a TLS connection, and a class per thing
 // that a caller may reasonably want to tell apart. java.net.ssl has the same
@@ -865,7 +876,20 @@ class SocketInputStream extends InputStream {
   // != null)`, and making the normal end of a connection an exception would
   // make every loop a try block.
   public String readLine() {
+    return readLine(0)
+  }
+
+  // readLine(max) is readLine with a limit: a line that has not ended within
+  // max bytes stops there and LineTooLongException is thrown rather than the
+  // reader holding as much as the peer cares to send. Zero is no limit, which
+  // is what a caller reading something it already bounds asks for.
+  //
+  // The limit counts the bytes of the line and not its characters. A peer that
+  // sends a line of four-byte characters is sending four times the bytes, and
+  // the number the limit is about is the one the connection carried.
+  public String readLine(int max) {
     StringBuilder sb = null
+    int got = 0
     while (true) {
       if (pos == count) {
         if (!fill()) {
@@ -887,8 +911,16 @@ class SocketInputStream extends InputStream {
           sb = new StringBuilder()
         }
         sb.append(Net.stringFrom(buf, pos, count - pos))
+        got = got + (count - pos)
         pos = count
+        if (max > 0 && got > max) {
+          throw new LineTooLongException("a line longer than " + max + " bytes")
+        }
         continue
+      }
+      got = got + (nl - pos)
+      if (max > 0 && got > max) {
+        throw new LineTooLongException("a line longer than " + max + " bytes")
       }
       String line
       if (sb == null) {

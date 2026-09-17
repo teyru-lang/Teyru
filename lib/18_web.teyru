@@ -75,24 +75,32 @@ package teyru
 // MultipartFile is one part of a multipart/form-data request: the field it was
 // sent as, the name the client's file had, the type the part declared, and the
 // part's bytes as they arrived. Spring's MultipartFile also knows how to write
-// itself to disk or hand out a stream; this is the four things a handler reads,
-// and the content is a String because a request body already is one: the
-// server reads it as text, so a file arrives as the characters that were sent.
+// itself to disk or hand out a stream; this is the four things a handler reads.
+//
+// The part is kept as its bytes, and `content` is those bytes read as text. A
+// part is a file as often as it is a field -- an image, a zip, a file of every
+// byte value there is -- and an upload's length, its digest and what it is
+// written back as are all questions about its bytes; a handler that wants the
+// text of a text part asks for `content` and gets exactly that.
 class MultipartFile {
   public String name = ""
   public String originalFilename = ""
   public String contentType = ""
   public String content = ""
+  // contentBytes is the part as it arrived. It is what `content` was decoded
+  // from, and the only faithful answer for a part that is not text.
+  public byte[] contentBytes = new byte[0]
 
   // isEmpty distinguishes a part that was sent with no bytes -- a form field a
   // browser submits empty, a file upload of a zero-length file -- which is the
   // question a handler asks before storing what it was given.
   public boolean isEmpty() {
-    return content.isEmpty()
+    return contentBytes.length == 0
   }
 
+  // size is the part's length in bytes, which is what a file's size is.
   public int size() {
-    return content.length()
+    return contentBytes.length
   }
 
   public String toString() {
@@ -126,6 +134,12 @@ class MultipartForm {
   // part answers the part a field name was sent as, or null when the request
   // carries no such part.
   public static MultipartFile part(String body, String boundary, String name) {
+    return part(body.getBytes(), boundary, name)
+  }
+
+  // part is the same question about a body that is bytes, which is how a
+  // request body arrives.
+  public static MultipartFile part(byte[] body, String boundary, String name) {
     if (boundary.length() == 0) {
       return null
     }
@@ -138,37 +152,48 @@ class MultipartForm {
     return null
   }
 
+  public static List<MultipartFile> parts(String body, String boundary) {
+    return parts(body.getBytes(), boundary)
+  }
+
   // parts splits a body into the parts read so far. A body that stops in the
   // middle of a part ends the parse, which is what a truncated upload can be
   // answered with: the parts before the break are still parts.
-  public static List<MultipartFile> parts(String body, String boundary) {
+  //
+  // The search is over the body's bytes rather than its characters, and it is
+  // the only way it can be: a boundary is ASCII, a part's content is anything
+  // at all, and a delimiter that is looked for in a string is a delimiter that
+  // is found in the wrong place as soon as the content is not text.
+  public static List<MultipartFile> parts(byte[] body, String boundary) {
     List<MultipartFile> out = new ArrayList<MultipartFile>()
     if (boundary.length() == 0) {
       return out
     }
-    String delimiter = "--" + boundary
-    int start = body.indexOf(delimiter)
+    byte[] delimiter = ("--" + boundary).getBytes()
+    byte[] closing = "--".getBytes()
+    byte[] blankLine = "\r\n\r\n".getBytes()
+    int start = indexOf(body, delimiter, 0)
     while (start >= 0) {
-      int line = start + delimiter.length()
+      int line = start + delimiter.length
       // the closing delimiter is the one followed by "--"
-      if (body.startsWith("--", line)) {
+      if (hasAt(body, closing, line)) {
         return out
       }
       // the delimiter's CRLF, then the part's headers, then the blank line
       // that ends them
-      int blank = body.indexOf("\r\n\r\n", line)
-      int next = blank < 0 ? -1 : body.indexOf(delimiter, blank)
+      int blank = indexOf(body, blankLine, line)
+      int next = blank < 0 ? -1 : indexOf(body, delimiter, blank)
       if (next < 0) {
         return out
       }
-      String headers = body.substring(line + 2, blank + 2)
+      String headers = Net.stringFrom(body, line + 2, blank + 2 - (line + 2))
       // the content ends at the CRLF in front of the next delimiter
       int begin = blank + 4
       int end = next
-      if (end - 2 >= begin && body.charAt(end - 2) == '\r' && body.charAt(end - 1) == '\n') {
+      if (end - 2 >= begin && body[end - 2] == 13 && body[end - 1] == 10) {
         end -= 2
       }
-      MultipartFile f = of(headers, body.substring(begin, end))
+      MultipartFile f = of(headers, body, begin, end - begin)
       if (f != null) {
         out.add(f)
       }
@@ -180,12 +205,47 @@ class MultipartForm {
     return out
   }
 
+  // indexOf is String.indexOf for bytes: the first place the needle appears at
+  // or after `from`, or -1. The needle is a delimiter or a blank line, both
+  // ASCII, so the search is over one-byte values. It is a scan rather than a
+  // two-way search, which is what a form body of a few megabytes can afford.
+  private static int indexOf(byte[] hay, byte[] needle, int from) {
+    if (needle.length == 0) {
+      return -1
+    }
+    for (int i = from : i + needle.length <= hay.length : i++) {
+      if (hasAt(hay, needle, i)) {
+        return i
+      }
+    }
+    return -1
+  }
+
+  // hasAt answers whether the needle is at that offset, and answers false
+  // rather than reading past the end: the last delimiter of a body is often the
+  // last thing in it.
+  private static boolean hasAt(byte[] hay, byte[] needle, int at) {
+    if (at < 0 || at + needle.length > hay.length) {
+      return false
+    }
+    for (int i = 0 : i < needle.length : i++) {
+      if (hay[at + i] != needle[i]) {
+        return false
+      }
+    }
+    return true
+  }
+
   // of is one part's headers and content as a MultipartFile, or null when the
   // headers do not name the field the part belongs to: a part without a
   // Content-Disposition cannot be asked for by name, so it is not one.
-  private static MultipartFile of(String headers, String content) {
+  private static MultipartFile of(String headers, byte[] body, int off, int len) {
     MultipartFile f = new MultipartFile()
-    f.content = content
+    f.contentBytes = new byte[len]
+    for (int i = 0 : i < len : i++) {
+      f.contentBytes[i] = body[off + i]
+    }
+    f.content = Net.stringFrom(f.contentBytes, 0, len)
     for (String line : WebUtil.splitRawLines(headers)) {
       int colon = line.indexOf(":")
       if (colon <= 0) {
@@ -209,6 +269,11 @@ class MultipartForm {
   // parameter is only a parameter when it follows a ";" or starts the value, so
   // that "name" is not found inside "filename".
   public static String parameter(String header, String param) {
+    // An empty name is in every header at every offset, so searching for it
+    // would never advance: the answer is that there is no such parameter.
+    if (param.length() == 0) {
+      return ""
+    }
     String lower = header.toLowerCase()
     int at = 0
     while (true) {
@@ -245,7 +310,80 @@ class HttpRequest {
   public String path = ""
   public String query = ""
   public String version = "HTTP/1.1"
+  // The framing the head declared, which the parser settles because the reader
+  // needs it before the body exists: how many bytes the body is, or -1 for a
+  // request with no body, or that it arrives in chunks. It is a decision rather
+  // than a header because the headers have to be read together to make it -- a
+  // Content-Length declared twice, a transfer coding nobody implements, and a
+  // request that declares both -- and a reader that made it again on its own
+  // would be a second reader to disagree with.
+  public int contentLength = -1
+  public boolean chunked = false
+  // The body as it arrived, and the text of it.
+  //
+  // A request body is bytes: it is a JSON document, a form, an upload, a gzip
+  // member -- which one it is is the Content-Type's to say -- and its bytes are
+  // what a length, a multipart boundary or a digest is counted in. `bodyBytes`
+  // is what the connection read; `body` is those bytes decoded, and the decode
+  // happens the first time something asks for the text, so a 10 MB upload of an
+  // image is never turned into a string nothing wanted. A request built by hand
+  // -- a test, a proxy -- sets `body` and has no bytes, which is the other way
+  // round and equally true.
+  public byte[] bodyBytes = null
   public String body = ""
+  private boolean bodyDecoded = false
+
+  // bodyText is the body read as text, which is what a handler bound to a
+  // String, a form field or a part asked after wants. The bytes are decoded by
+  // the charset the Content-Type names -- UTF-8 when it names none, which is
+  // what HTTP made the default, and ISO-8859-1 when it names that, because a
+  // body of one byte per character is a decoder of one line rather than a table
+  // this library does not have. Anything else is decoded as UTF-8.
+  //
+  // A byte that is not valid UTF-8 is replaced rather than refused: a body is
+  // not a header, and a mangled byte in a document the sender sent is not a
+  // reason to fail a request whose framing was perfectly clear. (The decode is
+  // Net.stringFrom, which is the one place the runtime turns bytes into text
+  // W5 is what gives it the replacement rule.)
+  public String bodyText() {
+    if (bodyBytes == null || bodyDecoded) {
+      return body
+    }
+    bodyDecoded = true
+    String charset = MultipartForm.parameter(header("Content-Type"), "charset").toLowerCase()
+    if (charset.equals("iso-8859-1") || charset.equals("latin1") || charset.equals("us-ascii")) {
+      StringBuilder b = new StringBuilder()
+      for (int i = 0 : i < bodyBytes.length : i++) {
+        b.append((char) (bodyBytes[i] & 0xff))
+      }
+      body = b.toString()
+      return body
+    }
+    body = Net.stringFrom(bodyBytes, 0, bodyBytes.length)
+    return body
+  }
+
+  // withBody is the body the connection read, as the bytes it read. It is what
+  // the server calls once the body is in hand, and it leaves the text to be
+  // decoded -- or never to be.
+  public HttpRequest withBody(byte[] bytes) {
+    bodyBytes = bytes
+    body = ""
+    bodyDecoded = false
+    return this
+  }
+
+  // withBodyText is the body as text, which is what a caller that already has
+  // one -- the parser reading a request out of a string, a test, a proxy --
+  // sets instead. Both are set so that asking for either answers the same
+  // thing, and neither decodes anything twice.
+  public HttpRequest withBodyText(String text) {
+    body = text
+    bodyBytes = text.getBytes()
+    bodyDecoded = true
+    return this
+  }
+
   // pendingSession is the id of a session a handler started while answering
   // this request. The answer is built after the handler returns, so the cookie
   // cannot be set there; the server stamps it on the way out instead.
@@ -301,7 +439,7 @@ class HttpRequest {
     if (header("Content-Type").toLowerCase().startsWith("application/x-www-form-urlencoded") == false) {
       return
     }
-    for (String pair : body.split("&")) {
+    for (String pair : bodyText().split("&")) {
       if (pair.isEmpty()) {
         continue
       }
@@ -327,7 +465,11 @@ class HttpRequest {
   // is asked for here by name, the way a file is, because the two arrive
   // together and only one of them has a filename.
   public MultipartFile multipart(String name) {
-    return MultipartForm.part(body, MultipartForm.boundary(header("Content-Type")), name)
+    String boundary = MultipartForm.boundary(header("Content-Type"))
+    if (bodyBytes != null) {
+      return MultipartForm.part(bodyBytes, boundary, name)
+    }
+    return MultipartForm.part(body, boundary, name)
   }
 
   // keepAlive answers whether the connection stays open after this request.
@@ -505,6 +647,12 @@ class HttpResponse {
   public int status = 200
   public String contentType = "text/plain; charset=utf-8"
   public String body = ""
+  // bodyBytes is the body when it is bytes rather than text -- a picture, a
+  // file, a part a handler echoed -- and when it is set it is the body: the
+  // connection writes those bytes and `body` is not written at all. A body that
+  // went through a string to reach the wire would arrive changed for every byte
+  // value that is not text, which is the one thing an upload cannot survive.
+  public byte[] bodyBytes = null
   private List<String> headerNames = new ArrayList<String>()
   private List<String> headerValues = new ArrayList<String>()
   private List<String> cookieNames = new ArrayList<String>()
@@ -562,8 +710,34 @@ class HttpResponse {
   //     and sending it anyway would leave it where the client reads the *next*
   //     answer on a keep-alive connection. The status decides, not the handler.
   public String respond(String version, boolean keepAlive, boolean head) {
+    String headText = respondHead(version, keepAlive)
+    if (head || carriesBody() == false) {
+      return headText
+    }
+    int length = bodyLength()
+    if (chunkedBody && length > 0) {
+      if (bodyBytes != null) {
+        return headText + chunkPrefix(length) + Net.stringFrom(bodyBytes, 0, length) + CHUNKED_END
+      }
+      return headText + chunked(body)
+    }
+    if (bodyBytes != null) {
+      return headText + Net.stringFrom(bodyBytes, 0, length)
+    }
+    return headText + body
+  }
+
+  // respondHead is the status line and the headers: everything a client reads
+  // before the body, with the framing the body is written with.
+  //
+  // It is separate from respond because a body that is bytes is written as
+  // bytes. The connection writes this, then the bytes: a string built to hold
+  // an image and written back out is an image that was decoded and encoded
+  // again, and one that a decoder had to have an opinion about.
+  public String respondHead(String version, boolean keepAlive) {
     boolean carries = carriesBody()
-    boolean chunked = chunkedBody && body.length() > 0 && carries
+    int length = bodyLength()
+    boolean chunked = chunkedBody && length > 0 && carries
     StringBuilder b = new StringBuilder()
     b.append(version.isEmpty() ? "HTTP/1.1" : version).append(" ").append(status).append(" ").append(statusText()).append("\r\n")
     if (carries) {
@@ -572,7 +746,7 @@ class HttpResponse {
     if (chunked) {
       b.append("Transfer-Encoding: chunked\r\n")
     } else if (carries) {
-      b.append("Content-Length: ").append(body.length()).append("\r\n")
+      b.append("Content-Length: ").append(length).append("\r\n")
     }
     for (int i = 0 : i < headerNames.size() : i++) {
       b.append(headerNames.get(i)).append(": ").append(headerValues.get(i)).append("\r\n")
@@ -586,14 +760,32 @@ class HttpResponse {
     }
     b.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n")
     b.append("\r\n")
-    if (head || carries == false) {
-      return b.toString()
-    }
-    if (chunked) {
-      return b.toString() + chunked(body)
-    }
-    return b.toString() + body
+    return b.toString()
   }
+
+  // bodyLength is the number of bytes this body puts on the wire, which is the
+  // number Content-Length declares and the one a chunk's size is written in.
+  //
+  // It is not `body.length()`. That counts characters, and a body with anything
+  // but ASCII in it is longer than that in bytes: a Content-Length taken from a
+  // character count is a client that stops reading one byte early and reads the
+  // next answer on the connection from the middle of this one.
+  public int bodyLength() {
+    if (bodyBytes != null) {
+      return bodyBytes.length
+    }
+    return body.getBytes().length
+  }
+
+  // The framing of a chunked body that is written from bytes: the size in the
+  // hex a chunk size is written in, then the bytes, then the CRLF after them
+  // and the chunk of length zero that ends the body. The middle of that is the
+  // body itself, and it is written by the connection rather than built here.
+  public static String chunkPrefix(int length) {
+    return Integer.toHexString(length) + "\r\n"
+  }
+
+  public static final String CHUNKED_END = "\r\n0\r\n\r\n"
 
   /* applyGzip is what the connection loop calls on its way out, and it is
      public because a caller that renders a response itself -- a test, a
@@ -607,11 +799,14 @@ class HttpResponse {
        body to a client that never said it could decode one. Vary is written
        whether or not this particular request got the compressed form. */
     header("Vary", "Accept-Encoding")
-    if (acceptsGzip(acceptEncoding) == false || body.length() < MIN_GZIP_BYTES) {
+    // A body that is already bytes is left alone: this compresses text, and
+    // what a handler handed over as bytes is a picture, an archive or a part
+    // it echoed, which is either already compressed or not text to begin with.
+    if (bodyBytes != null || acceptsGzip(acceptEncoding) == false || bodyLength() < MIN_GZIP_BYTES) {
       return
     }
     String packed = Gzip.compress(body)
-    if (packed.length() >= body.length()) {
+    if (packed.length() >= bodyLength()) {
       return
     }
     header("Content-Encoding", "gzip")
@@ -679,39 +874,210 @@ class HttpResponse {
 
 // ---------------------------------------------------------------- parsing
 
+// HttpProtocolException is a request this server refuses, carrying the status
+// that says why. It is an IllegalArgumentException because that is what the
+// parser has always thrown and what a caller of parse() catches; `status` is
+// what the connection answers with, and it is 400 -- the request could not be
+// understood -- unless the refusal is one of the few that has a status of its
+// own: 414 for a request line that is too long, 431 for headers that are, 413
+// for a body that is, 501 for a transfer coding this server does not implement,
+// 505 for a version it does not speak, 408 for a request that took too long to
+// arrive.
+//
+// The distinction matters because it is the whole of what a client learns: a
+// 400 says "I cannot read this", a 413 says "this is too big", and a client
+// that is told the wrong one retries something that will never work.
+class HttpProtocolException extends IllegalArgumentException {
+  public int status = 400
+
+  public HttpProtocolException(String message) {
+    super(message)
+  }
+
+  public HttpProtocolException(int status, String message) {
+    super(message)
+    this.status = status
+  }
+}
+
 class HttpParser {
   // parse reads one request. It throws IllegalArgumentException with a message
   // the caller can put in a 400 when the request cannot be understood.
   public static HttpRequest parse(String raw) {
-    if (raw.isEmpty()) {
-      throw new IllegalArgumentException("empty request")
-    }
     int headEnd = raw.indexOf("\r\n\r\n")
     String head = headEnd >= 0 ? raw.substring(0, headEnd) : raw
-    String body = headEnd >= 0 ? raw.substring(headEnd + 4) : ""
+    HttpRequest req = parseHead(head)
+    req.withBodyText(headEnd >= 0 ? raw.substring(headEnd + 4) : "")
+    req.readForm()
+    return req
+  }
+
+  // parseHead reads the request line and the headers, which is everything a
+  // request says before its body. The connection loop reads the head, parses
+  // it, and then reads the body the head declared -- the length is in the head,
+  // so the body cannot be read before it -- which is why the two halves of a
+  // request are read by two calls that meet in parse.
+  public static HttpRequest parseHead(String head) {
+    if (head.isEmpty()) {
+      throw new IllegalArgumentException("empty request")
+    }
     List<String> lines = splitLines(head)
     if (lines.size() == 0) {
       throw new IllegalArgumentException("no request line")
     }
     HttpRequest req = new HttpRequest()
     parseRequestLine(req, lines.get(0))
+    boolean lengthSeen = false
+    List<String> codings = new ArrayList<String>()
     for (int i = 1 : i < lines.size() : i++) {
       String line = lines.get(i)
+      // A line that begins with a space or a tab continues the one before it.
+      // RFC 9112 removed that folding and tells a server to reject it with a
+      // 400: two readers that disagree about where a header ends are what
+      // request smuggling is made of, and this server has no reason to be one
+      // of them.
+      if (line.startsWith(" ") || line.startsWith("\t")) {
+        throw new HttpProtocolException("a header line continues the one before it: " + line)
+      }
       int colon = line.indexOf(":")
       if (colon <= 0) {
         throw new IllegalArgumentException("malformed header: " + line)
       }
-      req.addHeader(line.substring(0, colon).trim(), line.substring(colon + 1).trim())
+      // Whitespace between the name and the colon is the other half of the same
+      // rule, and it is the one a smuggling attempt writes: "Content-Length : 5"
+      // is a header to one reader and something else to the next.
+      if (line.charAt(colon - 1) == ' ' || line.charAt(colon - 1) == '\t') {
+        throw new HttpProtocolException("whitespace before the colon in: " + line)
+      }
+      String name = line.substring(0, colon)
+      for (int k = 0 : k < name.length() : k++) {
+        if (isToken(name.charAt(k)) == false) {
+          throw new HttpProtocolException("not a header name: " + name)
+        }
+      }
+      String value = line.substring(colon + 1).trim()
+      req.addHeader(name, value)
+      String lower = name.toLowerCase()
+      if (lower.equals("content-length")) {
+        int declared = declaredLength(value)
+        if (lengthSeen && declared != req.contentLength) {
+          throw new HttpProtocolException("Content-Length is declared twice, as " +
+              req.contentLength + " and as " + declared)
+        }
+        req.contentLength = declared
+        lengthSeen = true
+      } else if (lower.equals("transfer-encoding")) {
+        String[] parts = value.split(",")
+        for (int k = 0 : k < parts.length : k++) {
+          String coding = parts[k].trim().toLowerCase()
+          if (coding.length() > 0) {
+            codings.add(coding)
+          }
+        }
+      }
+    }
+    // A request that says how long its body is twice, two ways, is a request
+    // whose body length two readers disagree about: RFC 9112 tells a server to
+    // answer 400 and close, and a server that picks one of the two is the
+    // server a smuggle is aimed at.
+    if (codings.size() > 0 && lengthSeen) {
+      throw new HttpProtocolException(
+          "a request with both Content-Length and Transfer-Encoding is refused: one of them is a lie")
+    }
+    if (codings.size() > 0) {
+      String last = codings.get(codings.size() - 1)
+      if (last.equals("chunked") == false) {
+        // chunked somewhere but not last is the case RFC 9112 gives a 400: the
+        // length of the body cannot be determined reliably
+        if (codings.contains("chunked")) {
+          throw new HttpProtocolException("chunked is not the last transfer coding: " + join(codings))
+        }
+        throw new HttpProtocolException(501, "transfer coding not implemented: " + last)
+      }
+      for (int i = 0 : i < codings.size() : i++) {
+        if (codings.get(i).equals("chunked") == false) {
+          throw new HttpProtocolException(501, "transfer coding not implemented: " + codings.get(i))
+        }
+      }
+      req.chunked = true
     }
     // HTTP/1.1 requires Host; a request without one is refused rather than
     // routed to whatever the default would be.
     if (req.version.equals("HTTP/1.1") && req.hasHeader("Host") == false) {
       throw new IllegalArgumentException("HTTP/1.1 request without Host")
     }
-    req.body = body
     req.readCookies()
-    req.readForm()
     return req
+  }
+
+  // declaredLength reads a Content-Length value, which may be a list of
+  // identical numbers (RFC 9112 lets a proxy fold two fields into one) but may
+  // not be anything else. A value that is not a number, that is negative, that
+  // carries a sign, or that is larger than a long is refused: every one of them
+  // is a length two readers would disagree about, and a length is the one thing
+  // this server agrees to allocate by.
+  private static int declaredLength(String value) {
+    String[] parts = value.split(",")
+    long declared = -1
+    for (int i = 0 : i < parts.length : i++) {
+      String part = parts[i].trim()
+      long v = digits(part)
+      if (v < 0) {
+        throw new HttpProtocolException("not a Content-Length: " + value)
+      }
+      if (declared >= 0 && v != declared) {
+        throw new HttpProtocolException("Content-Length names two lengths: " + value)
+      }
+      declared = v
+    }
+    if (declared < 0) {
+      throw new HttpProtocolException("not a Content-Length: " + value)
+    }
+    if (declared > 2147483647L) {
+      throw new HttpProtocolException("Content-Length is larger than any body this server could hold: " + value)
+    }
+    return (int) declared
+  }
+
+  // digits is a string of decimal digits as a number, or -1 when it is not one:
+  // empty, carrying a sign or a space, or larger than a long. Overflow is not a
+  // number either -- "99999999999999999999" is a length no client has -- so
+  // both answers are the same one.
+  private static long digits(String s) {
+    if (s.length() == 0 || s.length() > 19) {
+      return -1
+    }
+    long v = 0
+    for (int i = 0 : i < s.length() : i++) {
+      char ch = s.charAt(i)
+      if (ch < '0' || ch > '9') {
+        return -1
+      }
+      v = v * 10 + (long) (ch - '0')
+      if (v < 0) {
+        return -1
+      }
+    }
+    return v
+  }
+
+  // isToken is the RFC 9110 tchar set: what a header name may be made of.
+  public static boolean isToken(char ch) {
+    if (ch >= 'a' && ch <= 'z') { return true }
+    if (ch >= 'A' && ch <= 'Z') { return true }
+    if (ch >= '0' && ch <= '9') { return true }
+    return "!#$%&'*+-.^_`|~".indexOf(ch) >= 0
+  }
+
+  private static String join(List<String> parts) {
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < parts.size() : i++) {
+      if (i > 0) {
+        b.append(", ")
+      }
+      b.append(parts.get(i))
+    }
+    return b.toString()
   }
 
   private static void parseRequestLine(HttpRequest req, String line) {
@@ -726,6 +1092,19 @@ class HttpParser {
     req.method = line.substring(0, sp1)
     String target = line.substring(sp1 + 1, sp2)
     req.version = line.substring(sp2 + 1)
+    // The version is the one thing a server has to agree with the client about
+    // before it answers at all: a request in a protocol this server does not
+    // speak gets 505, which is what tells the client to stop trying.
+    if (req.version.equals("HTTP/1.1") == false && req.version.equals("HTTP/1.0") == false) {
+      throw new HttpProtocolException(505, "HTTP version not supported: " + req.version)
+    }
+    // absolute-form is a request to a proxy: "GET http://host/path HTTP/1.1".
+    // The authority is dropped and the path routed, which is what a server that
+    // can also be reached directly does with it.
+    if (target.startsWith("http://") || target.startsWith("https://")) {
+      int authority = WebUtil.indexOfFrom(target, "/", target.indexOf("://") + 3)
+      target = authority < 0 ? "/" : target.substring(authority)
+    }
     int q = target.indexOf("?")
     if (q >= 0) {
       req.path = target.substring(0, q)
@@ -1029,14 +1408,96 @@ class Router {
   }
 }
 
+// ---------------------------------------------------------------- routing
+
+// ConnectionTask is one connection on one worker of the pool: the server
+// answers it, and the pool is told the worker is free again. It is a class
+// rather than an anonymous Runnable because a connection has two things to know
+// -- the server and the socket -- and a named class carrying both reads better
+// than a closure that captures them.
+class ConnectionTask implements Runnable {
+  private HttpServer server
+  private Socket socket
+
+  public ConnectionTask(HttpServer server, Socket socket) {
+    this.server = server
+    this.socket = socket
+  }
+
+  public void run() {
+    try {
+      server.answer(socket)
+    } finally {
+      server.releaseConnection()
+    }
+  }
+}
+
+// SocketSessionTask is one WebSocket session on a thread of its own: the 101
+// that starts it, the frames until the peer closes, and then the connection.
+//
+// The handshake is written here rather than by the HTTP worker that accepted
+// the upgrade, and that is what makes the hand-off real: the worker has
+// answered its last HTTP request before this thread has written a byte, so a
+// session cannot hold the pool that answers requests.
+class SocketSessionTask implements Runnable {
+  private HttpServer server
+  private Socket socket
+  private SocketInputStream in
+  private SocketOutputStream out
+  private WebSocketHandler handler
+  private String path
+  private String key
+
+  public SocketSessionTask(HttpServer server, Socket socket, SocketInputStream in,
+      SocketOutputStream out, WebSocketHandler handler, String path, String key) {
+    this.server = server
+    this.socket = socket
+    this.in = in
+    this.out = out
+    this.handler = handler
+    this.path = path
+    this.key = key
+  }
+
+  public void run() {
+    server.serving(socket)
+    try {
+      out.write(WebSocketUpgrade.response(key))
+      out.flush()
+      WebSocketConnection.run(socket, in, out, new WebSocketSession(socket, out, path), handler,
+          new WebSocketLimits(server.getSocketMaxMessageBytes(), server.getSocketIdleTimeoutMs()))
+    } catch (IOException e) {
+      // a session whose peer went away is a session that ended
+    } catch (Exception e) {
+      // nor is a frame this server could not read a reason to stop serving:
+      // the connection ends, and the threads that answer requests are untouched
+    } finally {
+      server.served(socket)
+      server.releaseSocketSession()
+      HttpServer.closeQuietly(socket)
+    }
+  }
+}
+
 // ---------------------------------------------------------------- server
 
-// HttpServer serves the routes on a port. Requests are handled one at a time by
-// whichever thread runs the loop, so a second connection waits for the first to
-// finish. That is honest about what it is -- a server for a program that
-// answers requests, not one that serves a crowd -- and it is what makes the
-// server usable from a thread: ServerTask is the loop on one, and a program
-// that wants a connection answered while it does something else puts it there.
+// HttpServer serves the routes on a port.
+//
+// The shape is one accepting thread and a pool of workers. accept() belongs to
+// the accepting thread and nothing else does: a connection is handed to a
+// worker, and from there the connection -- its handshake, its requests, its
+// keep-alive until the client closes -- is that worker's. What that buys is the
+// difference between a server one client can stop and one it cannot: a client
+// that is slow, that says nothing, or that never finishes what it started holds
+// one worker, and the listener goes on accepting.
+//
+// The pool is bounded twice, and the limits are what a client is held to
+// (workerThreads connections answered at once, acceptQueue more waiting, and a
+// connection over both answered 503). A WebSocket is not served by that pool at
+// all: it is handed to a thread of its own, because a session lasts as long as
+// the peer wants and a session holding a request's worker would be one client
+// stopping another.
 class HttpServer {
   private int port
   private int boundPort = -1
@@ -1050,10 +1511,155 @@ class HttpServer {
   // is part of what the server is, and a caller configures it the way it
   // configures the port -- before the first connection, once.
   private TlsServer tls = null
-  // readTimeoutMs bounds how long one connection may take to send its request.
-  // Ten seconds is generous for a request that is already written and short
-  // enough that a stalled client does not hold the server for the afternoon.
-  private int readTimeoutMs = 10000
+  // ---- what a client is held to ----
+  //
+  // Every one of these numbers is a number a client can make the server reach,
+  // which is why none of them is unbounded and why each is checked while the
+  // bytes arrive rather than after them: what arrives has already been paid for
+  // by the time it can be measured.
+  //
+  // The defaults are the ones the plan fixes (D3), and the names are the
+  // properties Application.configureServer reads them from:
+  // `server.max-http-request-header-size` is Spring Boot's own key for the head,
+  // and the rest are `server.teyru.*` because they are settings this server has
+  // and Boot has no name for.
+
+  // The longest request line, in bytes: anything longer is a 414, because a
+  // request line nobody could route is not a request.
+  private int maxRequestLineBytes = 8192
+  // The most the headers may take, in bytes and in number. Both are 431: a
+  // request whose headers cannot be held is a request this server cannot read.
+  private int maxHeadBytes = 8192
+  private int maxHeaderCount = 100
+  // The largest body this server will read, in bytes. A body over it is a 413,
+  // and the answer comes before the body does.
+  private int maxBodyBytes = 10 * 1024 * 1024
+  // How long a head may take to arrive once it has started, and how long a body
+  // may. Both are totals and not per-read: a client that sends a byte every
+  // nine seconds is a client sending one request, slowly, and the deadline is
+  // what makes that a refusal rather than a connection held all afternoon.
+  private int headerTimeoutMs = 10000
+  private int bodyTimeoutMs = 30000
+  // How long a connection that has answered a request may sit before the next
+  // one starts, and how many requests it may carry before the answer says
+  // close. An idle connection is a thread and a descriptor, and a client that
+  // never comes back is not a reason to keep either.
+  private int keepAliveIdleMs = 15000
+  private int maxRequestsPerConnection = 100
+  // How many connections may be in flight at once, and how many more may wait
+  // for a worker: the sum is the number of clients this server will hold, and a
+  // client over it is answered 503 by the thread that accepted it rather than
+  // kept in a queue that has no end.
+  private int workerThreads = 64
+  private int acceptQueue = 100
+  // How many WebSocket sessions may be open at once. It is a limit of its own
+  // because a session is not a request: it lasts until the peer goes away, and
+  // a limit shared with requests would be a number of sessions that stops the
+  // server answering anything at all.
+  private int maxSocketConnections = 256
+  // What a session is held to: the largest message it may send (fragments
+  // included) and how long it may say nothing. A WebSocket has no length to
+  // declare and no answer to give, so these two are the only things bounding
+  // one -- and they are the reason a session is not simply a thread left to a
+  // peer's judgement.
+  private int socketMaxMessageBytes = 1048576
+  private int socketIdleTimeoutMs = 60000
+  // The TLS handshake is bounded by the same clock a head is: a peer that
+  // starts a handshake and stops cannot hold a worker for the afternoon.
+  private int handshakeTimeoutMs = 10000
+
+  // READ_POLL_MS is how long one read may block before the deadline is looked
+  // at again. A socket timeout is what wakes a thread that is blocked in recv,
+  // and a thread blocked in recv is a thread the collector has to wait for
+  // (the runtime's stop-the-world protocol cannot stop one that is inside the
+  // C library) and a stop() that cannot be noticed. Polling in small steps is
+  // what turns both of those into bounded waits rather than fifteen-second
+  // ones.
+  private static final int READ_POLL_MS = 250
+
+  // BODY_BLOCK is how much is read from the socket at a time. The body's buffer
+  // grows with what arrives, in blocks, which is what keeps a Content-Length
+  // from being an allocation request.
+  private static final int BODY_BLOCK = 8192
+
+  public int getMaxBodyBytes() { return maxBodyBytes }
+  public int getMaxHeadBytes() { return maxHeadBytes }
+  public int getMaxHeaderCount() { return maxHeaderCount }
+  public int getMaxRequestLineBytes() { return maxRequestLineBytes }
+  public int getHeaderTimeoutMs() { return headerTimeoutMs }
+  public int getBodyTimeoutMs() { return bodyTimeoutMs }
+  public int getKeepAliveIdleMs() { return keepAliveIdleMs }
+  public int getMaxRequestsPerConnection() { return maxRequestsPerConnection }
+  public int getWorkerThreads() { return workerThreads }
+  public int getAcceptQueue() { return acceptQueue }
+  public int getMaxSocketConnections() { return maxSocketConnections }
+  public int getSocketMaxMessageBytes() { return socketMaxMessageBytes }
+  public int getSocketIdleTimeoutMs() { return socketIdleTimeoutMs }
+
+  public HttpServer setMaxRequestLineBytes(int n) {
+    maxRequestLineBytes = n
+    return this
+  }
+
+  public HttpServer setMaxHeadBytes(int n) {
+    maxHeadBytes = n
+    return this
+  }
+
+  public HttpServer setMaxHeaderCount(int n) {
+    maxHeaderCount = n
+    return this
+  }
+
+  public HttpServer setMaxBodyBytes(int n) {
+    maxBodyBytes = n
+    return this
+  }
+
+  public HttpServer setHeaderTimeoutMs(int n) {
+    headerTimeoutMs = n
+    return this
+  }
+
+  public HttpServer setBodyTimeoutMs(int n) {
+    bodyTimeoutMs = n
+    return this
+  }
+
+  public HttpServer setKeepAliveIdleMs(int n) {
+    keepAliveIdleMs = n
+    return this
+  }
+
+  public HttpServer setMaxRequestsPerConnection(int n) {
+    maxRequestsPerConnection = n
+    return this
+  }
+
+  public HttpServer setWorkerThreads(int n) {
+    workerThreads = n
+    return this
+  }
+
+  public HttpServer setAcceptQueue(int n) {
+    acceptQueue = n
+    return this
+  }
+
+  public HttpServer setMaxSocketConnections(int n) {
+    maxSocketConnections = n
+    return this
+  }
+
+  public HttpServer setSocketMaxMessageBytes(int n) {
+    socketMaxMessageBytes = n
+    return this
+  }
+
+  public HttpServer setSocketIdleTimeoutMs(int n) {
+    socketIdleTimeoutMs = n
+    return this
+  }
   // The WebSockets this server answers, by path. A path is a WebSocket when it
   // was registered as one, which is what the upgrade checks.
   private List<String> socketPaths = new ArrayList<String>()
@@ -1136,6 +1742,10 @@ class HttpServer {
   }
 
   public void close() {
+    // Stopping first, and the listener second: a connection that arrives while
+    // the workers are finishing is refused rather than accepted into a pool
+    // that is going away.
+    stop()
     if (listener != null) {
       listener.close()
       listener = null
@@ -1166,29 +1776,40 @@ class HttpServer {
     }
   }
 
-  // serve accepts connections and answers them, one at a time, until the
-  // program ends.
+  // serve accepts connections and hands them to workers, until the program
+  // ends or the server is stopped.
   //
-  // One at a time is the shape -- accept, read one request, answer it, close --
-  // and it is a loop, so a second client waits for the first to finish. A
-  // program that cannot wait for it puts the loop on a thread of its own,
-  // which is what ServerTask does; the loop itself does not change.
+  // Accepting is the whole of what this loop does: a connection goes to a
+  // worker and this thread is back in accept before it has been read from. A
+  // program that cannot sit in this loop puts it on a thread of its own, which
+  // is what ServerTask does; the loop itself does not change.
   public void serve() {
     bind()
+    startWorkers()
     try {
-      while (true) {
-        Socket s = listener.accept()
+      while (finishing() == false) {
+        Socket s
         try {
-          s = startTls(s)
+          s = accept(idleAcceptMs)
         } catch (IOException e) {
-          // A handshake that failed is a connection that ends, not a server
-          // that stops: a port scanner, a client that speaks plain HTTP to a
-          // TLS port, and a peer that went away in the middle of the handshake
-          // all arrive here, and none of them is a reason to stop listening.
-          s.close()
+          // The listener was closed under this loop, which is what close() does
+          // after it sets the flag -- or accept failed for a reason waiting will
+          // not fix. The flag is what decides: a closed listener ends the loop,
+          // and anything else is waited out rather than spun on, because a
+          // server that runs out of descriptors must not become a server that
+          // burns a core.
+          if (finishing()) {
+            return
+          }
+          Thread.sleep(50)
           continue
         }
-        serveOne(s)
+        if (s == null) {
+          // a quiet quarter of a second: look at whether this loop is still
+          // serving and wait again
+          continue
+        }
+        dispatch(s)
       }
     } finally {
       close()
@@ -1205,32 +1826,288 @@ class HttpServer {
   // between connections.
   public int serveIdle(int idleMillis) {
     bind()
-    listener.setSoTimeout(idleMillis)
+    startWorkers()
     int answered = 0
     // The listener stays open across calls: a caller that serves in bursts --
     // accept what is waiting, do something else, come back -- must not have its
     // port closed between them, or the next client's connection is refused
     // before the loop gets a chance to bind again.
-    while (true) {
+    while (finishing() == false) {
       Socket s
       try {
-        s = listener.accept()
-      } catch (SocketTimeoutException e) {
+        s = accept(idleMillis)
+      } catch (IOException e) {
+        // nothing is listening any more: this burst is over
         break
       }
-      try {
-        s = startTls(s)
-      } catch (IOException e) {
-        // Not counted as answered, because nothing was: the connection ended in
-        // the handshake. The loop goes on listening, which is what a burst of
-        // clients that cannot complete a handshake must not be able to stop.
-        s.close()
-        continue
+      if (s == null) {
+        // the wait ran out with nothing waiting, which is what ends a burst
+        break
       }
-      serveOne(s)
+      dispatch(s)
       answered++
     }
     return answered
+  }
+
+  // idleAcceptMs is how long serve() waits for a connection before it looks at
+  // whether it is still serving. serve() is the loop of a program that has
+  // nothing else to do, and a program that is stopped still has to notice: an
+  // accept that blocks forever is a thread that never comes back.
+  private static final int IDLE_ACCEPT_MS = 250
+  private int idleAcceptMs = IDLE_ACCEPT_MS
+
+  // accept waits for a connection and answers null when nothing arrived within
+  // the timeout. A listener that cannot be listened on throws instead, and what
+  // that means is the caller's to decide: serve() waits and looks again, and
+  // serveIdle() -- a burst -- is over.
+  //
+  // A timeout of zero is Java's "wait until something arrives, however long
+  // that is", which is what serveIdle(0) means and what a Boot application that
+  // sets no `spring.web.idle-ms` gets. It is *not* implemented by asking the
+  // kernel to wait forever: the wait is taken a quarter of a second at a time
+  // and started again, so that a wait with no end is still a wait this thread
+  // can be stopped in -- and so that a stop() is noticed by a loop that would
+  // otherwise never look at the flag again.
+  private Socket accept(int timeoutMs) {
+    while (true) {
+      listener.setSoTimeout(timeoutMs <= 0 ? IDLE_ACCEPT_MS : timeoutMs)
+      try {
+        return listener.accept()
+      } catch (SocketTimeoutException e) {
+        if (timeoutMs > 0 || finishing()) {
+          return null
+        }
+        // a wait with no end: look at the flag and wait again, because the one
+        // thing a wait with no end may not do is be unendable
+      }
+    }
+  }
+
+  // dispatch hands a connection to a worker, or tells the client that there is
+  // no room for it. This is the only thing the accepting thread does with a
+  // connection, and it is why a slow client costs the server a worker rather
+  // than the listener.
+  private void dispatch(Socket s) {
+    if (finishing() || claimConnection() == false) {
+      refuse(s)
+      return
+    }
+    try {
+      workerPool.execute(new ConnectionTask(this, s))
+    } catch (RejectedExecutionException e) {
+      // The pool was shut down under this connection -- a stop() landing
+      // between the check above and here. It is refused like any other
+      // connection with no worker to give it.
+      releaseConnection()
+      refuse(s)
+    }
+  }
+
+  // refuse is the answer a client gets when the server has no worker to give
+  // it: 503, which is what says "not now" rather than "not ever", and a close,
+  // because a connection that was not accepted is not one to keep.
+  private void refuse(Socket s) {
+    try {
+      HttpResponse res = new HttpResponse()
+      res.status = 503
+      res.body = "the server has no room for this connection"
+      res.header("Retry-After", "1")
+      s.setSoTimeout(headerTimeoutMs)
+      s.getOutputStream().write(res.respond("HTTP/1.1", false, false))
+      s.getOutputStream().flush()
+    } catch (IOException e) {
+      // a client that cannot be told is a client that is not told
+    } finally {
+      closeQuietly(s)
+    }
+  }
+
+  // answer is what a worker does with a connection: the handshake if this
+  // server speaks TLS, and then the requests on it. It is public because the
+  // worker that calls it is an object of its own.
+  public void answer(Socket s) {
+    Socket ready
+    try {
+      ready = startTls(s)
+    } catch (IOException e) {
+      // A handshake that failed is a connection that ends, not a server that
+      // stops: a port scanner, a client that speaks plain HTTP to a TLS port,
+      // and a peer that went away in the middle of the handshake all arrive
+      // here, and none of them is a reason to stop listening.
+      closeQuietly(s)
+      return
+    }
+    serveOne(ready)
+  }
+
+  // ---- the workers ----
+  //
+  // One thread accepts, and everything else happens on workers. The pool is
+  // java.util.concurrent's (lib/37_executor.teyru) rather than a second pool
+  // written here, and it is the *cached* shape -- no worker kept, a worker
+  // leaving when it has had nothing to do for WORKER_IDLE_MS -- because of
+  // something this runtime does: a thread that is alive holds the process open,
+  // since there are no daemon threads here. A fixed pool of sixty-four parked
+  // workers would mean a program that served one connection and returned from
+  // main never exited.
+  //
+  // The bound on concurrency is therefore kept here and not by the pool: a
+  // connection in flight is counted, and the count is what decides whether a
+  // client is answered 503. `workerThreads` connections are served at once and
+  // `acceptQueue` more may wait for a worker, which is the two numbers the
+  // plan asks for, one in front of the other.
+  private ExecutorService workerPool = null
+  private ExecutorService socketPool = null
+  private int connections = 0
+  private int socketSessions = 0
+  private boolean stopped = false
+
+  // WORKER_IDLE_MS is how long a worker with nothing to do waits before it
+  // leaves. It is a second rather than java.util.concurrent's sixty because the
+  // cost of a worker leaving too early is a thread creation and the cost of it
+  // leaving too late is a program that has finished but does not exit.
+  private static final long WORKER_IDLE_MS = 1000L
+  // SHUTDOWN_GRACE_MS is how long stop() waits for the requests in flight to
+  // finish before it closes what is left. An answer already being written is
+  // worth finishing; a client that has stopped sending one is not worth waiting
+  // for, and a server that will not stop is worse than one that cuts a request.
+  private static final int SHUTDOWN_GRACE_MS = 2000
+
+  // startWorkers creates the pools, once. Serving twice -- a burst loop, a
+  // test -- starts one pool and not two.
+  private synchronized void startWorkers() {
+    if (workerPool == null) {
+      workerPool = new ThreadPool(0, WORKER_IDLE_MS, "teyru-http-")
+    }
+    if (socketPool == null) {
+      socketPool = new ThreadPool(0, WORKER_IDLE_MS, "teyru-ws-")
+    }
+  }
+
+  // claimConnection answers whether one more connection may be taken, and
+  // counts it when it may. The count is what the queue is: a connection waiting
+  // for a worker is a connection that has been claimed.
+  private synchronized boolean claimConnection() {
+    if (connections >= workerThreads + acceptQueue) {
+      return false
+    }
+    connections++
+    return true
+  }
+
+  public synchronized void releaseConnection() {
+    connections--
+    notifyAll()
+  }
+
+  public synchronized void releaseSocketSession() {
+    socketSessions--
+    notifyAll()
+  }
+
+  private synchronized boolean finishing() {
+    return stopped
+  }
+
+  // handOverSession gives a connection that has been upgraded to a thread of
+  // its own, and answers false when there is no room for it. A session outlives
+  // every request it will never make, and a session on an HTTP worker would be
+  // one client holding a worker that another client's request could have.
+  private synchronized boolean claimSocketSession() {
+    if (stopped || socketSessions >= maxSocketConnections) {
+      return false
+    }
+    socketSessions++
+    return true
+  }
+
+  /* stop finishes serving. Nothing new is accepted or taken, a connection that
+     is waiting for a request is closed rather than waited on, and the requests
+     that are in flight are given SHUTDOWN_GRACE_MS to finish before what is
+     left is closed.
+
+     A worker notices in two places, and both are needed: the next request on a
+     keep-alive connection is not started (readHead), and a worker that is
+     already inside the wait for one is woken by the same socket timeout it uses
+     to look at its own deadline. A request that has started is not interrupted:
+     it is not the client's fault that the server is finishing, and half an
+     answer is worse than a slow one. */
+  public void stop() {
+    synchronized (this) {
+      if (stopped) {
+        return
+      }
+      stopped = true
+      notifyAll()
+    }
+    awaitQuiet(SHUTDOWN_GRACE_MS)
+    // Whatever is still in hand is closed: a client that has stopped sending
+    // the request it began is not a reason for this server not to finish.
+    closeServing()
+    if (workerPool != null) {
+      workerPool.shutdown()
+      workerPool.awaitTermination(SHUTDOWN_GRACE_MS)
+    }
+    if (socketPool != null) {
+      socketPool.shutdown()
+      socketPool.awaitTermination(SHUTDOWN_GRACE_MS)
+    }
+  }
+
+  // awaitQuiet waits, up to the deadline, for the connections in flight to
+  // finish. It is a poll rather than a wait on the monitor because the thing
+  // being waited for is a worker finishing a request, and a worker that does
+  // not finish must not be able to hold this method for the afternoon.
+  private void awaitQuiet(int graceMs) {
+    long deadline = System.currentTimeMillis() + graceMs
+    while (true) {
+      synchronized (this) {
+        if (connections == 0 && socketSessions == 0) {
+          return
+        }
+      }
+      if (System.currentTimeMillis() >= deadline) {
+        return
+      }
+      Thread.sleep(5)
+    }
+  }
+
+  // closeServing closes the connections that are being served, which is what
+  // wakes a worker whose client stopped talking. The list is kept by the pool's
+  // tasks and not by this method: a connection is in it exactly while a worker
+  // is answering it.
+  private void closeServing() {
+    List<Socket> live = new ArrayList<Socket>()
+    synchronized (this) {
+      live.addAll(liveSockets)
+    }
+    for (int i = 0 : i < live.size() : i++) {
+      closeQuietly(live.get(i))
+    }
+  }
+
+  // The connections a worker is answering, which is what stop() closes when the
+  // grace is over. A connection is in it from the moment a worker takes it --
+  // or a session's thread does -- until that thread is finished with it.
+  private List<Socket> liveSockets = new ArrayList<Socket>()
+
+  public synchronized void serving(Socket s) {
+    liveSockets.add(s)
+  }
+
+  public synchronized void served(Socket s) {
+    liveSockets.remove(s)
+  }
+
+  public static void closeQuietly(Socket s) {
+    try {
+      s.close()
+    } catch (IOException e) {
+      // closing a socket that is already broken is not an error worth
+      // reporting: the connection is what the caller wanted gone
+    }
   }
 
   // startTls is the handshake a connection goes through when this server was
@@ -1245,7 +2122,7 @@ class HttpServer {
     // The handshake is bounded by the same read timeout that bounds a request,
     // so a peer that starts a handshake and stops cannot hold the thread that
     // answers connections -- there is only one of it.
-    s.setSoTimeout(readTimeoutMs)
+    s.setSoTimeout(handshakeTimeoutMs)
     return tls.accept(s)
   }
 
@@ -1253,49 +2130,108 @@ class HttpServer {
   // client that connects and says nothing, or goes away mid-request, is not an
   // error the server reports: it is a connection that ends.
   private void serveOne(Socket s) {
+    // handedOver is what the finally must not do: a connection that became a
+    // WebSocket belongs to the thread that is now running the session, and
+    // closing it here would close the session it was handed to.
+    boolean handedOver = false
+    serving(s)
     try {
-      // A client that opens a connection and never finishes a request would
-      // otherwise hold the only thread there is, forever.
-      s.setSoTimeout(readTimeoutMs)
       SocketInputStream in = s.getInputStream()
       SocketOutputStream out = s.getOutputStream()
       // One connection answers as many requests as the client keeps sending:
       // HTTP/1.1 keeps a connection open unless either side says close, and a
       // browser sends a page and its assets down one.
+      int answered = 0
       while (true) {
         HttpRequest req = null
         HttpResponse res
+        // refused is what the connection does about a request it could not
+        // answer: a refusal is not a body of text the client asked for, and the
+        // bytes it declared may still be on their way. The connection closes,
+        // which is the only place the stream is known to be at a boundary.
+        boolean refused = false
         try {
           // Reading and parsing are inside the same try because they refuse a
           // request for the same reason: what arrived was not a request this
           // server can answer. A malformed line is the parser's refusal; a body
           // that ended before the length it promised is the reader's, and both
           // are the client's mistake, which is a 400.
-          String raw = readRequest(in, out)
-          if (raw == null) {
+          String head = readHead(s, in, answered > 0)
+          if (head == null) {
             return
           }
-          req = HttpParser.parse(raw)
+          req = HttpParser.parseHead(head)
+          req.withBody(readBody(s, in, out, req))
           res = handle(req)
+        } catch (HttpProtocolException e) {
+          // The refusal that says what it refused with: 414 for a request line
+          // nobody could route, 431 for headers that are not a request, 413 for
+          // a body this server will not hold, 501 for a transfer coding it does
+          // not implement, 417 for an expectation it cannot meet, 408 for a
+          // request that took too long to arrive.
+          res = new HttpResponse()
+          res.status = e.status
+          res.body = e.getMessage()
+          refused = true
         } catch (IllegalArgumentException e) {
           res = new HttpResponse()
           res.status = 400
           res.body = e.getMessage()
+          refused = true
         }
         // An upgrade turns the connection into a WebSocket, and a WebSocket
         // never goes back to being HTTP: the frames are read until the peer
         // closes, and then the connection ends.
         WebSocketHandler ws = req == null ? null : socketAt(req.path)
-        if (req != null && WebSocketUpgrade.wanted(req, req.path, ws != null)) {
-          out.write(WebSocketUpgrade.response(req.header("Sec-WebSocket-Key")))
+        if (refused == false && req != null && WebSocketUpgrade.wanted(req, req.path, ws != null)) {
+          // A session is handed to a thread of its own rather than run here:
+          // this worker belongs to the pool that answers requests, and a
+          // session lasts until the peer goes away. There is a limit of its
+          // own, and a session over it is refused here -- before the 101,
+          // because a session that has been promised is a session the client
+          // will wait for.
+          if (claimSocketSession()) {
+            handedOver = true
+            socketPool.execute(new SocketSessionTask(this, s, in, out, ws, req.path,
+                req.header("Sec-WebSocket-Key")))
+            return
+          }
+          HttpResponse busy = new HttpResponse()
+          busy.status = 503
+          busy.body = "the server has no room for this WebSocket"
+          out.write(busy.respond(req.version, false, false))
           out.flush()
-          WebSocketConnection.run(s, in, out, new WebSocketSession(s, out, req.path), ws)
           return
         }
-        boolean keep = req != null && req.keepAlive()
+        boolean keep = refused == false && req != null && req.keepAlive()
+        // A connection is worth reusing, but not forever. A client that sends a
+        // hundred thousand requests down one is a client holding a worker that
+        // another client could have; the last answer on the connection says so,
+        // which is how a client is told to open another one.
+        if (maxRequestsPerConnection > 0 && answered + 1 >= maxRequestsPerConnection) {
+          keep = false
+        }
         boolean head = req != null && req.method.equals("HEAD")
-        out.write(res.respond(req == null ? "HTTP/1.1" : req.version, keep, head))
+        String version = req == null ? "HTTP/1.1" : req.version
+        // A body that is bytes is written as bytes, after the head that
+        // declares its length: the request may have been an upload and the
+        // answer to it may be the same bytes.
+        if (res.bodyBytes != null) {
+          out.write(res.respondHead(version, keep))
+          if (head == false && res.carriesBody()) {
+            if (res.chunkedBody && res.bodyBytes.length > 0) {
+              out.write(HttpResponse.chunkPrefix(res.bodyBytes.length))
+              out.write(res.bodyBytes)
+              out.write(HttpResponse.CHUNKED_END)
+            } else {
+              out.write(res.bodyBytes)
+            }
+          }
+        } else {
+          out.write(res.respond(version, keep, head))
+        }
         out.flush()
+        answered++
         if (keep == false) {
           return
         }
@@ -1313,133 +2249,262 @@ class HttpServer {
       // and the connection ends, which is what a request whose answer could not
       // be built gets.
     } finally {
-      s.close()
+      if (handedOver == false) {
+        served(s)
+        closeQuietly(s)
+      }
     }
   }
 
-  // readRequest reads the head and the body off a stream and renders the
-  // request the parser expects: the lines, a blank line, then the bytes.
+  // readHead reads one request's request line and headers off a stream, as the
+  // lines they are, and answers them as the text the parser reads. It answers
+  // null when the connection ended before a request line arrived, which is a
+  // connection that ends rather than a request that failed.
   //
-  // The body is read by length rather than by line, because a body is bytes and
-  // may contain anything -- a line reader would stop at the first CRLF inside
-  // it and hand a truncated document to the handler.
-  private String readRequest(SocketInputStream in, SocketOutputStream out) {
-    StringBuilder head = new StringBuilder()
+  // The head is read as lines and the body is not: a body is bytes, and a line
+  // reader would stop at the first CRLF inside it and hand a truncated document
+  // to the handler.
+  //
+  // Three things bound what one client can make of this, and all three are
+  // checked as the bytes arrive rather than after them: how long the head may
+  // take (the idle timeout for the request line, then one deadline for the rest
+  // of it), how long one line may be (a request line that is too long is a 414,
+  // a header that is is a 431), and how much the head may hold in total. A
+  // reader that read and then refused would have paid for what it refused.
+  private String readHead(Socket s, SocketInputStream in, boolean keptAlive) {
+    // A server that is finishing does not start another request on a
+    // connection: the worker goes back to the pool and the connection closes,
+    // which is what "stop closes idle connections" means -- a request that has
+    // started is finished, and one that has not is not begun.
+    if (finishing()) {
+      return null
+    }
+    // A new connection is a client with a request to send, and it has the head
+    // deadline to send it: a client that opens a connection and then says
+    // nothing, or says one byte, is refused at that deadline. A connection that
+    // has already answered a request is a client between requests, and the wait
+    // there is the idle timeout, which is longer because a client with nothing
+    // to say yet is not a client in trouble.
+    long start = System.currentTimeMillis() + (keptAlive ? keepAliveIdleMs : headerTimeoutMs)
+    String requestLine
+    try {
+      requestLine = readLineDeadline(s, in, start, maxRequestLineBytes, true)
+    } catch (LineTooLongException e) {
+      throw new HttpProtocolException(414,
+          "the request line is longer than " + maxRequestLineBytes + " bytes")
+    }
+    if (requestLine == null) {
+      // the connection ended before a request line: nothing to answer
+      return null
+    }
+    if (requestLine.isEmpty()) {
+      // A bare CRLF before the request line. It is not a request, and the
+      // parser is the one that says so with the 400 it always gave this.
+      return ""
+    }
+    // From here the clock is the head's own: a client that started a request
+    // has headerTimeoutMs to finish saying what it is.
+    long deadline = System.currentTimeMillis() + headerTimeoutMs
+    StringBuilder head = new StringBuilder(requestLine).append("\r\n")
+    int total = lineBytes(requestLine) + 2
+    int count = 0
     while (true) {
-      String line = in.readLine()
+      String line
+      try {
+        line = readLineDeadline(s, in, deadline, maxHeadBytes)
+      } catch (LineTooLongException e) {
+        throw new HttpProtocolException(431,
+            "a request header is longer than " + maxHeadBytes + " bytes")
+      }
       if (line == null) {
-        // the connection ended before the blank line: nothing to answer, unless
-        // a request line already arrived and the head was simply unterminated
-        return head.length() == 0 ? null : head.toString()
+        // The connection ended before the blank line. The head that arrived is
+        // still a head, and the parser refuses it for whatever is wrong with
+        // it -- which is a better answer than a silence.
+        return head.toString()
       }
       if (line.isEmpty()) {
         break
       }
+      total = total + lineBytes(line) + 2
+      if (total > maxHeadBytes) {
+        throw new HttpProtocolException(431,
+            "the request headers are longer than " + maxHeadBytes + " bytes")
+      }
+      count++
+      if (maxHeaderCount > 0 && count > maxHeaderCount) {
+        throw new HttpProtocolException(431,
+            "the request has more than " + maxHeaderCount + " headers")
+      }
       head.append(line).append("\r\n")
     }
-    String headText = head.toString()
-    // A client that asked to be told to go ahead waits for the answer before it
-    // sends the body, so the answer is written before anything is read.
-    if (expectsContinue(headText)) {
+    return head.toString()
+  }
+
+  // lineBytes is a line's length in bytes, which is what a limit about the
+  // connection is about. It is not `line.length()`, which counts characters:
+  // those are the same number only while every character is one byte.
+  private static int lineBytes(String line) {
+    return line.getBytes().length
+  }
+
+  // readLineDeadline reads one line with the whole of the wait bounded by the
+  // deadline. Each read is given the smaller of what is left of the deadline
+  // and one poll, so a peer that sends a byte every nine seconds is refused
+  // when the deadline arrives rather than being given a fresh timeout per read.
+  private String readLineDeadline(Socket s, SocketInputStream in, long deadline, int max) {
+    return readLineDeadline(s, in, deadline, max, false)
+  }
+
+  // idleWait marks the wait for a request that has not started: that wait is
+  // the one a stop may end, because a client that has said nothing is not a
+  // client whose request is being cut off.
+  private String readLineDeadline(Socket s, SocketInputStream in, long deadline, int max,
+      boolean idleWait) {
+    long startedAt = System.currentTimeMillis()
+    while (true) {
+      if (idleWait && finishing()) {
+        throw new SocketException("the server is stopping")
+      }
+      long left = deadline - System.currentTimeMillis()
+      if (left <= 0) {
+        throw new HttpProtocolException(408, "the request did not arrive within " +
+            ((deadline - startedAt) / 1000) + " seconds")
+      }
+      s.setSoTimeout((int) (left < READ_POLL_MS ? left : READ_POLL_MS))
+      try {
+        return in.readLine(max)
+      } catch (SocketTimeoutException e) {
+        // the poll ran out rather than the deadline: look at the clock again
+      }
+    }
+  }
+
+  // readDeadline is readLineDeadline for a block of a body.
+  private int readDeadline(Socket s, SocketInputStream in, byte[] buf, int off, int len,
+      long deadline, String what) {
+    while (true) {
+      long left = deadline - System.currentTimeMillis()
+      if (left <= 0) {
+        throw new HttpProtocolException(408, what)
+      }
+      s.setSoTimeout((int) (left < READ_POLL_MS ? left : READ_POLL_MS))
+      try {
+        return in.read(buf, off, len)
+      } catch (SocketTimeoutException e) {
+        // the poll ran out rather than the deadline: look at the clock again
+      }
+    }
+  }
+
+  // readBody reads the body the head declared, as bytes, and answers it. A
+  // request with no body answers an empty array, which is not the same thing as
+  // null: the body is the empty one, not an absent one.
+  //
+  // The body is read by length rather than by line, and it is never turned into
+  // a string on the way: the bytes are what a length, a multipart boundary or a
+  // digest is counted in, and a decoder that ran here would have to have an
+  // opinion about a file it has no business reading.
+  private byte[] readBody(Socket s, SocketInputStream in, SocketOutputStream out, HttpRequest req) {
+    long deadline = System.currentTimeMillis() + bodyTimeoutMs
+    // `Expect` is the client asking a question before it sends anything. The
+    // one expectation this server can meet is 100-continue, and a request that
+    // asks for something else is told so rather than ignored: answering 417 is
+    // the whole point of the header, and a client that is not told will wait.
+    String expect = req.header("Expect").trim()
+    if (expect.length() > 0 && expect.toLowerCase().indexOf("100-continue") < 0) {
+      throw new HttpProtocolException(417, "expectation not met: " + expect)
+    }
+    if (expect.length() > 0) {
+      // A body this server will not read is refused before the client is told
+      // to send it. The other order -- continue, then 413 -- makes the client
+      // upload the whole thing for nothing, which is the cost the header exists
+      // to avoid. A chunked body has no length to check yet, so its limit is
+      // enforced on the chunks as they arrive.
+      if (req.chunked == false && req.contentLength > maxBodyBytes) {
+        throw new HttpProtocolException(413, "the request body of " + req.contentLength +
+            " bytes is over the limit of " + maxBodyBytes + " bytes")
+      }
       out.write("HTTP/1.1 100 Continue\r\n\r\n")
       out.flush()
     }
-    if (chunkedBody(headText)) {
-      return headText + "\r\n" + readChunked(in)
+    if (req.chunked) {
+      return readChunked(s, in, deadline)
     }
-    int len = contentLength(headText)
-    if (len <= 0) {
-      return headText
+    if (req.contentLength < 0) {
+      // No length and no chunks is no body: a request is delimited by one or
+      // the other, and a request that says neither has said it has none.
+      return new byte[0]
     }
-    byte[] buf = new byte[len]
+    if (req.contentLength > maxBodyBytes) {
+      throw new HttpProtocolException(413, "the request body of " + req.contentLength +
+          " bytes is over the limit of " + maxBodyBytes + " bytes")
+    }
+    // The buffer grows with what arrives, in blocks, rather than being made the
+    // size the client claimed: a Content-Length is a client's word, and a
+    // client that says a gigabyte should not be able to spend a gigabyte of
+    // this server's memory by saying so.
+    int initial = req.contentLength < BODY_BLOCK ? req.contentLength : BODY_BLOCK
+    ByteArrayOutputStream bo = new ByteArrayOutputStream(initial)
+    byte[] block = new byte[BODY_BLOCK]
+    int remaining = req.contentLength
     int got = 0
-    while (got < len) {
-      int n = in.read(buf, got, len - got)
+    while (remaining > 0) {
+      int want = remaining < BODY_BLOCK ? remaining : BODY_BLOCK
+      int n = readDeadline(s, in, block, 0, want, deadline,
+          "the request body stopped arriving after " + got + " of " + req.contentLength + " bytes")
       if (n <= 0) {
-        break
+        // A client that promised this many bytes and sent fewer -- including
+        // none at all -- sent a request that is not whole. Answering it anyway
+        // would hand a route half a document as if the client had finished
+        // writing it: the message is incomplete, and this is the only place
+        // that knows it.
+        throw new HttpProtocolException("the request body ended after " + got + " of " + req.contentLength + " bytes")
       }
-      got += n
+      bo.write(block, 0, n)
+      remaining = remaining - n
+      got = got + n
     }
-    // A client that promised len bytes and sent fewer -- including none at all
-    // -- sent a request that is not whole. Answering it anyway would hand a
-    // route half a document as if the client had finished writing it, which is
-    // the one answer that cannot be right: the message is incomplete, and the
-    // reader is the only place that knows it.
-    if (got < len) {
-      throw new IllegalArgumentException(
-          "the request body ended after " + got + " of " + len + " bytes")
-    }
-    // The head already ends with CRLF -- every line was appended with one --
-    // so a single CRLF more is the blank line that ends it. Adding two, as the
-    // shape "head CRLF CRLF body" suggests, puts one CRLF of the head's into
-    // the body and every POST arrives with a leading blank line.
-    return headText + "\r\n" + Net.stringFrom(buf, 0, got)
-  }
-
-  // contentLength reads Content-Length out of a request head, or -1 when the
-  // header is absent or unreadable. A head is not parsed here: the parser does
-  // that, and this only needs one number out of it before deciding how much to
-  // read.
-  private int contentLength(String head) {
-    for (String line : WebUtil.splitRawLines(head)) {
-      int colon = line.indexOf(":")
-      if (colon <= 0) {
-        continue
-      }
-      if (line.substring(0, colon).trim().toLowerCase().equals("content-length")) {
-        try {
-          return Integer.parseInt(line.substring(colon + 1).trim())
-        } catch (IllegalArgumentException e) {
-          return -1
-        }
-      }
-    }
-    return -1
-  }
-
-  // expectsContinue reads Expect: 100-continue out of a request head.
-  private boolean expectsContinue(String head) {
-    return headerIs(head, "expect", "100-continue")
-  }
-
-  // chunkedBody reads Transfer-Encoding out of a request head.
-  private boolean chunkedBody(String head) {
-    return headerIs(head, "transfer-encoding", "chunked")
-  }
-
-  private boolean headerIs(String head, String name, String want) {
-    for (String line : WebUtil.splitRawLines(head)) {
-      int colon = line.indexOf(":")
-      if (colon <= 0) {
-        continue
-      }
-      if (line.substring(0, colon).trim().toLowerCase().equals(name)) {
-        return line.substring(colon + 1).trim().toLowerCase().indexOf(want) >= 0
-      }
-    }
-    return false
+    return bo.toByteArray()
   }
 
   // readChunked reads a body whose length arrives in pieces: a line holding the
   // size in hexadecimal, the bytes, and a line of length zero to end it. The
   // extensions after a size and the trailers after the last chunk are read and
-  // dropped, which is what a server that does not use them does.
-  private String readChunked(SocketInputStream in) {
-    StringBuilder b = new StringBuilder()
+  // dropped, which is what a server that does not use them does -- but they are
+  // counted against the header budget first, because a client that can make a
+  // server read unbounded text with a chunk extension has found the same hole
+  // as one that can with a header.
+  //
+  // The body's own limit is enforced on the sizes as they arrive: a chunked
+  // body has no length to check before it starts, so the check is per chunk and
+  // the answer is the same 413.
+  private byte[] readChunked(Socket s, SocketInputStream in, long deadline) {
+    ByteArrayOutputStream b = new ByteArrayOutputStream()
+    byte[] block = new byte[BODY_BLOCK]
+    int total = 0
+    int budget = maxHeadBytes
+    int trailers = 0
     while (true) {
-      String line = in.readLine()
+      String line
+      try {
+        line = readLineDeadline(s, in, deadline, maxHeadBytes)
+      } catch (LineTooLongException e) {
+        throw new HttpProtocolException(431, "a chunk size line is longer than " + maxHeadBytes + " bytes")
+      }
       if (line == null) {
         // the connection ended before the chunk that would have ended the body
-        throw new IllegalArgumentException("the chunked body ended before its last chunk")
+        throw new HttpProtocolException("the chunked body ended before its last chunk")
       }
       int semi = line.indexOf(';')
       String size = (semi >= 0 ? line.substring(0, semi) : line).trim()
-      int n
-      try {
-        n = Integer.parseInt(size, 16)
-      } catch (NumberFormatException e) {
-        throw new IllegalArgumentException("not a chunk size: " + line)
+      if (semi >= 0) {
+        budget = budget - (lineBytes(line) - semi)
+        if (budget < 0) {
+          throw new HttpProtocolException(431,
+              "the chunk extensions are longer than " + maxHeadBytes + " bytes")
+        }
       }
+      long n = chunkSize(size)
       if (n == 0) {
         // The trailer section is as many header lines as the client sent and
         // then a blank line. Reading one line and stopping would leave the rest
@@ -1447,29 +2512,71 @@ class HttpServer {
         // start of the next request and answers a 400 the client never asked
         // for -- a request with one trailer would be answered twice.
         while (true) {
-          String trailer = in.readLine()
+          String trailer
+          try {
+            trailer = readLineDeadline(s, in, deadline, maxHeadBytes)
+          } catch (LineTooLongException e) {
+            throw new HttpProtocolException(431, "a trailer is longer than " + maxHeadBytes + " bytes")
+          }
           if (trailer == null || trailer.isEmpty()) {
             break
+          }
+          trailers++
+          if (maxHeaderCount > 0 && trailers > maxHeaderCount) {
+            throw new HttpProtocolException(431, "the request has more than " + maxHeaderCount + " trailers")
+          }
+          budget = budget - lineBytes(trailer) - 2
+          if (budget < 0) {
+            throw new HttpProtocolException(431,
+                "the trailers are longer than " + maxHeadBytes + " bytes")
           }
         }
         break
       }
-      byte[] buf = new byte[n]
+      if ((long) total + n > (long) maxBodyBytes) {
+        throw new HttpProtocolException(413, "the request body is over the limit of " + maxBodyBytes + " bytes")
+      }
       int got = 0
-      while (got < n) {
-        int k = in.read(buf, got, n - got)
+      while ((long) got < n) {
+        long left = n - (long) got
+        int want = left < BODY_BLOCK ? (int) left : BODY_BLOCK
+        int k = readDeadline(s, in, block, 0, want, deadline,
+            "the chunked body stopped arriving in a chunk of " + n + " bytes")
         if (k <= 0) {
-          break
+          throw new HttpProtocolException("the chunked body ended in a chunk of " + n + " bytes")
         }
-        got += k
+        b.write(block, 0, k)
+        got = got + k
       }
-      if (got < n) {
-        throw new IllegalArgumentException("the chunked body ended in a chunk of " + n + " bytes")
+      total = total + (int) n
+      // the CRLF that ends the chunk, which is not part of it
+      String after = readLineDeadline(s, in, deadline, 8)
+      if (after == null || after.isEmpty() == false) {
+        throw new HttpProtocolException("a chunk of the request body was not followed by CRLF")
       }
-      b.append(Net.stringFrom(buf, 0, got))
-      in.readLine()
     }
-    return b.toString()
+    return b.toByteArray()
+  }
+
+  // chunkSize reads the hexadecimal size a chunk line begins with. A size that
+  // is not hexadecimal, or that would not fit in a long, is a 400: the framing
+  // of the body cannot be read, so no reader can agree where the body ends.
+  private static long chunkSize(String size) {
+    if (size.length() == 0 || size.length() > 16) {
+      throw new HttpProtocolException("not a chunk size: " + size)
+    }
+    long v = 0
+    for (int i = 0 : i < size.length() : i++) {
+      int d = WebUtil.hexDigit(size.charAt(i))
+      if (d < 0) {
+        throw new HttpProtocolException("not a chunk size: " + size)
+      }
+      v = v * 16 + (long) d
+      if (v < 0) {
+        throw new HttpProtocolException("chunk size is larger than a long: " + size)
+      }
+    }
+    return v
   }
 
   // knownMethod reports whether this server implements a method at all. The set
@@ -1728,6 +2835,9 @@ class HttpServer {
 // listener stays open between passes -- that is what serveIdle does -- so a
 // client that connects while the loop is between two of them is answered on the
 // next one rather than refused.
+//
+// (The two tasks the pools run -- one connection, one session -- are above,
+// next to the pool that takes them.)
 class ServerTask implements Runnable {
   private HttpServer server
   // idleMs is how long one pass waits for a connection, and therefore how long
@@ -1772,6 +2882,7 @@ class ServerTask implements Runnable {
 }
 
 // ---------------------------------------------------------------- bootstrap
+// (the worker tasks are above, next to the pool they run on)
 
 // @SpringBootApplication is @Configuration + @ComponentScan + @EnableAutoConfiguration
 // in one, which in Spring is what makes a class the program's root.
@@ -1837,6 +2948,49 @@ class Application {
       server.ssl(certificate, ctx.getProperty("server.ssl.certificate-private-key", ""))
     }
     Sessions.setTimeout(SpringApplication.sessionTimeoutSeconds(ctx))
+    configureLimits(ctx, server)
+  }
+
+  /* configureLimits reads what a client is held to out of the configuration, so
+     that a deployment can change a number without recompiling the server.
+
+     The names are the ones in the class comment above the fields. One of them
+     is Spring Boot's own (`server.max-http-request-header-size`, the size of
+     the header block, which is what a Boot application already sets when it
+     hits a 431); the rest are `server.teyru.*`, in the shape Boot writes its
+     own `server.tomcat.*` settings in.
+
+     A value that is not a number is the default rather than a refusal to start:
+     a server that will not boot over a typo in a limit is a server nobody can
+     correct from a phone at three in the morning, and the default is a safe
+     number by construction. */
+  public static void configureLimits(ApplicationContext ctx, HttpServer server) {
+    server.setMaxHeadBytes(SpringApplication.parseIntOr(
+        ctx.getProperty("server.max-http-request-header-size", ""), server.getMaxHeadBytes()))
+    server.setMaxRequestLineBytes(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.max-request-line-bytes", ""), server.getMaxRequestLineBytes()))
+    server.setMaxHeaderCount(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.max-header-count", ""), server.getMaxHeaderCount()))
+    server.setMaxBodyBytes(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.max-body-bytes", ""), server.getMaxBodyBytes()))
+    server.setHeaderTimeoutMs(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.header-timeout-ms", ""), server.getHeaderTimeoutMs()))
+    server.setBodyTimeoutMs(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.body-timeout-ms", ""), server.getBodyTimeoutMs()))
+    server.setKeepAliveIdleMs(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.keep-alive-idle-ms", ""), server.getKeepAliveIdleMs()))
+    server.setMaxRequestsPerConnection(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.max-requests-per-connection", ""), server.getMaxRequestsPerConnection()))
+    server.setWorkerThreads(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.worker-threads", ""), server.getWorkerThreads()))
+    server.setAcceptQueue(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.accept-queue", ""), server.getAcceptQueue()))
+    server.setMaxSocketConnections(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.websocket.max-connections", ""), server.getMaxSocketConnections()))
+    server.setSocketMaxMessageBytes(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.websocket.max-message-bytes", ""), server.getSocketMaxMessageBytes()))
+    server.setSocketIdleTimeoutMs(SpringApplication.parseIntOr(
+        ctx.getProperty("server.teyru.websocket.idle-timeout-ms", ""), server.getSocketIdleTimeoutMs()))
   }
 
   // routerFrom builds the router by reading each controller's methods, which is

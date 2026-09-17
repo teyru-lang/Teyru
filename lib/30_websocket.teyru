@@ -31,6 +31,55 @@ class Sha1 {
   String value() default ""
 }
 
+/* WebSocketProtocolException is a frame this server refuses, carrying the close
+   code the peer is told before the connection ends. The code is the whole of
+   what the protocol gives a peer to diagnose with, which is why it is a field
+   rather than a sentence:
+
+     1001  going away          the session was idle for too long
+     1002  protocol error      a client frame that was not masked, a control
+                               frame that was too long or fragmented, an opcode
+                               nobody defined, a continuation with nothing to
+                               continue
+     1007  invalid frame data  a text message that is not UTF-8
+     1009  message too big     a message over the limit, fragments included
+
+   It is an IOException because that is what the frame reader's callers already
+   handle, and a session that ends is a session that ends whichever way it
+   went. */
+class WebSocketProtocolException extends IOException {
+  public int code
+
+  public WebSocketProtocolException(int code, String message) {
+    super(message)
+    this.code = code
+  }
+}
+
+/* WebSocketLimits is what one session is held to. Two numbers, because a
+   WebSocket is the one thing here that has no answer to give and no length to
+   declare: a peer can hold a session open for as long as it likes, and it can
+   send a message as large as it likes unless the server says otherwise.
+
+   maxMessageBytes is the whole of a message, fragments included -- a client
+   that sends a message in pieces is sending several frames and one message --
+   and maxControlBytes is the 125 bytes RFC 6455 allows a control frame, which
+   is a limit of the protocol rather than a choice. */
+class WebSocketLimits {
+  public int maxMessageBytes = 1048576
+  public int idleTimeoutMs = 60000
+
+  public static final int MAX_CONTROL_BYTES = 125
+
+  public WebSocketLimits() {
+  }
+
+  public WebSocketLimits(int maxMessageBytes, int idleTimeoutMs) {
+    this.maxMessageBytes = maxMessageBytes
+    this.idleTimeoutMs = idleTimeoutMs
+  }
+}
+
 // WebSocketSession is one connection after the upgrade: what a program sends on
 // and what tells it the connection ended.
 class WebSocketSession {
@@ -119,12 +168,6 @@ class WebSocketFrame {
   // 125 is the largest payload a frame's own length field holds; beyond it the
   // length moves into two or eight bytes, and 126 and 127 say which.
   public static final int SHORT_MAX = 125
-  // MAX_PAYLOAD is the largest frame this server will hold. A frame's length is
-  // eight bytes on the wire, so without a limit a client asks for any amount of
-  // memory and the server hands it over -- and a message is a message, not a
-  // file: sixty-four megabytes is far past what a program should send in one
-  // frame and it is a number the server can afford to allocate for one client.
-  public static final long MAX_PAYLOAD = 64L * 1024L * 1024L
 
   public boolean fin = true
   public int opcode = TEXT
@@ -134,27 +177,31 @@ class WebSocketFrame {
     return opcode >= 0x8
   }
 
-  // read reads one frame: the flags, the length, the mask a client always sends,
-  // and the payload it unmasked. The masking is what the protocol asks for from
-  // a client and never from a server, and it is the same operation in both
-  // directions: the four bytes repeat over the payload.
+  // read reads one frame from a client: the flags, the length, the mask a client
+  // always sends, and the payload it unmasked.
   //
-  // A frame this server will not read is answered with null, which is the same
-  // answer the end of the stream gets: null means there is no next frame, and
-  // the connection is over either way. It is deliberately not an exception.
-  // RFC 6455 fails the connection for a frame that cannot be handled -- the
-  // protocol has no reply for a malformed frame other than the close that ends
-  // it -- and an exception thrown here would leave the connection loop, which
-  // catches only IOExceptions, and stop the thread that answers every other
-  // client. A client that can stop the server by sending eight bytes is not a
-  // client the server can refuse.
-  public static WebSocketFrame read(SocketInputStream in) {
-    int first = in.read()
-    if (first < 0) {
+  // It refuses what RFC 6455 tells a server to fail a connection for, and says
+  // which code the peer gets: a frame that is not masked (1002), a control frame
+  // over 125 bytes or one that is fragmented (1002), an opcode nobody defined
+  // (1002), a frame larger than the message limit (1009). Returning null is
+  // reserved for the one case that is not a failure -- the connection ended
+  // between frames -- because a peer that goes away is not a peer that erred.
+  //
+  // Both waits are totals and neither blocks longer than the poll: the first
+  // byte of a frame waits out the idle timeout, and a frame that has started has
+  // the same timeout to finish. That is what makes an idle session end rather
+  // than sit for the afternoon, and what keeps a thread blocked here from
+  // holding the collector, which cannot stop a thread inside the C library's
+  // recv().
+  public static WebSocketFrame read(Socket socket, SocketInputStream in, WebSocketLimits limits) {
+    long idleDeadline = System.currentTimeMillis() + (long) limits.idleTimeoutMs
+    int first = readByteWithin(socket, in, idleDeadline, true)
+    if (first == END_OF_STREAM) {
       return null
     }
-    int second = in.read()
-    if (second < 0) {
+    long deadline = System.currentTimeMillis() + (long) limits.idleTimeoutMs
+    int second = readByteWithin(socket, in, deadline, false)
+    if (second == END_OF_STREAM) {
       return null
     }
     WebSocketFrame f = new WebSocketFrame()
@@ -163,42 +210,114 @@ class WebSocketFrame {
     boolean masked = (second & 0x80) != 0
     long len = second & 0x7f
     if (len == 126) {
-      int hi = in.read()
-      int lo = in.read()
-      if (hi < 0 || lo < 0) {
-        return null
-      }
-      len = ((long) hi << 8) | (long) lo
+      len = ((long) readByteWithin(socket, in, deadline, false) << 8) |
+          (long) readByteWithin(socket, in, deadline, false)
     } else if (len == 127) {
       len = 0
       for (int i = 0 : i < 8 : i++) {
-        int b = in.read()
-        if (b < 0) {
-          return null
-        }
-        len = (len << 8) | (long) b
+        len = (len << 8) | (long) readByteWithin(socket, in, deadline, false)
       }
     }
-    // The length is read from a client's bytes, so it is a number this server
-    // was told rather than one it can trust: a suffix of -1 from a stream that
-    // ended in the middle of a length would otherwise become a negative size,
-    // and a client could name a payload of any size it liked.
-    if (len > MAX_PAYLOAD) {
-      return null
+    if (opcodeOf(f.opcode) == false) {
+      throw new WebSocketProtocolException(1002, "opcode " + f.opcode + " is not one the protocol defines")
+    }
+    // A client MUST mask every frame it sends, and a server that reads an
+    // unmasked one has no idea whether it is reading a client or a proxy
+    // repeating what it was given: the mask is the proof that the bytes were
+    // written by the peer this connection is to.
+    if (masked == false) {
+      throw new WebSocketProtocolException(1002, "a client frame must be masked")
+    }
+    // A control frame is a frame the protocol wants an answer to before the
+    // message around it is finished, and 125 bytes is what RFC 6455 allows one
+    // to carry. A fragmented control frame is a control frame two peers could
+    // read in two orders, so it is refused rather than reassembled.
+    if (f.isControl()) {
+      if (f.fin == false) {
+        throw new WebSocketProtocolException(1002, "a control frame cannot be fragmented")
+      }
+      if (len > (long) WebSocketLimits.MAX_CONTROL_BYTES) {
+        throw new WebSocketProtocolException(1002,
+            "a control frame of " + len + " bytes is over the 125 the protocol allows")
+      }
+    }
+    // The length is a number a client wrote, and this is the only place it can
+    // be checked before it is allocated: a client that says "two gigabytes" gets
+    // a close of 1009 rather than two gigabytes.
+    if (len > (long) limits.maxMessageBytes) {
+      throw new WebSocketProtocolException(1009,
+          "a frame of " + len + " bytes is over the limit of " + limits.maxMessageBytes)
     }
     byte[] mask = new byte[4]
-    if (masked) {
-      in.readFully(mask, 0, mask.length)
-    }
+    readFullyWithin(socket, in, mask, 0, mask.length, deadline)
     f.payload = new byte[(int) len]
-    in.readFully(f.payload, 0, f.payload.length)
-    if (masked) {
-      for (int i = 0 : i < f.payload.length : i++) {
-        f.payload[i] = (byte) (f.payload[i] ^ mask[i % 4])
-      }
+    readFullyWithin(socket, in, f.payload, 0, f.payload.length, deadline)
+    for (int i = 0 : i < f.payload.length : i++) {
+      f.payload[i] = (byte) (f.payload[i] ^ mask[i % 4])
     }
     return f
   }
+
+  // END_OF_STREAM is what a read that found the connection over answers, which
+  // is a number no byte can be: read() answers 0..255 or -1.
+  private static final int END_OF_STREAM = -1
+
+  // POLL_MS is how long one read blocks before the clock is looked at again.
+  private static final int POLL_MS = 250
+
+  // readByteWithin reads one byte, waiting no longer than the deadline and
+  // looking at the clock every poll. END_OF_STREAM is the connection over;
+  // a deadline that arrives is the refusal it names.
+  private static int readByteWithin(Socket socket, SocketInputStream in, long deadline, boolean idle) {
+    while (true) {
+      long left = deadline - System.currentTimeMillis()
+      if (left <= 0) {
+        if (idle) {
+          throw new WebSocketProtocolException(1001, "the session was idle for longer than it is allowed")
+        }
+        throw new WebSocketProtocolException(1002, "a frame did not finish arriving in time")
+      }
+      socket.setSoTimeout((int) (left < POLL_MS ? left : POLL_MS))
+      try {
+        return in.read()
+      } catch (SocketTimeoutException e) {
+        // the poll ran out rather than the deadline: look at the clock again
+      }
+    }
+  }
+
+  // readFullyWithin is readFully with a deadline: the same retry on a short
+  // read, and the same refusal when the clock runs out.
+  private static void readFullyWithin(Socket socket, SocketInputStream in, byte[] buf, int off,
+      int len, long deadline) {
+    int have = 0
+    while (have < len) {
+      long left = deadline - System.currentTimeMillis()
+      if (left <= 0) {
+        throw new WebSocketProtocolException(1002, "a frame did not finish arriving in time")
+      }
+      socket.setSoTimeout((int) (left < POLL_MS ? left : POLL_MS))
+      try {
+        int n = in.read(buf, off + have, len - have)
+        if (n < 0) {
+          throw new EOFException("the connection ended in the middle of a frame")
+        }
+        have = have + n
+      } catch (SocketTimeoutException e) {
+        // the poll ran out rather than the deadline: look at the clock again
+      }
+    }
+  }
+
+  // opcodeOf answers whether this is an opcode the protocol defines: a
+  // continuation, text, binary, or one of the three control frames. The rest of
+  // the space is reserved, and a frame in it is a frame two implementations
+  // could read differently.
+  public static boolean opcodeOf(int opcode) {
+    return opcode == CONT || opcode == TEXT || opcode == BINARY ||
+        opcode == CLOSE || opcode == PING || opcode == PONG
+  }
+
 
   // encode renders one frame. A server's frames are not masked, and its payload
   // is sent whole, so the length is what it is.
@@ -288,75 +407,193 @@ class WebSocketConnection {
   // it, which is what a client that sends a large message does.
   public static void run(Socket socket, SocketInputStream in, SocketOutputStream out,
       WebSocketSession session, WebSocketHandler handler) {
-    StringBuilder message = new StringBuilder()
-    byte[] binary = new byte[0]
+    run(socket, in, out, session, handler, new WebSocketLimits())
+  }
+
+  // run is the whole of a session, and the limits are what a peer is held to:
+  // how large a message may be and how long a silence is allowed, both of which
+  // are questions a WebSocket asks that a request does not -- a session has no
+  // answer to give and no length to declare.
+  //
+  // A frame that breaks the protocol ends the session with the close code that
+  // says which rule it broke (RFC 6455 §7.4.1), because the code is the whole
+  // of what the peer is told. A peer that goes away between frames is not a
+  // failure and gets no close: there is nobody left to read it.
+  public static void run(Socket socket, SocketInputStream in, SocketOutputStream out,
+      WebSocketSession session, WebSocketHandler handler, WebSocketLimits limits) {
+    ByteArrayOutputStream message = null
+    long total = 0
     int opcode = 0
+    int failure = 0
+    String reason = ""
     handler.onOpen(session)
-    while (session.isOpen()) {
-      WebSocketFrame f
-      try {
-        f = WebSocketFrame.read(in)
-      } catch (IOException e) {
-        // A peer that goes away in the middle of a frame is a connection that
-        // ended, which is what the peer that goes away between frames gets: the
-        // read is waiting for bytes the connection will never carry, and the
-        // close below is the same close either way. Letting the exception out
-        // would skip onClose, and a handler that holds something -- a
-        // subscriber, a counter -- would hold it for the life of the process.
-        break
+    try {
+      while (session.isOpen()) {
+        WebSocketFrame f = WebSocketFrame.read(socket, in, limits)
+        if (f == null) {
+          // the connection ended between frames: there is nobody to answer
+          break
+        }
+        if (f.isControl()) {
+          if (f.opcode == WebSocketFrame.PING) {
+            out.write(WebSocketFrame.encode(WebSocketFrame.PONG, f.payload))
+            out.flush()
+            continue
+          }
+          if (f.opcode == WebSocketFrame.PONG) {
+            continue
+          }
+          // A close from the peer is answered with a close, which is what the
+          // protocol asks of both ends. The code the peer sent is not echoed:
+          // what it means is the peer's to know, and an empty close says the
+          // same thing about this end -- the conversation is over.
+          session.ended()
+          out.write(WebSocketFrame.encode(WebSocketFrame.CLOSE, new byte[0]))
+          out.flush()
+          break
+        }
+        // ---- a data frame, which is a message or part of one ----
+        if (f.opcode == WebSocketFrame.CONT) {
+          if (message == null) {
+            throw new WebSocketProtocolException(1002,
+                "a continuation frame with no message to continue")
+          }
+        } else {
+          // A new text or binary frame before the message before it ended is
+          // two messages that two readers would interleave differently.
+          if (message != null) {
+            throw new WebSocketProtocolException(1002,
+                "a new message began before the one before it had ended")
+          }
+          message = new ByteArrayOutputStream()
+          total = 0
+          opcode = f.opcode
+        }
+        // The limit is on the message and not on the frame: a client that sends
+        // a megabyte in a thousand fragments has sent a megabyte.
+        total = total + (long) f.payload.length
+        if (total > (long) limits.maxMessageBytes) {
+          throw new WebSocketProtocolException(1009,
+              "a message of more than " + limits.maxMessageBytes + " bytes")
+        }
+        message.write(f.payload, 0, f.payload.length)
+        if (f.fin == false) {
+          continue
+        }
+        byte[] bytes = message.toByteArray()
+        message = null
+        if (opcode == WebSocketFrame.BINARY) {
+          handler.onBinary(session, bytes)
+        } else {
+          // A text message that is not UTF-8 is a message no two readers agree
+          // on, and RFC 6455 fails the connection for it rather than letting
+          // each reader replace the bytes it cannot read.
+          if (WebSocketText.valid(bytes) == false) {
+            throw new WebSocketProtocolException(1007, "a text message that is not UTF-8")
+          }
+          handler.onMessage(session, Net.stringFrom(bytes, 0, bytes.length))
+        }
       }
-      if (f == null) {
-        break
-      }
-      if (f.opcode == WebSocketFrame.PING) {
-        out.write(WebSocketFrame.encode(WebSocketFrame.PONG, f.payload))
-        out.flush()
-        continue
-      }
-      if (f.opcode == WebSocketFrame.PONG) {
-        continue
-      }
-      if (f.opcode == WebSocketFrame.CLOSE) {
-        session.ended()
-        out.write(WebSocketFrame.encode(WebSocketFrame.CLOSE, new byte[0]))
-        out.flush()
-        break
-      }
-      if (f.opcode == WebSocketFrame.TEXT || f.opcode == WebSocketFrame.BINARY) {
-        opcode = f.opcode
-        message = new StringBuilder()
-        binary = new byte[0]
-      }
-      if (opcode == WebSocketFrame.BINARY) {
-        binary = join(binary, f.payload)
-      } else {
-        message.append(WebSocketFrame.text(f))
-      }
-      if (f.fin == false) {
-        continue
-      }
-      if (opcode == WebSocketFrame.BINARY) {
-        handler.onBinary(session, binary)
-        binary = new byte[0]
-      } else {
-        handler.onMessage(session, message.toString())
-        message = new StringBuilder()
-      }
-      opcode = 0
+    } catch (WebSocketProtocolException e) {
+      failure = e.code
+      reason = e.getMessage()
+    } catch (IOException e) {
+      // A peer that goes away in the middle of a frame is a connection that
+      // ended, which is what the peer that goes away between frames gets: the
+      // read is waiting for bytes the connection will never carry. Letting the
+      // exception out would skip onClose, and a handler that holds something --
+      // a subscriber, a counter -- would hold it for the life of the process.
+    }
+    if (failure != 0) {
+      // the close that says which rule was broken, which is all the peer gets
+      session.ended()
+      out.write(WebSocketFrame.encode(WebSocketFrame.CLOSE, closeBody(failure, reason)))
+      out.flush()
     }
     session.ended()
     handler.onClose(session)
   }
 
-  static byte[] join(byte[] have, byte[] more) {
-    byte[] out = new byte[have.length + more.length]
-    for (int i = 0 : i < have.length : i++) {
-      out[i] = have[i]
+  // closeBody is what a close frame carries: the two bytes of the code, and the
+  // reason when there is room for it. A close frame is a control frame, so the
+  // whole of it is 125 bytes and a reason that would not fit is cut rather than
+  // sent as a frame no peer may read.
+  public static byte[] closeBody(int code, String reason) {
+    byte[] text = reason == null ? new byte[0] : reason.getBytes()
+    int extra = text.length
+    if (extra > WebSocketLimits.MAX_CONTROL_BYTES - 2) {
+      extra = WebSocketLimits.MAX_CONTROL_BYTES - 2
     }
-    for (int i = 0 : i < more.length : i++) {
-      out[have.length + i] = more[i]
+    byte[] body = new byte[2 + extra]
+    body[0] = (byte) ((code >> 8) & 0xff)
+    body[1] = (byte) (code & 0xff)
+    for (int i = 0 : i < extra : i++) {
+      body[2 + i] = text[i]
     }
-    return out
+    return body
+  }
+}
+
+/* WebSocketText answers whether a message is valid UTF-8, which RFC 6455 asks a
+   text frame to be and a binary frame not to be.
+
+   The check is over the bytes and not over the string the bytes would become,
+   and that is the point: a decoder that replaces what it cannot read turns a
+   broken message into a readable one, and the server would then hand the
+   handler a document the peer did not send. An overlong encoding, a surrogate,
+   a code point above U+10FFFF and a truncated sequence are all refused. */
+class WebSocketText {
+  public static boolean valid(byte[] b) {
+    int i = 0
+    while (i < b.length) {
+      int first = b[i] & 0xff
+      if (first < 0x80) {
+        i++
+        continue
+      }
+      int need
+      int code
+      int least
+      if (first >= 0xc2 && first <= 0xdf) {
+        need = 1
+        code = first & 0x1f
+        least = 0x80
+      } else if (first >= 0xe0 && first <= 0xef) {
+        need = 2
+        code = first & 0x0f
+        least = 0x800
+      } else if (first >= 0xf0 && first <= 0xf4) {
+        need = 3
+        code = first & 0x07
+        least = 0x10000
+      } else {
+        // 0x80..0xBF is a continuation byte with nothing before it, 0xC0 and
+        // 0xC1 can only encode an overlong value, and 0xF5.. would be a code
+        // point no character has
+        return false
+      }
+      if (i + need >= b.length) {
+        return false
+      }
+      for (int k = 1 : k <= need : k++) {
+        int next = b[i + k] & 0xff
+        if (next < 0x80 || next > 0xbf) {
+          return false
+        }
+        code = (code << 6) | (next & 0x3f)
+      }
+      if (code < least) {
+        return false
+      }
+      if (code >= 0xd800 && code <= 0xdfff) {
+        return false
+      }
+      if (code > 0x10ffff) {
+        return false
+      }
+      i = i + need + 1
+    }
+    return true
   }
 }
 
