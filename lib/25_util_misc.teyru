@@ -1359,21 +1359,11 @@ class Properties extends HashMap<Object, Object> {
       } else if (c < 0x0020) {
         out.append("\\u" + hex4(c))
       } else if (c > 0x007e) {
-        /* Java escapes the CHARACTER; a Teyru string holds the UTF-8 bytes of
-           that character, so the bytes are decoded back to the code point
-           first -- escaping them one byte at a time would write the encoding
-           of the encoding, which is what store used to do to any non-ASCII
-           value. A code point outside the BMP is written as the pair of
-           surrogates Java holds it as. */
-        int cp = utf8CodePoint(s, i)
-        i = i + utf8Length(c) - 1
-        if (cp > 0xFFFF) {
-          int v = cp - 0x10000
-          out.append("\\u" + hex4((char) (0xD800 + (v >> 10))))
-          out.append("\\u" + hex4((char) (0xDC00 + (v & 0x3FF))))
-        } else {
-          out.append("\\u" + hex4((char) cp))
-        }
+        /* Java's saveConvert escapes each char of the string, and a Teyru
+           string is indexed by UTF-16 code unit, so `c` is that char: escaping
+           a character outside the BMP writes the two `\uXXXX` of the surrogate
+           pair it is held as, which is what Java writes too. */
+        out.append("\\u" + hex4(c))
       } else {
         out.append(c)
       }
@@ -1381,48 +1371,6 @@ class Properties extends HashMap<Object, Object> {
     return out.toString()
   }
 
-  /* How many bytes the UTF-8 sequence starting with `lead` occupies. A byte
-     that cannot start one counts as itself. */
-  private static int utf8Length(char lead) {
-    if (lead >= 0xC0 && lead < 0xE0) {
-      return 2
-    }
-    if (lead >= 0xE0 && lead < 0xF0) {
-      return 3
-    }
-    if (lead >= 0xF0 && lead < 0xF8) {
-      return 4
-    }
-    return 1
-  }
-
-  /* The code point the UTF-8 bytes starting at `at` stand for. Text that is
-     not valid UTF-8 reads as the bytes it is made of, so it is escaped a byte
-     at a time instead of being swallowed. */
-  private static int utf8CodePoint(String s, int at) {
-    char b = s.charAt(at)
-    if (b < 0x80) {
-      return b
-    }
-    if (b >= 0xC0 && b < 0xE0) {
-      return ((b & 0x1F) << 6) | utf8Tail(s, at + 1)
-    }
-    if (b >= 0xE0 && b < 0xF0) {
-      return ((b & 0x0F) << 12) | (utf8Tail(s, at + 1) << 6) | utf8Tail(s, at + 2)
-    }
-    if (b >= 0xF0 && b < 0xF8) {
-      return ((b & 0x07) << 18) | (utf8Tail(s, at + 1) << 12) |
-        (utf8Tail(s, at + 2) << 6) | utf8Tail(s, at + 3)
-    }
-    return b
-  }
-
-  private static int utf8Tail(String s, int at) {
-    if (at >= s.length()) {
-      return 0
-    }
-    return s.charAt(at) & 0x3F
-  }
 
   /* Java's own hex digits, and uppercase: store writes é, not é,
      and a file compared against one javac wrote has to agree. */
