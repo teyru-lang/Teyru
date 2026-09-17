@@ -213,12 +213,6 @@ int32_t ty_str_eq_obj(tystr *a, void *b) {
   return ty_str_eq(a, (tystr *)b);
 }
 
-tystr *ty_str_sub_from(tystr *s, int32_t from) {
-  if (!s) return NULL;
-  if (from < 0 || from > s->blen) ty_throw((tyobj *)ty_sioobe(from, s ? s->blen : 0));
-  return ty_str_sub(s, from, (int32_t)s->blen);
-}
-
 int64_t ty_str_tolong(tystr *s) { return s ? strtoll(TY_STR_DATA(s), NULL, 10) : 0; }
 double ty_str_todouble(tystr *s) { return s ? strtod(TY_STR_DATA(s), NULL) : 0; }
 float ty_str_tofloat(tystr *s) { return s ? (float)strtod(TY_STR_DATA(s), NULL) : 0; }
@@ -371,42 +365,64 @@ int32_t ty_enum_compare(void *a, void *b) { return ty_enum_ordinal(a) - ty_enum_
 
 /* ---- StringBuilder ----------------------------------------------------- */
 
+/* The builder's buffer holds code units (tyrt.h says why), so `len` counts
+   units, `cap` is a capacity in units, and growing doubles it. Java's
+   default capacity is 16; this one starts at 32 units, four times the bytes
+   the old byte buffer held and the same number of characters. */
 void *ty_sb_new(void) {
   tySB *sb = (tySB *)ty_alloc(sizeof(tySB));
-  sb->cap = 32;
   sb->len = 0;
-  sb->buf = (char *)malloc((size_t)sb->cap);
+  sb->cap = 32;
+  sb->buf = (uint16_t *)malloc((size_t)sb->cap * sizeof(uint16_t));
   return sb;
 }
 
-static void sb_ensure(tySB *sb, int64_t extra) {
-  if (sb->len + extra <= sb->cap) return;
+/* Room for `extra` more units. Every mutator in both files grows through this
+   one, so the doubling rule and the size it is applied to are in one place. */
+void ty_sb_reserve(void *p, int64_t extra) {
+  tySB *sb = (tySB *)p;
+  if (extra <= 0 || sb->len + extra <= sb->cap) return;
   while (sb->len + extra > sb->cap) sb->cap *= 2;
-  sb->buf = (char *)realloc(sb->buf, (size_t)sb->cap);
+  sb->buf = (uint16_t *)realloc(sb->buf, (size_t)sb->cap * sizeof(uint16_t));
 }
 
 void *ty_sb_append_str(void *p, tystr *s) {
   tySB *sb = (tySB *)p;
   if (!s) return p;
-  sb_ensure(sb, s->blen);
-  memcpy(sb->buf + sb->len, TY_STR_DATA(s), (size_t)s->blen);
-  sb->len += s->blen;
+  if (s->ulen == 0) return p;
+  ty_sb_reserve(sb, s->ulen);
+  ty_str_units(s, sb->buf + sb->len);
+  sb->len += s->ulen;
   return p;
 }
 void *ty_sb_append_int(void *p, int64_t v) { return ty_sb_append_str(p, ty_str_of_long(v)); }
 void *ty_sb_append_long(void *p, int64_t v) { return ty_sb_append_str(p, ty_str_of_long(v)); }
 void *ty_sb_append_double(void *p, double v) { return ty_sb_append_str(p, ty_str_of_double(v)); }
 void *ty_sb_append_bool(void *p, int32_t v) { return ty_sb_append_str(p, ty_str_of_bool(v)); }
-void *ty_sb_append_char(void *p, uint16_t c) { return ty_sb_append_str(p, ty_str_of_char(c)); }
+/* append(char) appends one code unit, which is one unit even when it is half of
+   an astral character: two of them appended in order are that character, and
+   the builder's buffer says so because it holds units. */
+void *ty_sb_append_char(void *p, uint16_t c) {
+  tySB *sb = (tySB *)p;
+  if (!sb) ty_npe();
+  ty_sb_reserve(sb, 1);
+  sb->buf[sb->len++] = c;
+  return p;
+}
 void *ty_sb_append_obj(void *p, void *o) {
   if (!o) return ty_sb_append_str(p, ty_str_intern("null"));
   return ty_sb_append_str(p, ty_str_of_obj((tyobj *)o));
 }
 tystr *ty_sb_tostring(void *p) {
   tySB *sb = (tySB *)p;
-  return ty_str_new(sb->buf, sb->len);
+  if (!sb) ty_npe();
+  return ty_str_of_units(sb->buf, sb->len);
 }
-int32_t ty_sb_len(void *p) { return (int32_t)((tySB *)p)->len; }
+int32_t ty_sb_len(void *p) {
+  tySB *sb = (tySB *)p;
+  if (!sb) ty_npe();
+  return (int32_t)sb->len;
+}
 
 
 /* ---- java.io.IO -------------------------------------------------------- */
@@ -449,9 +465,7 @@ static FILE *ty_ps_out(void *self) {
 }
 
 void ty_ps_print_str(void *self, tystr *s) {
-  FILE *f = ty_ps_out(self);
-  if (s) fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, f);
-  else fputs("null", f);
+  ty_str_write(ty_ps_out(self), s);
 }
 void ty_ps_println_str(void *self, tystr *s) {
   ty_ps_print_str(self, s);
@@ -460,16 +474,14 @@ void ty_ps_println_str(void *self, tystr *s) {
 void ty_ps_print_int(void *self, int64_t v) { fprintf(ty_ps_out(self), "%lld", (long long)v); }
 void ty_ps_println_int(void *self, int64_t v) { fprintf(ty_ps_out(self), "%lld\n", (long long)v); }
 void ty_ps_print_double(void *self, double v) {
-  tystr *s = ty_str_of_double(v);
-  fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, ty_ps_out(self));
+  ty_str_write(ty_ps_out(self), ty_str_of_double(v));
 }
 void ty_ps_println_double(void *self, double v) {
   ty_ps_print_double(self, v);
   fputc('\n', ty_ps_out(self));
 }
 void ty_ps_print_float(void *self, float v) {
-  tystr *s = ty_str_of_float(v);
-  fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, ty_ps_out(self));
+  ty_str_write(ty_ps_out(self), ty_str_of_float(v));
 }
 void ty_ps_println_float(void *self, float v) {
   ty_ps_print_float(self, v);
@@ -478,7 +490,7 @@ void ty_ps_println_float(void *self, float v) {
 void ty_ps_print_char(void *self, uint16_t c) {
   FILE *f = ty_ps_out(self);
   if (c < 0x80) fputc((int)c, f);
-  else fputs(TY_STR_DATA(ty_str_of_char(c)), f);
+  else ty_str_write(f, ty_str_of_char(c));
 }
 void ty_ps_println_char(void *self, uint16_t c) {
   ty_ps_print_char(self, c);

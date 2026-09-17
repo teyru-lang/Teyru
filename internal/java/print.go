@@ -1172,14 +1172,41 @@ func floatText(f float64, bits int) string {
 	return s
 }
 
+// quote prints a string literal so that javac reads back the same code units.
+// The bytes are WTF-8, so the walk is over sequences and not over code points:
+// a lone surrogate -- "\uD800" on its own, which is a string Java holds -- is
+// its three-byte form here and has no UTF-8 spelling at all, so ranging over the
+// string the way Go does would answer U+FFFD for it and print a program that
+// says something else.
 func quote(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
-	for _, r := range s {
+	for i := 0; i < len(s); {
+		r, n := wtf8Rune(s[i:])
 		b.WriteString(escapeRune(r, '"'))
+		i += n
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// wtf8Rune decodes one WTF-8 sequence: the code point it spells, which for a
+// surrogate standing alone is the surrogate itself, and how many bytes it took.
+// A byte that cannot begin a sequence is answered as itself, one byte wide,
+// which is as far as a string this repository builds can be malformed.
+func wtf8Rune(s string) (rune, int) {
+	b := s[0]
+	switch {
+	case b < 0x80:
+		return rune(b), 1
+	case b&0xE0 == 0xC0 && len(s) >= 2:
+		return rune(b&0x1F)<<6 | rune(s[1]&0x3F), 2
+	case b&0xF0 == 0xE0 && len(s) >= 3:
+		return rune(b&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), 3
+	case b&0xF8 == 0xF0 && len(s) >= 4:
+		return rune(b&0x07)<<18 | rune(s[1]&0x3F)<<12 | rune(s[2]&0x3F)<<6 | rune(s[3]&0x3F), 4
+	}
+	return rune(b), 1
 }
 
 // escapeRune prints one character so that Java reads the same code unit back: a
@@ -1201,6 +1228,11 @@ func escapeRune(r rune, quote rune) string {
 		return "\\b"
 	case r == '\f':
 		return "\\f"
+	// A surrogate has no UTF-8 spelling, so it is written as the escape that
+	// names the code unit -- and Go's own conversion of such a rune would say
+	// U+FFFD, which is a different string.
+	case r >= 0xD800 && r <= 0xDFFF:
+		return fmt.Sprintf("\\u%04x", r)
 	case r < 0x20 || r == 0x7f:
 		return fmt.Sprintf("\\u%04x", r)
 	}
