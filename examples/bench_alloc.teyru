@@ -1,4 +1,5 @@
-// Allocation pressure: short-lived objects.
+// Allocation pressure: short-lived objects. The argument is the number of
+// cells allocated.
 class Cell {
   private long value
   public Cell(long v) {
@@ -11,8 +12,12 @@ class Cell {
 
 class BenchAlloc {
   public static void main(String[] args) {
+    int n = 20000000
+    if (args.length > 0) {
+      n = Integer.parseInt(args[0])
+    }
     long sum = 0
-    for (int i = 0 : i < 20000000 : i++) {
+    for (int i = 0 : i < n : i++) {
       Cell c = new Cell(i)
       sum += c.value()
     }

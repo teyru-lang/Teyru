@@ -1,0 +1,48 @@
+// Strings whose characters are not ASCII: concatenation, a charAt walk and a
+// substring. bench_string cannot see the cost of indexing a UTF-16 string over
+// UTF-8 storage, because for ASCII the two agree and the fast path answers
+// without translating anything. Here every index has to be translated.
+//
+// The concatenated part and the walked part are counted separately in the
+// output, so a change that makes one of them slower and the other faster cannot
+// hide in a single total.
+//
+// Until the string semantics work in the fix plan lands, the two sides of this
+// program do *different work* and its row in scripts/bench.sh is not a fair
+// comparison: this side counts UTF-8 bytes where Java counts UTF-16 units, so
+// the same scale means more bytes here, and `text.charAt(i) == '中'` never holds
+// because the byte it reads is not a character. The output difference is the
+// evidence -- 28890 against 16890, and 0 matches against 1000 -- and it is
+// printed rather than hidden so that the row cannot be read as a benchmark of
+// two implementations of the same thing. It becomes a fair comparison at the
+// same moment the outputs agree.
+class BenchStringCjk {
+  public static void main(String[] args) {
+    int n = 200000
+    if (args.length > 0) {
+      n = Integer.parseInt(args[0])
+    }
+    String base = "中文"
+    String emoji = "😀"
+
+    long built = 0
+    for (int i = 0 : i < n : i++) {
+      String s = base + "-" + i + emoji
+      built += s.length()
+    }
+
+    StringBuilder sb = new StringBuilder()
+    for (int i = 0 : i < 1000 : i++) {
+      sb.append("中文")
+    }
+    String text = sb.toString()
+    long walked = 0
+    for (int i = 0 : i < text.length() : i++) {
+      if (text.charAt(i) == '中') {
+        walked += 1
+      }
+    }
+    long sliced = text.substring(1, 5).length()
+    System.out.println("concat=" + built + " walked=" + walked + " sliced=" + sliced)
+  }
+}

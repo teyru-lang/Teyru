@@ -1,9 +1,14 @@
-// String building: concatenation in a loop.
+// String building: concatenation in a loop, ASCII only. The argument is the
+// number of concatenations.
 class BenchString {
   public static void main(String[] args) {
+    int n = 200000
+    if (args.length > 0) {
+      n = Integer.parseInt(args[0])
+    }
     String base = "teyru"
     long total = 0
-    for (int i = 0 : i < 200000 : i++) {
+    for (int i = 0 : i < n : i++) {
       String s = base + "-" + i
       total += s.length()
     }
