@@ -504,6 +504,27 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   `TEYRU_GC_STRESS` 給了不是正整數的值會印一行說明並當作沒開，而不是安靜地不開。
   W3 與 W14 的量測讀的就是這兩個開關。
 
+- **平台矩陣：arm64 已實測，macOS 只到「編譯並連結」（2026-09-17 在 linux/amd64 上量測，
+  編譯器 2f78d0d、tests 21b8a07）**：`linux/arm64` 的整套在 qemu 下 **250 項全過、0 項不符**
+  （222 支程式＋3 個套件＋23 個診斷＋2 個原生）。做法沒有動 `tests/run.sh`：sysroot 用 Debian sid
+  的 arm64 套件裝進 `aarch64-linux-gnu-gcc` 的預設 sysroot（libc 2.43 與標頭、`linux-libc-dev`、
+  `libatomic`、OpenSSL 3.6.4 及它要的 zlib／zstd；Debian 的 `libc.so`／`libm.so` 連結腳本要改寫成
+  sysroot 內路徑，Fedora 無條件加的 `-latomic_asneeded` 要指向 Debian 的 libatomic），目標由一個
+  加上 `--target linux/arm64` 的編譯器包裝帶著走，`CC=aarch64-linux-gnu-gcc`、`QEMU_LD_PREFIX` 指
+  向 sysroot（Fedora 的 qemu-user-static 已註冊 binfmt handler，但那支 qemu 沒有預設 sysroot）。
+  同一次暴露兩個還沒解的空隙：
+  - **`tests/run.sh` 沒有地方可以指名目標**：它只喊 `teyru build -O1 -o <輸出> <來源>`，也沒有任何
+    環境變數可介入，所以交叉目標目前只能靠替換編譯器那個名字（一個包裝腳本）達成——可行，但這是
+    沒有文件的路徑。
+  - **`--cc` 補不上目標表裡沒有編譯器的目標**：`darwin/amd64` 與 `darwin/arm64` 的 `cc` 是空的，
+    `resolveTarget` 在 `Compile` 讀 `opts.CC` 之前就拒絕，所以即使裝了 `zig cc -target <arch>-macos`
+    也不能用 `teyru build` 編給 macOS。
+  `darwin/amd64` 與 `darwin/arm64` 上**沒有任何一行程式被執行過**：繞過目標表、把 `teyru emit` 的 C
+  交給 `zig cc -target <arch>-macos`，**不碰 TLS 的 188 支全部編譯並連結成功**（Mach-O 執行檔），碰
+  得到 TLS 的 34 支編不過（`tyrt_tls.c` include `openssl/err.h`，macOS 沒有那個標頭），而且這批連
+  結不帶 `-flto`（zig 回 `LTO requires using LLD`，那是編譯器自己對沒有 LTO 的工具鏈的退回路徑）。
+  這個「模擬器上跑過」與「只編過」的差別，在 README 的平台表與 docs 的 index 上必須分得清楚。
+
 ## 11. 送出前檢查清單
 
 - [ ] `go build ./...`、`go vet ./...`、`go test ./... -count=1` 全綠（`tests/` submodule 已 checkout）
