@@ -107,6 +107,33 @@ $(cat "$DIR/$name.experr")"
   done
 done
 
+# The TLS round trip, once, because the last commit above gives every ty_tls_*
+# entry point a weak definition in tyrt_net.c so that a program which did not
+# link the TLS layer fails by name instead of by link error. What that must not
+# do is shadow the strong definitions tyrt_tls.c provides when the layer *is*
+# linked -- a weak definition quietly winning would turn every TLS program into
+# one that throws "not linked against OpenSSL" -- and the only way to see which
+# one the linker chose is to run a handshake. t191 does one, in process, over a
+# loopback connection.
+if [ -f "$DIR/t191_tls_keepalive.teyru" ]; then
+  tlslog="$TMPDIR/t191.log"
+  if "$BIN" build -O2 -o "$TMPDIR/t191" "$DIR/t191_tls_keepalive.teyru" >"$tlslog" 2>&1; then
+    if timeout 300 "$TMPDIR/t191" >"$TMPDIR/t191.out" 2>"$TMPDIR/t191.err" &&
+       diff -q "$TMPDIR/t191.out" "$DIR/t191_tls_keepalive.expected" >/dev/null; then
+      printf '%-5s %-7s %-6s %-24s ok\n' -- c clang t191_tls_keepalive
+    else
+      printf '%-5s %-7s %-6s %-24s MISMATCH\n' -- c clang t191_tls_keepalive
+      sed -n '1,3p' "$TMPDIR/t191.err" | sed 's/^/        /'
+      failed=$((failed+1))
+    fi
+  else
+    code=$(grep -m1 -o 'TY-[A-Z]*-[0-9]*' "$tlslog" || true)
+    printf '%-5s %-7s %-6s %-24s BLOCKED  %s\n' -- c clang t191_tls_keepalive \
+      "${code:-no OpenSSL for this target}"
+    blocked=$((blocked+1))
+  fi
+fi
+
 echo
-echo "stack-matrix: $failed failed, $blocked blocked (gcc -O0, see the header)"
+echo "stack-matrix: $failed failed, $blocked blocked (gcc -O0 and TLS, see the header)"
 [ "$failed" -eq 0 ]
