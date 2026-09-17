@@ -260,7 +260,12 @@ class ClientResponseParser {
     res.body = Gzip.decompress(res.body)
   }
 
-  private static HttpClientResponse parseRaw(SocketInputStream in) {
+  /* parseRaw is the reading half on its own, without expanding a compressed
+     body. It is public because the client needs the two halves apart: reading
+     is transport -- a connection that broke is worth one more try -- and
+     expanding is not, so a body that will not expand has to be raised where
+     re-sending the request is not the answer. */
+  public static HttpClientResponse parseRaw(SocketInputStream in) {
     String statusLine = in.readLine()
     if (statusLine == null) {
       return null
@@ -459,21 +464,18 @@ class HttpClient {
     int tries = 0
     while (true) {
       Socket s = connection(u, tries > 0)
+      HttpClientResponse res = null
       try {
         s.setSoTimeout(request.timeoutMs > 0 ? request.timeoutMs : timeoutMs)
         s.getOutputStream().write(request.render(u))
         s.getOutputStream().flush()
-        HttpClientResponse res = ClientResponseParser.parse(s.getInputStream())
-        if (res == null) {
-          throw new IllegalStateException("the server closed the connection without answering")
-        }
-        // the connection stays open unless the server said otherwise, which is
-        // what makes the next request to the same authority one write
-        if (res.header("Connection").toLowerCase().indexOf("close") >= 0 || u.scheme.equals("https") == false &&
-            res.header("Connection").toLowerCase().indexOf("close") >= 0) {
-          close()
-        }
-        return res
+        // The reading half only, and the test below is why: a connection that
+        // broke between two requests is worth sending the request again, and a
+        // body that will not expand is not. Expanding it here would put a
+        // compression failure inside the retry, so a client would send a POST a
+        // second time because it could not read the first answer -- a second
+        // side effect, which is worse than the error it is covering for.
+        res = ClientResponseParser.parseRaw(s.getInputStream())
       } catch (IOException e) {
         // a connection the server closed between requests is the one case worth
         // retrying: the request itself may not have been read
@@ -482,7 +484,20 @@ class HttpClient {
         if (tries > 1) {
           throw e
         }
+        continue
       }
+      if (res == null) {
+        throw new IllegalStateException("the server closed the connection without answering")
+      }
+      // the connection stays open unless the server said otherwise, which is
+      // what makes the next request to the same authority one write
+      if (res.header("Connection").toLowerCase().indexOf("close") >= 0) {
+        close()
+      }
+      // The expansion happens once, on the answer this call is going to return,
+      // and its failure is the caller's to see as it is.
+      ClientResponseParser.decodeBody(res)
+      return res
     }
   }
 

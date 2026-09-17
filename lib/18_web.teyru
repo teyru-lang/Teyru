@@ -366,8 +366,19 @@ class HttpRequest {
     return ""
   }
 
+  // hasHeader asks whether the request carried the header at all, which is not
+  // the same question as whether its value is non-empty: `X-Foo:` is a header
+  // the client sent and meant nothing by, and `@RequestHeader` with a default
+  // answers "" for it rather than the default, as Spring's does. Asking the
+  // value would answer the default for a header that is right there.
   public boolean hasHeader(String name) {
-    return header(name).isEmpty() == false
+    String want = name.toLowerCase()
+    for (int i = 0 : i < headerNames.size() : i++) {
+      if (headerNames.get(i).toLowerCase().equals(want)) {
+        return true
+      }
+    }
+    return false
   }
 
   // header answers with the default when the request carries no such header,
@@ -546,17 +557,21 @@ class HttpResponse {
   //   * no body at all for HEAD, which is a response whose headers are the
   //     answer and whose body the client is not sent.
   //   * no Content-Length for 204 and 304, which are defined not to have a
-  //     body.
+  //     body -- and no body either, which is the same rule one step further: a
+  //     handler that set a body on a 204 wrote something that cannot be sent,
+  //     and sending it anyway would leave it where the client reads the *next*
+  //     answer on a keep-alive connection. The status decides, not the handler.
   public String respond(String version, boolean keepAlive, boolean head) {
-    boolean chunked = chunkedBody && body.length() > 0
+    boolean carries = carriesBody()
+    boolean chunked = chunkedBody && body.length() > 0 && carries
     StringBuilder b = new StringBuilder()
     b.append(version.isEmpty() ? "HTTP/1.1" : version).append(" ").append(status).append(" ").append(statusText()).append("\r\n")
-    if (body.length() > 0 || carriesBody()) {
+    if (carries) {
       b.append("Content-Type: ").append(contentType).append("\r\n")
     }
     if (chunked) {
       b.append("Transfer-Encoding: chunked\r\n")
-    } else if (carriesBody()) {
+    } else if (carries) {
       b.append("Content-Length: ").append(body.length()).append("\r\n")
     }
     for (int i = 0 : i < headerNames.size() : i++) {
@@ -571,7 +586,7 @@ class HttpResponse {
     }
     b.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n")
     b.append("\r\n")
-    if (head) {
+    if (head || carries == false) {
       return b.toString()
     }
     if (chunked) {
@@ -1248,18 +1263,21 @@ class HttpServer {
       // HTTP/1.1 keeps a connection open unless either side says close, and a
       // browser sends a page and its assets down one.
       while (true) {
-        String raw = readRequest(in, out)
-        if (raw == null) {
-          return
-        }
         HttpRequest req = null
         HttpResponse res
         try {
+          // Reading and parsing are inside the same try because they refuse a
+          // request for the same reason: what arrived was not a request this
+          // server can answer. A malformed line is the parser's refusal; a body
+          // that ended before the length it promised is the reader's, and both
+          // are the client's mistake, which is a 400.
+          String raw = readRequest(in, out)
+          if (raw == null) {
+            return
+          }
           req = HttpParser.parse(raw)
           res = handle(req)
         } catch (IllegalArgumentException e) {
-          // a request the parser refuses is the client's mistake, and the status
-          // that says so is 400
           res = new HttpResponse()
           res.status = 400
           res.body = e.getMessage()
@@ -1284,6 +1302,16 @@ class HttpServer {
       }
     } catch (IOException e) {
       // a connection that failed is not a reason to stop serving
+    } catch (Exception e) {
+      // Nor is a request this server could not answer. Everything that answers
+      // a request turns its own failures into a response -- a route into a 500,
+      // a handler's result that cannot be written into one, an advice that
+      // throws into one -- and this is the backstop under all of it, because
+      // the alternative is worse than any answer: this loop is one thread that
+      // serves every client there is, so an exception that reaches here does
+      // not fail one request, it stops the server. The client gets no answer
+      // and the connection ends, which is what a request whose answer could not
+      // be built gets.
     } finally {
       s.close()
     }
@@ -1332,8 +1360,14 @@ class HttpServer {
       }
       got += n
     }
-    if (got == 0) {
-      return headText
+    // A client that promised len bytes and sent fewer -- including none at all
+    // -- sent a request that is not whole. Answering it anyway would hand a
+    // route half a document as if the client had finished writing it, which is
+    // the one answer that cannot be right: the message is incomplete, and the
+    // reader is the only place that knows it.
+    if (got < len) {
+      throw new IllegalArgumentException(
+          "the request body ended after " + got + " of " + len + " bytes")
     }
     // The head already ends with CRLF -- every line was appended with one --
     // so a single CRLF more is the blank line that ends it. Adding two, as the
@@ -1395,7 +1429,8 @@ class HttpServer {
     while (true) {
       String line = in.readLine()
       if (line == null) {
-        break
+        // the connection ended before the chunk that would have ended the body
+        throw new IllegalArgumentException("the chunked body ended before its last chunk")
       }
       int semi = line.indexOf(';')
       String size = (semi >= 0 ? line.substring(0, semi) : line).trim()
@@ -1403,11 +1438,20 @@ class HttpServer {
       try {
         n = Integer.parseInt(size, 16)
       } catch (NumberFormatException e) {
-        break
+        throw new IllegalArgumentException("not a chunk size: " + line)
       }
       if (n == 0) {
-        // the trailers end at the blank line, which is what was just read
-        in.readLine()
+        // The trailer section is as many header lines as the client sent and
+        // then a blank line. Reading one line and stopping would leave the rest
+        // of the section in the stream, where the next read takes it for the
+        // start of the next request and answers a 400 the client never asked
+        // for -- a request with one trailer would be answered twice.
+        while (true) {
+          String trailer = in.readLine()
+          if (trailer == null || trailer.isEmpty()) {
+            break
+          }
+        }
         break
       }
       byte[] buf = new byte[n]
@@ -1418,6 +1462,9 @@ class HttpServer {
           break
         }
         got += k
+      }
+      if (got < n) {
+        throw new IllegalArgumentException("the chunked body ended in a chunk of " + n + " bytes")
       }
       b.append(Net.stringFrom(buf, 0, got))
       in.readLine()
@@ -1543,15 +1590,29 @@ class HttpServer {
       // wrapped in an InvocationTargetException. The advice has to see the
       // exception the controller meant -- the one it would have seen if the
       // call had been direct -- so the wrapper comes off here.
-      Exception thrown = e
-      if (e instanceof InvocationTargetException && e.getCause() instanceof Exception) {
-        thrown = (Exception) e.getCause()
-      }
+      Exception thrown = unwrap(e)
       // what a @ControllerAdvice answers for this kind of failure, and a 500
       // when no advice does. An exception, rather than a runtime one: a route
       // that throws a checked exception, or an advice that throws while
       // answering, is still an answer the client has to get.
-      HttpResponse advised = WebAdvice.answer(ctx, thrown, req)
+      //
+      // The advice is called inside a try because "an advice that throws while
+      // answering is still an answer the client has to get" is only true if
+      // something catches it: the advice is a program's own code and can fail,
+      // and an exception leaving here would leave handle() -- which promises a
+      // response for every request, and whose caller is the connection loop,
+      // the one thread that answers every other client. A route that failed and
+      // an advice that failed while answering it is a 500 that names what the
+      // advice did.
+      HttpResponse advised = null
+      try {
+        advised = WebAdvice.answer(ctx, thrown, req)
+      } catch (Exception adviceFailure) {
+        // The advice is called reflectively too, so its own failure arrives
+        // wrapped the same way: what the client is told about is the exception
+        // the advice meant to throw, not the wrapper the call put it in.
+        thrown = unwrap(adviceFailure)
+      }
       if (advised != null) {
         out = advised
       } else {
@@ -1576,6 +1637,18 @@ class HttpServer {
     // handler built is the one whose flag is read and whose body is packed.
     out.applyGzip(req.header("Accept-Encoding"))
     return out
+  }
+
+  // unwrap is the exception a reflective call meant. A route and an advice are
+  // both called through Method.invoke, so what each of them threw arrives
+  // wrapped in an InvocationTargetException: what an advice matches its
+  // @ExceptionHandler on, and what a client is told about, is the exception
+  // inside it rather than the wrapper the call put around it.
+  private static Exception unwrap(Exception e) {
+    if (e instanceof InvocationTargetException && e.getCause() instanceof Exception) {
+      return (Exception) e.getCause()
+    }
+    return e
   }
 
   // invoke runs one route and answers what the connection writes.
@@ -1731,22 +1804,39 @@ class Application {
   // does, and it is here so that main is one line.
   public static void serve(ApplicationContext ctx, int port, int idleMs) {
     HttpServer server = new HttpServer(port, routerFrom(ctx), ctx)
-    // Spring's two properties, read the way Spring reads them: a Spring Boot
-    // application given server.ssl.certificate and
-    // server.ssl.certificate-private-key serves HTTPS, and so does this one,
-    // given --server.ssl.certificate=... on its command line (Application.boot
-    // turns those into properties). A program that names neither serves plain
-    // HTTP as it always did; naming one of them without the other is a
-    // configuration that cannot work, and the empty path it reads is the
-    // missing one -- the certificate then fails to load, which is where a
-    // certificate that is not there fails too.
+    configureServer(ctx, server)
+    WebSocketScanner.register(ctx, server)
+    server.bind()
+    server.serveIdle(idleMs == 0 ? 0 : idleMs)
+  }
+
+  /* configureServer applies the configuration that is about the server rather
+     than about a route: the certificate it presents, and how long a session
+     may sit untouched.
+
+     It is one method because there are two entry points that build a server --
+     `serve` here and SpringApplication.run in lib/33_spring.teyru -- and a
+     property that only one of them reads is a property that silently does
+     nothing on the other one. That is exactly what happened to the certificate:
+     a Boot-shaped program given --server.ssl.certificate=... served plain HTTP,
+     and nothing in its output said so: the one answer a server must never give
+     to a request to encrypt.
+
+     Spring's names, read the way Spring reads them: `server.ssl.certificate`
+     and `server.ssl.certificate-private-key` are a PEM chain and its PEM key as
+     paths, and `server.servlet.session.timeout` (with
+     `spring.web.session.timeout` as the shorter spelling this project uses
+     elsewhere) is a duration. A program that names no certificate serves plain
+     HTTP as it always did; naming one of them without the other is a
+     configuration that cannot work, and the empty path it reads is the missing
+     one -- the certificate then fails to load, which is where a certificate
+     that is not there fails too. */
+  public static void configureServer(ApplicationContext ctx, HttpServer server) {
     String certificate = ctx.getProperty("server.ssl.certificate", "")
     if (certificate.length() > 0) {
       server.ssl(certificate, ctx.getProperty("server.ssl.certificate-private-key", ""))
     }
-    WebSocketScanner.register(ctx, server)
-    server.bind()
-    server.serveIdle(idleMs == 0 ? 0 : idleMs)
+    Sessions.setTimeout(SpringApplication.sessionTimeoutSeconds(ctx))
   }
 
   // routerFrom builds the router by reading each controller's methods, which is

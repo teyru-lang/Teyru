@@ -119,6 +119,12 @@ class WebSocketFrame {
   // 125 is the largest payload a frame's own length field holds; beyond it the
   // length moves into two or eight bytes, and 126 and 127 say which.
   public static final int SHORT_MAX = 125
+  // MAX_PAYLOAD is the largest frame this server will hold. A frame's length is
+  // eight bytes on the wire, so without a limit a client asks for any amount of
+  // memory and the server hands it over -- and a message is a message, not a
+  // file: sixty-four megabytes is far past what a program should send in one
+  // frame and it is a number the server can afford to allocate for one client.
+  public static final long MAX_PAYLOAD = 64L * 1024L * 1024L
 
   public boolean fin = true
   public int opcode = TEXT
@@ -132,6 +138,16 @@ class WebSocketFrame {
   // and the payload it unmasked. The masking is what the protocol asks for from
   // a client and never from a server, and it is the same operation in both
   // directions: the four bytes repeat over the payload.
+  //
+  // A frame this server will not read is answered with null, which is the same
+  // answer the end of the stream gets: null means there is no next frame, and
+  // the connection is over either way. It is deliberately not an exception.
+  // RFC 6455 fails the connection for a frame that cannot be handled -- the
+  // protocol has no reply for a malformed frame other than the close that ends
+  // it -- and an exception thrown here would leave the connection loop, which
+  // catches only IOExceptions, and stop the thread that answers every other
+  // client. A client that can stop the server by sending eight bytes is not a
+  // client the server can refuse.
   public static WebSocketFrame read(SocketInputStream in) {
     int first = in.read()
     if (first < 0) {
@@ -147,19 +163,32 @@ class WebSocketFrame {
     boolean masked = (second & 0x80) != 0
     long len = second & 0x7f
     if (len == 126) {
-      len = ((long) in.read() << 8) | (long) in.read()
+      int hi = in.read()
+      int lo = in.read()
+      if (hi < 0 || lo < 0) {
+        return null
+      }
+      len = ((long) hi << 8) | (long) lo
     } else if (len == 127) {
       len = 0
       for (int i = 0 : i < 8 : i++) {
-        len = (len << 8) | (long) in.read()
+        int b = in.read()
+        if (b < 0) {
+          return null
+        }
+        len = (len << 8) | (long) b
       }
+    }
+    // The length is read from a client's bytes, so it is a number this server
+    // was told rather than one it can trust: a suffix of -1 from a stream that
+    // ended in the middle of a length would otherwise become a negative size,
+    // and a client could name a payload of any size it liked.
+    if (len > MAX_PAYLOAD) {
+      return null
     }
     byte[] mask = new byte[4]
     if (masked) {
       in.readFully(mask, 0, mask.length)
-    }
-    if (len < 0 || len > 64 * 1024 * 1024) {
-      throw new IllegalStateException("a WebSocket frame of " + len + " bytes is not one this server reads")
     }
     f.payload = new byte[(int) len]
     in.readFully(f.payload, 0, f.payload.length)
@@ -264,7 +293,18 @@ class WebSocketConnection {
     int opcode = 0
     handler.onOpen(session)
     while (session.isOpen()) {
-      WebSocketFrame f = WebSocketFrame.read(in)
+      WebSocketFrame f
+      try {
+        f = WebSocketFrame.read(in)
+      } catch (IOException e) {
+        // A peer that goes away in the middle of a frame is a connection that
+        // ended, which is what the peer that goes away between frames gets: the
+        // read is waiting for bytes the connection will never carry, and the
+        // close below is the same close either way. Letting the exception out
+        // would skip onClose, and a handler that holds something -- a
+        // subscriber, a counter -- would hold it for the life of the process.
+        break
+      }
       if (f == null) {
         break
       }

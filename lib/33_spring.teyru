@@ -66,8 +66,14 @@ class SpringApplication {
     }
     int port = parseIntOr(ctx.getProperty("server.port", "8080"), 8080)
     int idle = parseIntOr(ctx.getProperty("spring.web.idle-ms", "0"), 0)
-    Sessions.setTimeout(SpringApplication.sessionTimeoutSeconds(ctx))
     HttpServer server = new HttpServer(port, Application.routerFrom(ctx), ctx)
+    // Everything the configuration says about the server itself -- the
+    // certificate it presents and how long a session lives -- is applied here
+    // and in Application.serve by the same call, because the two entry points
+    // building a server differently is a bug that cannot be seen: a Boot
+    // program given a certificate served plain HTTP, silently, which is the one
+    // answer a server must never give to a request to encrypt.
+    Application.configureServer(ctx, server)
     WebSocketScanner.register(ctx, server)
     WebSocketApi.register(ctx, server)
     server.bind()
