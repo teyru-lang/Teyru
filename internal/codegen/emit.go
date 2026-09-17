@@ -527,6 +527,13 @@ func (e *Emitter) emitClassMeta(cl *ast.Class) {
 	// in an old field the first time someone forgets to update this line.
 	fmt.Fprintf(&e.data, "static tyclass cls_%s = {\n", mangle(cl.Full))
 	fmt.Fprintf(&e.data, "  .name = %q, .id = %d, .flags = %s,\n", cl.Full, cl.ID, flagsExpr)
+	// The name the class reports where a program is shown one: for a
+	// standard-library class, the JDK class it stands in for (decision D8), and
+	// nothing at all when the two names are the same -- the runtime reads a
+	// null as "named as it is" (ty_class_jname).
+	if j := util.JavaName(cl.Full); j != cl.Full {
+		fmt.Fprintf(&e.data, "  .jname = %q,\n", j)
+	}
 	fmt.Fprintf(&e.data, "  .super = %s, .niface = %d, .ifaces = if_%s,\n", sup, len(cl.Ifaces), mangle(cl.Full))
 	fmt.Fprintf(&e.data, "  .nvt = %d, .vtable = vt_%s, .clinit = %s,\n", len(cl.VTable), mangle(cl.Full), clinit)
 	fmt.Fprintf(&e.data, "  .isize = %d, .isel = %d, .imap = %s,\n", int(off), imapLen, imapName)

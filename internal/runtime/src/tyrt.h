@@ -218,6 +218,14 @@ struct tyclass {
   /* reflection: the annotations written on the class itself */
   const tyannotation *annos;
   int32_t nannos;
+  /* The name this class reports where a program is shown a class name -- D8 of
+     the fix plan: the JDK class it stands in for, so the string class reports
+     "java.lang.String" rather than "teyru.String". NULL when the two names are
+     the same, which is every class a program declares itself, and the generated
+     code writes it only for the standard library's classes. `name` stays the
+     binary name: that is what Class.forName looks a class up by, and a program
+     may write either spelling there. */
+  const char *jname;
 };
 
 /* Class handles installed by generated startup code. */
@@ -828,6 +836,9 @@ void ty_unimplemented(const char *what) __attribute__((noreturn));
 /* ---- prelude helpers --------------------------------------------------- */
 void ty_clinit(tyclass *c);
 void *ty_class_of(void *o);
+/* The name a class reports: the JDK name of the class it stands in for, or its
+   own binary name when it has none. NULL answers "?". */
+const char *ty_class_jname(const tyclass *k);
 tystr *ty_class_name(void *c);
 
 /* ---- reflection ---------------------------------------------------------

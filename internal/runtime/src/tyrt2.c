@@ -175,13 +175,18 @@ void *ty_class_of(void *o) { return o ? (void *)(((tyobj *)o)->cls) : NULL; }
    `(tyobj*)&cls_teyru_String`), which is the tyclass itself. The wrapper's own
    class tells the two apart: a tyclass's first word is its name, and a name
    can never be the address of the generated Class struct. */
+const char *ty_class_jname(const tyclass *k) {
+  if (!k) return "?";
+  return k->jname ? k->jname : k->name;
+}
+
 tystr *ty_class_name(void *c) {
   if (!c) return NULL;
   if (ty_class_cls && ((tyobj *)c)->cls == ty_class_cls) {
     tyclass *k = ((tyclassobj *)c)->target;
-    return k ? ty_str_intern(k->name) : NULL;
+    return k ? ty_str_intern(ty_class_jname(k)) : NULL;
   }
-  return ty_str_intern(((tyclass *)c)->name);
+  return ty_str_intern(ty_class_jname((tyclass *)c));
 }
 
 tystr *ty_str_ident(tystr *s) { return s; }
@@ -259,6 +264,42 @@ int64_t ty_millis(void) { return typlat_realtime_ms(); }
 int64_t ty_nanos(void) { return typlat_monotonic_ns(); }
 void ty_exit(int32_t code) { exit(code); }
 
+/* Names an array's element type the way Java's arraycopy message does, which is
+   the only place Java spells an array type out in a message. Java names every
+   primitive array after its element -- "long[]", "char[]" -- and *every* array
+   of references "object array[]", whatever its component type is: measured on
+   JDK 21, copying a String[], an Integer[] or an int[][] into a long[] all answer
+   "can not copy object array[] into long[]". So the component class is needed
+   for primitives only.
+
+   An array the runtime built for itself records no element class (see
+   ty_alloc_arr), and the only primitive ones it builds are the char[]
+   String.toCharArray and the byte[] String.getBytes hand out; the reflection
+   path records the component class it was given and generated code records the
+   element class of every array it makes. An element size of one or two bytes
+   with no element class is those two, and any other size with no element class
+   is one this does not have a name for: it answers 0 and the caller says what
+   it can instead of guessing a type. */
+static int arr_elem_name(tyarr *a, char *out, size_t n) {
+  if (a->refs) {
+    snprintf(out, n, "object array[]");
+    return 1;
+  }
+  if (a->elemcls) {
+    snprintf(out, n, "%s[]", ty_class_jname(a->elemcls));
+    return 1;
+  }
+  if (a->esize == 1) {
+    snprintf(out, n, "byte[]");
+    return 1;
+  }
+  if (a->esize == 2) {
+    snprintf(out, n, "char[]");
+    return 1;
+  }
+  return 0;
+}
+
 void ty_arraycopy(void *src, int32_t spos, void *dst, int32_t dpos, int32_t len) {
   tyarr *a = (tyarr *)src, *b = (tyarr *)dst;
   if (!a || !b) ty_throw((tyobj *)ty_npe());
@@ -269,8 +310,24 @@ void ty_arraycopy(void *src, int32_t spos, void *dst, int32_t dpos, int32_t len)
   /* Java requires the two arrays to have the same element type: copying a
      long[] into a byte[] is an ArrayStoreException. Without this test the copy
      below would take its byte count from the source element size and write
-     past the end of the destination. */
-  if (a->esize != b->esize || a->refs != b->refs) ty_throw((tyobj *)ty_arraystore());
+     past the end of the destination.
+
+     The message is Java's, and it names both element types: "arraycopy: type
+     mismatch: can not copy long[] into byte[]". What each side is called, and
+     the fact that Java names a primitive array after its element and *every*
+     reference array "object array[]", is arr_elem_name's business above. When
+     neither of the two arrays can be named -- neither is one the runtime built
+     without an element class -- the sentence falls back to naming the
+     disagreement rather than one of the types, because a name that is not the
+     array's would be worse than none. */
+  if (a->esize != b->esize || a->refs != b->refs) {
+    char src[160], dst[160], msg[352];
+    if (arr_elem_name(a, src, sizeof src) && arr_elem_name(b, dst, sizeof dst)) {
+      snprintf(msg, sizeof msg, "arraycopy: type mismatch: can not copy %s into %s", src, dst);
+      ty_throw(ty_make_ex(TY_ARRAYSTORE, msg));
+    }
+    ty_throw((tyobj *)ty_arraystore());
+  }
   memmove((char *)b->data + (size_t)dpos * b->esize, (char *)a->data + (size_t)spos * a->esize,
           (size_t)len * a->esize);
 }

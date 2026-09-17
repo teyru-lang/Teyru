@@ -7,6 +7,7 @@ import (
 
 	"github.com/teyru-lang/Teyru/internal/ast"
 	"github.com/teyru-lang/Teyru/internal/source"
+	"github.com/teyru-lang/Teyru/internal/util"
 )
 
 // printer turns a program into Java text. It collects the imports the JDK
@@ -93,7 +94,7 @@ func (p *printer) name(pos source.Pos, s string) string {
 		p.refuse(pos, "the standard library class "+s, reason)
 		return s
 	}
-	if fqn, ok := javaOf[s]; ok {
+	if fqn, ok := util.JavaClassOf(s); ok {
 		return p.imported(fqn)
 	}
 	return s
