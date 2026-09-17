@@ -1876,20 +1876,10 @@ tystr *ty_str_of_obj(void *o) {
   return ((tystr *(*)(void *))((tyobj *)o)->cls->vtable[0])(o);
 }
 
-tystr *ty_str_upper(tystr *s) {
-  if (!s) return NULL;
-  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
-  for (int64_t i = 0; i < r->blen; i++)
-    if (TY_STR_DATA(r)[i] >= 'a' && TY_STR_DATA(r)[i] <= 'z') TY_STR_DATA(r)[i] -= 32;
-  return r;
-}
-tystr *ty_str_lower(tystr *s) {
-  if (!s) return NULL;
-  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
-  for (int64_t i = 0; i < r->blen; i++)
-    if (TY_STR_DATA(r)[i] >= 'A' && TY_STR_DATA(r)[i] <= 'Z') TY_STR_DATA(r)[i] += 32;
-  return r;
-}
+/* ty_str_upper and ty_str_lower are not here: a case conversion is a question
+   about code points and, for the final sigma, about the word a code point sits
+   in, so both are defined beside the Unicode tables they read (see
+   "the case mappings of a String", further down). */
 tystr *ty_str_trim(tystr *s) {
   if (!s) return NULL;
   int64_t a = 0, b = s->blen;
@@ -2539,52 +2529,321 @@ int64_t ty_rem_long(int64_t a, int64_t b) {
 
 /* ------------------------------------------------------------- Character */
 
-/* Classification is ASCII, and it is deliberately not <ctype.h>: those
-   functions answer for the current locale, and a Teyru char is one byte of a
-   UTF-8 string, so the answer a program gets must not depend on LC_CTYPE. Java
-   classifies the whole of Unicode; a byte-oriented runtime can be exact for
-   ASCII, which is the part a program is normally asking about. */
+/* Classification, and the case mapping of one code point.
+
+   Every answer here is the JDK's, and the JDK's answers are Unicode's: the
+   tables of tyrt_unicode.c are generated from Unicode 15.0.0's own data files
+   (internal/tools/genunicode), and what this section adds is the mapping from
+   those tables onto java.lang.Character -- which categories a predicate is,
+   which property bits a predicate is, and the two case conversions that are
+   about a whole string rather than about one code point.
+
+   It is deliberately not <ctype.h>: those functions answer for the current
+   locale, and the answer a program gets must not depend on LC_CTYPE. Nor is it
+   a range of ASCII any more: the classification of a code point above the BMP
+   is answered as exactly as the classification of 'a', which is what Java does
+   and what a program comparing two strings from different scripts needs. */
 #define TY_ASCII_UPPER(c) ((c) >= 'A' && (c) <= 'Z')
 #define TY_ASCII_LOWER(c) ((c) >= 'a' && (c) <= 'z')
 #define TY_ASCII_DIGIT(c) ((c) >= '0' && (c) <= '9')
 #define TY_ASCII_ALPHA(c) (TY_ASCII_UPPER(c) || TY_ASCII_LOWER(c))
-#define TY_ASCII_ALNUM(c) (TY_ASCII_ALPHA(c) || TY_ASCII_DIGIT(c))
 
-/* The whitespace strip() strips and isWhitespace() accepts, which in Java are
-   the same set: space, the five control characters 0x09..0x0D, and the four
-   information separators 0x1C..0x1F. It is deliberately not the set trim()
-   strips -- trim takes every byte <= ' ', which is a strictly larger set -- and
-   the two must not be confused, since Java keeps them apart. */
-int32_t ty_is_whitespace(uint16_t c) {
-  return c == ' ' || (c >= 9 && c <= 13) || (c >= 0x1C && c <= 0x1F);
+/* The letters are Lu, Ll, Lt, Lm and Lo, which are the five categories the
+   general category numbers 1..5 -- a fact about how the table was written
+   (genunicode numbers them as Character's constants are numbered), not about
+   which characters they are. */
+#define TY_CAT_IS_LETTER(t) ((t) >= TY_UC_UPPERCASE_LETTER && (t) <= TY_UC_OTHER_LETTER)
+
+int32_t ty_char_type(int32_t cp) { return ty_uc_category(cp); }
+int32_t ty_is_letter(int32_t cp) { return TY_CAT_IS_LETTER(ty_uc_category(cp)); }
+int32_t ty_is_digit(int32_t cp) { return ty_uc_category(cp) == TY_UC_DECIMAL_DIGIT_NUMBER; }
+int32_t ty_is_letter_or_digit(int32_t cp) { return ty_is_letter(cp) || ty_is_digit(cp); }
+/* Alphabetic is the letters, the letter numbers and Other_Alphabetic, which is
+   the combining marks and modifier letters of the scripts that write a vowel
+   with one: U+0345 COMBINING GREEK YPOGEGRAMMENI is alphabetic and is not a
+   letter. */
+int32_t ty_is_alphabetic(int32_t cp) {
+  return ty_is_letter(cp) || ty_uc_category(cp) == TY_UC_LETTER_NUMBER ||
+         (ty_uc_props(cp) & TY_UC_OTHER_ALPHABETIC) != 0;
 }
-int32_t ty_is_letter_or_digit(uint16_t c) { return TY_ASCII_ALNUM(c); }
-int32_t ty_is_alphabetic(uint16_t c) { return TY_ASCII_ALPHA(c); }
-int32_t ty_is_upper_case(uint16_t c) { return TY_ASCII_UPPER(c); }
-int32_t ty_is_lower_case(uint16_t c) { return TY_ASCII_LOWER(c); }
-int32_t ty_char_upper(uint16_t c) { return TY_ASCII_LOWER(c) ? c - 32 : c; }
-int32_t ty_char_lower(uint16_t c) { return TY_ASCII_UPPER(c) ? c + 32 : c; }
+/* Uppercase and lowercase are their categories plus Other_Uppercase and
+   Other_Lowercase: U+2160 ROMAN NUMERAL ONE is uppercase and U+02B0 MODIFIER
+   LETTER SMALL H is lowercase, and neither is an Lu or an Ll. */
+int32_t ty_is_upper_case(int32_t cp) {
+  return ty_uc_category(cp) == TY_UC_UPPERCASE_LETTER || (ty_uc_props(cp) & TY_UC_OTHER_UPPERCASE) != 0;
+}
+int32_t ty_is_lower_case(int32_t cp) {
+  return ty_uc_category(cp) == TY_UC_LOWERCASE_LETTER || (ty_uc_props(cp) & TY_UC_OTHER_LOWERCASE) != 0;
+}
+int32_t ty_is_title_case(int32_t cp) { return ty_uc_category(cp) == TY_UC_TITLECASE_LETTER; }
+/* Whether a character carries case at all, which the Final_Sigma condition of
+   the lowercase mapping asks: Character.isCased is these three categories plus
+   the two Other_* properties, and nothing else. */
+static int uc_is_cased(int32_t cp) {
+  return ty_is_upper_case(cp) || ty_is_lower_case(cp) || ty_is_title_case(cp);
+}
+/* The whitespace strip() strips and isWhitespace() accepts, which in Java are
+   the same set. It is the White_Space property with the JDK's four exceptions
+   and its four additions (genunicode says which), and it is deliberately not
+   the set trim() strips -- trim takes every code unit <= ' ', which is a
+   strictly larger set -- and the two must not be confused, since Java keeps
+   them apart. */
+int32_t ty_is_whitespace(int32_t cp) { return (ty_uc_props(cp) & TY_UC_WHITE_SPACE) != 0; }
+/* isSpaceChar is the three separator categories and not the whitespace set:
+   U+00A0 NO-BREAK SPACE is a space character and is not whitespace, and U+001C
+   is whitespace and is not a space character. */
+int32_t ty_is_space_char(int32_t cp) {
+  int32_t t = ty_uc_category(cp);
+  return t == TY_UC_SPACE_SEPARATOR || t == TY_UC_LINE_SEPARATOR || t == TY_UC_PARAGRAPH_SEPARATOR;
+}
+int32_t ty_is_defined(int32_t cp) {
+  return cp >= 0 && cp <= 0x10FFFF && ty_uc_category(cp) != TY_UC_UNASSIGNED;
+}
+/* Character.toUpperCase(int), toLowerCase(int) and toTitleCase(int) are the
+   *simple* mapping: one code point in, one code point out, and a character with
+   no mapping of its own answers with itself -- U+00DF LATIN SMALL LETTER SHARP
+   S is unchanged by toUpperCase, and the two characters it becomes in a string
+   are a question about the string (see below). */
+int32_t ty_char_upper(int32_t cp) { return ty_uc_case(cp, 0); }
+int32_t ty_char_lower(int32_t cp) { return ty_uc_case(cp, 1); }
+int32_t ty_char_title(int32_t cp) { return ty_uc_case(cp, 2); }
 int32_t ty_char_compare(uint16_t a, uint16_t b) { return a < b ? -1 : (a > b ? 1 : 0); }
 tystr *ty_char_tostr_val(uint16_t c) { return ty_str_of_char(c); }
 int32_t ty_char_hash_val(uint16_t c) { return (int32_t)c; }
 
-/* Java's getNumericValue answers the value of a digit in any radix up to 36,
-   -1 for a character that is not one, and -2 for a character that has a
-   numeric value which is not a digit -- the byte-oriented runtime answers -1
-   where Java answers -2, because there is no such character below 0x80. */
-int32_t ty_char_numeric(uint16_t c) {
-  if (TY_ASCII_DIGIT(c)) return c - '0';
-  if (TY_ASCII_UPPER(c)) return c - 'A' + 10;
-  if (TY_ASCII_LOWER(c)) return c - 'a' + 10;
-  return -1;
-}
-/* digit() asks the same question but with a radix, and answers -1 for a digit
-   that is out of the radix as well as for a character that is not a digit. */
-int32_t ty_char_digit(uint16_t c, int32_t radix) {
+/* Java's getNumericValue answers the numeric value of a numeral (U+216B ROMAN
+   NUMERAL TWELVE is 12), the value of a digit in any radix up to 36, -1 for a
+   character with neither, and -2 for a character whose numeric value is not a
+   non-negative int -- U+00BD VULGAR FRACTION ONE HALF and U+16B60, whose value
+   is 10^10. */
+int32_t ty_char_numeric(int32_t cp) { return ty_uc_numeric_value(cp); }
+/* digit() asks the same question with a radix, and answers -1 for a value that
+   is not below the radix as well as for a character that is not a digit: 'f' is
+   a digit in radix 16 (15) and is not one in radix 10. A radix outside 2..36
+   has no digits at all. */
+int32_t ty_char_digit(int32_t cp, int32_t radix) {
+  int32_t v;
   if (radix < 2 || radix > 36) return -1;
-  int32_t v = ty_char_numeric(c);
+  v = ty_uc_digit_value(cp);
   return (v < 0 || v >= radix) ? -1 : v;
 }
+
+/* ------------------------------------------ the case mappings of a String */
+
+/* A string's case conversion is not the case conversion of each of its code
+   points, in three ways.
+
+     - A code point can map to more than one. U+00DF LATIN SMALL LETTER SHARP S
+       uppercases to "SS", U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE
+       lowercases to "i" and a combining dot above, and the ligatures expand
+       the same way. Those mappings are SpecialCasing.txt's, and the ones read
+       here are its unconditional entries: the rest are conditioned on a
+       language (Turkish, Azeri, Lithuanian), and there is no locale here to
+       condition on.
+     - U+03A3 GREEK CAPITAL LETTER SIGMA lowercases to U+03C2 the final form
+       when it ends a cased word and to U+03C3 otherwise. That is the one
+       conditional mapping that is not about a language, and the JDK applies it
+       for every locale: "ΟΔΟΣ".toLowerCase() ends in the final form.
+     - A supplementary character is one character: it is two code units, and
+       folding the units would leave both of them alone.
+
+   So the walk is over code points, and each one is asked for its full mapping
+   rather than its simple one. */
+
+/* Whether a code point can be inside a word, which is what the Final_Sigma
+   condition is about. The letters, the digits and the marks can; an ideographic
+   character cannot, because Java's word iterator breaks a run of them into one
+   word each -- which is why the sigma of "ΑΣ中Α" is final here and in the JDK. */
+static int uc_word_char(int32_t cp) {
+  if ((ty_uc_props(cp) & TY_UC_IDEOGRAPHIC) != 0) return 0;
+  switch (ty_uc_category(cp)) {
+    case TY_UC_UPPERCASE_LETTER:
+    case TY_UC_LOWERCASE_LETTER:
+    case TY_UC_TITLECASE_LETTER:
+    case TY_UC_MODIFIER_LETTER:
+    case TY_UC_OTHER_LETTER:
+    case TY_UC_DECIMAL_DIGIT_NUMBER:
+    case TY_UC_LETTER_NUMBER:
+    case TY_UC_OTHER_NUMBER:
+    case TY_UC_NON_SPACING_MARK:
+    case TY_UC_COMBINING_SPACING_MARK:
+    case TY_UC_ENCLOSING_MARK:
+      return 1;
+    default:
+      return 0;
+  }
+}
+/* The punctuation a word continues through. This set is measured against the
+   JDK rather than read off UAX #29, because the JDK's word iterator is its own
+   rule-based one and is not UAX #29: it keeps a hyphen inside a word, it joins
+   through a period or an apostrophe only when a letter is on both sides, and it
+   breaks at a middle dot or a comma. See AGENTS.md §10 for what the difference
+   is measured to be. */
+static int uc_joins(int32_t cp) {
+  return cp == '"' || cp == '\'' || cp == '-' || cp == '.' || cp == 0xAD ||
+         ty_uc_category(cp) == TY_UC_CONNECTOR_PUNCTUATION;
+}
+/* A mark or a format character attaches to the character before it and so can
+   never be a word boundary itself. U+200D ZERO WIDTH JOINER is one of these,
+   which is why a word continues across it. */
+static int uc_transparent(int32_t cp) {
+  switch (ty_uc_category(cp)) {
+    case TY_UC_NON_SPACING_MARK:
+    case TY_UC_COMBINING_SPACING_MARK:
+    case TY_UC_ENCLOSING_MARK:
+    case TY_UC_FORMAT:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* The code points of a string, by unit index. codePointAt and codePointBefore
+   in tyrt.h raise on an index outside the string; these are for callers that
+   have already established the index is inside it. */
+static int32_t uc_cp_at(tystr *s, int64_t i) {
+  uint16_t c = str_unit_at(s, i);
+  if (unit_is_high(c) && i + 1 < s->ulen) {
+    uint16_t d = str_unit_at(s, i + 1);
+    if (unit_is_low(d)) return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+  }
+  return c;
+}
+static int32_t uc_cp_before(tystr *s, int64_t i) {
+  uint16_t c = str_unit_at(s, i - 1);
+  if (unit_is_low(c) && i >= 2) {
+    uint16_t d = str_unit_at(s, i - 2);
+    if (unit_is_high(d)) return 0x10000 + ((d - 0xD800) << 10) + (c - 0xDC00);
+  }
+  return c;
+}
+static int64_t uc_cp_len(tystr *s, int64_t i) {
+  uint16_t c = str_unit_at(s, i);
+  return (unit_is_high(c) && i + 1 < s->ulen && unit_is_low(str_unit_at(s, i + 1))) ? 2 : 1;
+}
+/* The unit index of the character before i, with everything that attaches to it
+   skipped: the base character is what a word boundary is decided between. */
+static int64_t uc_base_before(tystr *s, int64_t i) {
+  int64_t j = i - 1;
+  while (j > 0 && uc_transparent(uc_cp_before(s, j + 1))) j--;
+  return j;
+}
+/* The unit index of the character after the one starting at i, with everything
+   that attaches to it skipped. */
+static int64_t uc_base_after(tystr *s, int64_t i) {
+  int64_t j = i + uc_cp_len(s, i);
+  while (j < s->ulen && uc_transparent(uc_cp_at(s, j))) j += uc_cp_len(s, j);
+  return j;
+}
+
+/* No word boundary at unit position i, which is between the characters on
+   either side of it. Only the positions inside the string are asked about: the
+   two ends are boundaries, and the callers say so by their loop conditions. */
+static int str_no_boundary(tystr *s, int64_t i) {
+  int32_t c1, c2;
+  int64_t j, k;
+  if (i <= 0 || i >= s->ulen) return 0;
+  c2 = uc_cp_at(s, i);
+  if (uc_transparent(c2)) return 1;
+  j = uc_base_before(s, i);
+  c1 = uc_cp_at(s, j);
+  if (uc_word_char(c1) && uc_word_char(c2)) return 1;
+  if (uc_joins(c1) && TY_CAT_IS_LETTER(ty_uc_category(c2))) {
+    k = uc_base_before(s, j);
+    if (k < j && TY_CAT_IS_LETTER(ty_uc_category(uc_cp_at(s, k)))) return 1;
+  }
+  if (TY_CAT_IS_LETTER(ty_uc_category(c1)) && uc_joins(c2)) {
+    k = uc_base_after(s, i);
+    if (k < s->ulen && TY_CAT_IS_LETTER(ty_uc_category(uc_cp_at(s, k)))) return 1;
+  }
+  return 0;
+}
+
+/* Java's Final_Sigma condition, which is what decides whether U+03A3 is the
+   final form: the character at unit index `index` is final-cased when there is
+   a cased character before it in its word and none after it in the same word.
+   The JDK asks this of its BreakIterator; str_no_boundary is what answers here,
+   and what it does not reproduce is recorded in AGENTS.md §10. */
+static int str_final_cased(tystr *s, int64_t index) {
+  int64_t i = index;
+  while (i > 0 && str_no_boundary(s, i)) {
+    if (uc_is_cased(uc_cp_before(s, i))) {
+      int64_t j = index + uc_cp_len(s, index);
+      while (j < s->ulen && str_no_boundary(s, j)) {
+        if (uc_is_cased(uc_cp_at(s, j))) return 0;
+        j += uc_cp_len(s, j);
+      }
+      return 1;
+    }
+    i = uc_base_before(s, i);
+  }
+  return 0;
+}
+
+/* The full case mapping of the character starting at unit `at`, written to out
+   as code points: the number written is returned, and it is never more than
+   TY_UC_MAX_EXPANSION. */
+static int32_t str_case_of(tystr *s, int64_t at, int32_t upper, int32_t *out) {
+  int32_t cp = uc_cp_at(s, at);
+  int32_t n;
+  if (!upper && cp == 0x3A3) {
+    out[0] = str_final_cased(s, at) ? 0x3C2 : 0x3C3;
+    return 1;
+  }
+  n = ty_uc_special(cp, upper, out, TY_UC_MAX_EXPANSION);
+  if (n > 0) return n;
+  out[0] = ty_uc_case(cp, upper ? 0 : 1);
+  return 1;
+}
+
+/* The case conversion of a whole string. An ASCII string is mapped byte by byte
+   in place: no code point below U+0080 has a full case mapping, so the
+   arithmetic is the whole answer, and it is what nearly every call wants. */
+static tystr *str_case(tystr *s, int32_t upper) {
+  int32_t buf[TY_UC_MAX_EXPANSION];
+  int64_t at, i, units = 0, k = 0;
+  uint16_t *tmp;
+  tystr *r;
+  if (TY_STR_ASCII(s)) {
+    r = ty_str_new(TY_STR_DATA(s), s->blen);
+    for (at = 0; at < r->blen; at++) {
+      unsigned char c = (unsigned char)TY_STR_DATA(r)[at];
+      if (upper) {
+        if (c >= 'a' && c <= 'z') TY_STR_DATA(r)[at] = (char)(c - 32);
+      } else if (c >= 'A' && c <= 'Z') {
+        TY_STR_DATA(r)[at] = (char)(c + 32);
+      }
+    }
+    return r;
+  }
+  /* The answer is a string, and a string is allocated once: the units are
+     counted first, then written. An expansion can be longer than what it
+     expands, which is why the count is not the input's. */
+  for (at = 0; at < s->ulen;) {
+    int32_t n = str_case_of(s, at, upper, buf);
+    for (i = 0; i < n; i++) units += buf[i] >= 0x10000 ? 2 : 1;
+    at += uc_cp_len(s, at);
+  }
+  tmp = (uint16_t *)malloc((size_t)(units > 0 ? units : 1) * sizeof(uint16_t));
+  for (at = 0; at < s->ulen;) {
+    int32_t n = str_case_of(s, at, upper, buf);
+    for (i = 0; i < n; i++) {
+      if (buf[i] >= 0x10000) {
+        int32_t v = buf[i] - 0x10000;
+        tmp[k++] = (uint16_t)(0xD800 + (v >> 10));
+        tmp[k++] = (uint16_t)(0xDC00 + (v & 0x3FF));
+      } else {
+        tmp[k++] = (uint16_t)buf[i];
+      }
+    }
+    at += uc_cp_len(s, at);
+  }
+  r = ty_str_of_units(tmp, units);
+  free(tmp);
+  return r;
+}
+tystr *ty_str_upper(tystr *s) { return s ? str_case(s, 1) : NULL; }
+tystr *ty_str_lower(tystr *s) { return s ? str_case(s, 0) : NULL; }
 
 /* ---------------------------------------------------- the wrappers' values */
 
@@ -2801,26 +3060,42 @@ int32_t ty_box_equals(void *a, void *b) {
 
 /* -------------------------------------------------------------- parsing */
 
+/* The code unit at index i, with the ASCII case answered from the string's own
+   bytes: the parsers walk a string one unit at a time, and the strings they are
+   handed are nearly always ASCII, where a unit index is a byte index. */
+static int32_t str_unit_fast(tystr *s, int64_t i) {
+  if (TY_STR_ASCII(s)) return (unsigned char)TY_STR_DATA(s)[i];
+  return (int32_t)str_unit_at(s, i);
+}
+
 /* The digit loop of Java's parsers, written the JDK's way: the accumulator is
    negative and the limit is the type's minimum, so that the most negative value
    of a type needs no special case, and every overflow test is a comparison
    before the operation that would overflow rather than after it. 0 means Java's
    parser would reject the string: an empty string, a lone sign, a digit outside
-   the radix, or a value that does not fit the type. */
-static int parse_int(const char *d, int64_t n, int32_t radix, int64_t limit_pos,
-                     int64_t limit_neg, int64_t *out) {
+   the radix, or a value that does not fit the type.
+
+   It walks code units and asks Character.digit about each one, which is what
+   Java's parser does -- so "１２３" is 123, since U+FF11 is a decimal digit, and
+   an OSMANYA digit above the BMP is not a number, since Java reads its two
+   surrogate units as two characters that are not digits. */
+static int parse_int(tystr *s, int32_t radix, int64_t limit_pos, int64_t limit_neg,
+                     int64_t *out) {
+  int64_t n = s->ulen;
   int64_t i = 0, result = 0, limit = limit_pos, multmin;
   int neg = 0;
+  int32_t first;
   if (n <= 0 || radix < 2 || radix > 36) return 0;
-  if (d[0] < '0') {
-    if (d[0] == '-') { neg = 1; limit = limit_neg; }
-    else if (d[0] != '+') return 0;
+  first = str_unit_fast(s, 0);
+  if (first < '0') {
+    if (first == '-') { neg = 1; limit = limit_neg; }
+    else if (first != '+') return 0;
     if (n == 1) return 0;
     i = 1;
   }
   multmin = limit / radix;
   for (; i < n; i++) {
-    int32_t digit = ty_char_digit((unsigned char)d[i], radix);
+    int32_t digit = ty_char_digit(str_unit_fast(s, i), radix);
     if (digit < 0 || result < multmin) return 0;
     result *= radix;
     if (result < limit + digit) return 0;
@@ -2832,12 +3107,12 @@ static int parse_int(const char *d, int64_t n, int32_t radix, int64_t limit_pos,
 int32_t ty_str_parsable_int(tystr *s, int32_t radix) {
   int64_t v;
   if (!s) return 0;
-  return parse_int(TY_STR_DATA(s), s->blen, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
+  return parse_int(s, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
 }
 int64_t ty_str_parsable_long(tystr *s, int32_t radix) {
   int64_t v;
   if (!s) return 0;
-  return parse_int(TY_STR_DATA(s), s->blen, radix, -INT64_MAX, INT64_MIN, &v);
+  return parse_int(s, radix, -INT64_MAX, INT64_MIN, &v);
 }
 /* The two conversions below run only on a string the parsable test above has
    already accepted, so the failure return is unreachable and the value is the
@@ -2848,13 +3123,13 @@ int64_t ty_str_parsable_long(tystr *s, int32_t radix) {
 int32_t ty_str_toint_radix(tystr *s, int32_t radix) {
   int64_t v = 0;
   if (!s) ty_npe();
-  parse_int(TY_STR_DATA(s), s->blen, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
+  parse_int(s, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
   return (int32_t)v;
 }
 int64_t ty_str_tolong_radix(tystr *s, int32_t radix) {
   int64_t v = 0;
   if (!s) ty_npe();
-  parse_int(TY_STR_DATA(s), s->blen, radix, -INT64_MAX, INT64_MIN, &v);
+  parse_int(s, radix, -INT64_MAX, INT64_MIN, &v);
   return v;
 }
 
@@ -2900,6 +3175,14 @@ static int parsable_hex_part(const char *d, int64_t i, int64_t end) {
 }
 static int parsable_float_str(const char *d, int64_t n) {
   int64_t i = 0, end = n;
+  /* Double.parseDouble and Float.parseFloat ignore leading and trailing
+     whitespace, "as if by the String.trim() method": every code unit <= ' ' at
+     either end and nothing else, so a U+00A0 is not whitespace to them and is
+     refused below. The conversion itself needs no trimming -- strtod skips the
+     leading whitespace and stops at the trailing whitespace -- so only this
+     grammar test has to look past it. */
+  while (i < end && (unsigned char)d[i] <= ' ') i++;
+  while (end > i && (unsigned char)d[end - 1] <= ' ') end--;
   if (i < n && (d[i] == '+' || d[i] == '-')) i++;
   if (n - i == 3 && memcmp(d + i, "NaN", 3) == 0) return 1;
   if (n - i == 8 && memcmp(d + i, "Infinity", 8) == 0) return 1;
@@ -2926,33 +3209,58 @@ float ty_str_tofloat_val(tystr *s) { return s ? strtof(TY_STR_DATA(s), NULL) : 0
 
 /* --------------------------------------------------------------- String */
 
-/* compareToIgnoreCase and equalsIgnoreCase fold each *code unit* the way Java
-   does -- Character.toLowerCase(Character.toUpperCase(c)), which is not the
-   same as lowercasing once -- and compare the results. They index by unit
-   because a string is a sequence of units: folding the bytes of a UTF-8
-   encoding of CJK lowers nothing and lines the two strings up by byte. */
-int32_t ty_str_cmp_ic(tystr *a, tystr *b) {
-  int64_t i, n;
-  if (!a || !b) ty_npe();
-  n = a->ulen < b->ulen ? a->ulen : b->ulen;
-  if (TY_STR_ASCII(a) && TY_STR_ASCII(b)) {
-    const char *da = TY_STR_DATA(a), *db = TY_STR_DATA(b);
-    for (i = 0; i < n; i++) {
-      int32_t x = ty_char_lower(ty_char_upper((unsigned char)da[i]));
-      int32_t y = ty_char_lower(ty_char_upper((unsigned char)db[i]));
-      if (x != y) return x - y;
+/* The case-insensitive comparisons: compareToIgnoreCase, equalsIgnoreCase and
+   regionMatches(ignoreCase,...) are Java's algorithm, which is a unit at a time
+   first -- what nearly every comparison is, and it needs no index arithmetic --
+   and only where two units differ does it look for the supplementary character
+   one of them may be half of, because "𐐨" and "𐐀" are one character each and
+   folding their two units would leave both alone. */
+/* Java's compareCodePointCI: the difference between two folded code points, 0
+   when they are equal ignoring case. The fold is two steps -- uppercase first
+   and lowercase of *that* -- and the two steps are not the same as lowercasing
+   once: the dotless i (U+0131) and 'i' are equal here because both uppercase to
+   'I', and neither lowercases to the other. */
+static int32_t uc_cmp_ci(int32_t a, int32_t b) {
+  int32_t ua, ub;
+  if (a == b) return 0;
+  ua = ty_char_upper(a);
+  ub = ty_char_upper(b);
+  if (ua == ub) return 0;
+  ua = ty_char_lower(ua);
+  ub = ty_char_lower(ub);
+  return ua - ub;
+}
+/* Java's codePointIncluding: the code point the unit at `index` is part of,
+   within the range [start, end) of the comparison, negated when the unit turned
+   out to be one half of it -- the caller then walks one unit further. */
+static int32_t str_cp_including(tystr *s, int32_t unit, int64_t index, int64_t start, int64_t end) {
+  if (unit_is_high(unit)) {
+    if (index + 1 < end) {
+      uint16_t c = str_unit_at(s, index + 1);
+      if (unit_is_low(c)) return -(0x10000 + ((unit - 0xD800) << 10) + (c - 0xDC00));
     }
-  } else {
-    tyucur ca, cb;
-    ucur_init(&ca, a);
-    ucur_init(&cb, b);
-    for (i = 0; i < n; i++) {
-      int32_t x = ty_char_lower(ty_char_upper(ucur_next(&ca)));
-      int32_t y = ty_char_lower(ty_char_upper(ucur_next(&cb)));
-      if (x != y) return x - y;
-    }
+  } else if (unit_is_low(unit) && index > start) {
+    uint16_t c = str_unit_at(s, index - 1);
+    if (unit_is_high(c)) return -(0x10000 + ((c - 0xD800) << 10) + (unit - 0xDC00));
   }
-  return (int32_t)(a->ulen - b->ulen);
+  return unit;
+}
+int32_t ty_str_cmp_ic(tystr *a, tystr *b) {
+  int64_t k1, k2, tlast, olast;
+  if (!a || !b) ty_npe();
+  tlast = a->ulen;
+  olast = b->ulen;
+  for (k1 = 0, k2 = 0; k1 < tlast && k2 < olast; k1++, k2++) {
+    int32_t cp1 = str_unit_fast(a, k1), cp2 = str_unit_fast(b, k2), diff;
+    if (cp1 == cp2 || uc_cmp_ci(cp1, cp2) == 0) continue;
+    cp1 = str_cp_including(a, cp1, k1, 0, tlast);
+    if (cp1 < 0) { k1++; cp1 = -cp1; }
+    cp2 = str_cp_including(b, cp2, k2, 0, olast);
+    if (cp2 < 0) { k2++; cp2 = -cp2; }
+    diff = uc_cmp_ci(cp1, cp2);
+    if (diff != 0) return diff;
+  }
+  return (int32_t)(tlast - olast);
 }
 int32_t ty_str_eq_ic(tystr *a, tystr *b) {
   if (a == b) return 1;
@@ -2963,10 +3271,12 @@ int32_t ty_str_eq_ic(tystr *a, tystr *b) {
    helper because the bounds are the same and only the comparison differs.
    Where both ranges begin and end on sequence boundaries the bytes are the
    comparison: canonical encoding is a function of the unit sequence, so equal
-   units give equal bytes. */
+   units give equal bytes. The case-insensitive comparison is Java's
+   compareToCIImpl over the two ranges, which is why it is written the same way
+   as compareToIgnoreCase above rather than as a second fold. */
 int32_t ty_str_region_matches(tystr *s, int32_t ignore_case, int32_t toff,
                               tystr *o, int32_t ooff, int32_t len) {
-  int64_t i;
+  int64_t i, ia, ib, la, lb;
   if (!s || !o) ty_npe();
   if (toff < 0 || ooff < 0) return 0;
   if (toff > s->ulen - len || ooff > o->ulen - len) return 0;
@@ -2977,18 +3287,24 @@ int32_t ty_str_region_matches(tystr *s, int32_t ignore_case, int32_t toff,
     int64_t na = str_byte_at(s, toff + len) - a, nb = str_byte_at(o, ooff + len) - b;
     return na == nb && memcmp(TY_STR_DATA(s) + a, TY_STR_DATA(o) + b, (size_t)na) == 0;
   }
-  {
+  if (!ignore_case) {
     tyucur ca, cb;
     ucur_at(&ca, s, toff);
     ucur_at(&cb, o, ooff);
-    for (i = 0; i < len; i++) {
-      int32_t x = ucur_next(&ca), y = ucur_next(&cb);
-      if (x == y) continue;
-      if (!ignore_case) return 0;
-      if (ty_char_upper(x) == ty_char_upper(y)) continue;
-      if (ty_char_lower(x) == ty_char_lower(y)) continue;
-      return 0;
-    }
+    for (i = 0; i < len; i++)
+      if (ucur_next(&ca) != ucur_next(&cb)) return 0;
+    return 1;
+  }
+  la = (int64_t)toff + len;
+  lb = (int64_t)ooff + len;
+  for (ia = toff, ib = ooff; ia < la && ib < lb; ia++, ib++) {
+    int32_t cp1 = str_unit_fast(s, ia), cp2 = str_unit_fast(o, ib);
+    if (cp1 == cp2 || uc_cmp_ci(cp1, cp2) == 0) continue;
+    cp1 = str_cp_including(s, cp1, ia, toff, la);
+    if (cp1 < 0) { ia++; cp1 = -cp1; }
+    cp2 = str_cp_including(o, cp2, ib, ooff, lb);
+    if (cp2 < 0) { ib++; cp2 = -cp2; }
+    if (uc_cmp_ci(cp1, cp2) != 0) return 0;
   }
   return 1;
 }
@@ -3131,38 +3447,48 @@ int32_t ty_str_lastindexof_ch_from(tystr *s, int32_t c, int32_t from) {
   if (!s) ty_npe();
   return (int32_t)rfind_cp(s, c, from);
 }
-int32_t ty_str_isblank(tystr *s) {
-  int64_t i;
-  if (!s) ty_npe();
-  for (i = 0; i < s->blen; i++)
-    if (!ty_is_whitespace((unsigned char)TY_STR_DATA(s)[i])) return 0;
-  return 1;
-}
 /* strip is Java's strip: the whitespace isWhitespace accepts, and nothing else.
-   It is not trim, which takes every byte <= ' ' and is kept for compatibility
-   with the same method in Java. */
+   It is not trim, which takes every code unit <= ' ' and is kept for
+   compatibility with the same method in Java. The whitespace is Unicode's, so
+   U+3000 IDEOGRAPHIC SPACE is stripped and U+00A0 NO-BREAK SPACE is not; both
+   walks are over code points, because a supplementary character is one
+   character and its two units must not be asked the question separately. */
 static int64_t strip_left(tystr *s) {
   int64_t i = 0;
-  while (i < s->blen && ty_is_whitespace((unsigned char)TY_STR_DATA(s)[i])) i++;
+  while (i < s->ulen) {
+    int32_t cp = uc_cp_at(s, i);
+    if (cp != ' ' && cp != '\t' && !ty_is_whitespace(cp)) break;
+    i += uc_cp_len(s, i);
+  }
   return i;
 }
 static int64_t strip_right(tystr *s) {
-  int64_t b = s->blen;
-  while (b > 0 && ty_is_whitespace((unsigned char)TY_STR_DATA(s)[b - 1])) b--;
+  int64_t b = s->ulen;
+  while (b > 0) {
+    int32_t cp = uc_cp_before(s, b);
+    if (cp != ' ' && cp != '\t' && !ty_is_whitespace(cp)) break;
+    b -= uc_cp_len(s, b - 1);
+  }
   return b;
 }
-tystr *ty_str_strip(tystr *s) {
+int32_t ty_str_isblank(tystr *s) {
   if (!s) ty_npe();
-  return ty_str_new(TY_STR_DATA(s) + strip_left(s), strip_right(s) - strip_left(s));
+  return strip_left(s) == s->ulen;
+}
+tystr *ty_str_strip(tystr *s) {
+  int64_t a, b;
+  if (!s) ty_npe();
+  a = strip_left(s);
+  b = strip_right(s);
+  return str_slice(s, a, b > a ? b : a);
 }
 tystr *ty_str_strip_leading(tystr *s) {
   if (!s) ty_npe();
-  int64_t a = strip_left(s);
-  return ty_str_new(TY_STR_DATA(s) + a, s->blen - a);
+  return str_slice(s, strip_left(s), s->ulen);
 }
 tystr *ty_str_strip_trailing(tystr *s) {
   if (!s) ty_npe();
-  return ty_str_new(TY_STR_DATA(s), strip_right(s));
+  return str_slice(s, 0, strip_right(s));
 }
 /* Java's repeat: a negative count is an IllegalArgumentException, a count of
    zero is the empty string, and the result is the receiver repeated. */
@@ -3759,13 +4085,16 @@ void *ty_sb_set_charat(void *p, int32_t at, uint16_t c) {
   return p;
 }
 /* delete is half open: [from, to), and to == length is allowed. deleteCharAt
-   is delete(at, at+1). Java answers an out-of-range index with
-   StringIndexOutOfBoundsException; an empty range is simply a no-op. */
+   is delete(at, at+1), which is the one place the range is not clamped: an
+   index outside the text is refused. `to` past the end is *clamped* rather
+   than refused -- Java's delete answers sb.delete(2, 100) by deleting to the
+   end, and only a start outside 0..length or past the end throws. An empty
+   range is a no-op. */
 void *ty_sb_delete(void *p, int32_t from, int32_t to) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
+  if (to > sb->len) to = sb->len;
   if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
-  if (to > sb->len) ty_sioobe(to, sb->len);
   memmove(sb->buf + from, sb->buf + to, (size_t)(sb->len - to) * sizeof(uint16_t));
   sb->len -= to - from;
   return p;
@@ -3778,12 +4107,17 @@ void *ty_sb_delete_charat(void *p, int32_t at) {
   sb->len--;
   return p;
 }
+/* replace has the same clamping, and it is the one builder method that refuses
+   a null String with NullPointerException rather than inserting "null": Java
+   reads str.length() after the bounds check, so an out-of-range range is the
+   StringIndexOutOfBoundsException and a null replacement inside one is the
+   NullPointerException. */
 void *ty_sb_replace(void *p, int32_t from, int32_t to, tystr *s) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (!s) ty_npe();
+  if (to > sb->len) to = sb->len;
   if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
-  if (to > sb->len) ty_sioobe(to, sb->len);
+  if (!s) ty_npe();
   ty_sb_delete(p, from, to);
   lang_sb_insert_str(sb, from, s);
   return p;

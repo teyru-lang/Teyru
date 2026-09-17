@@ -682,16 +682,44 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   半邊併成 four-byte 序列（`("\uD83D" + "\uDE00").equals("😀")` 為真，這正是 equals／
   switch／hash 靠的位元組等式），lexer 用 WTF-8 解 `char` 字面值（`'\uD83D'` 是那個 code
   unit 而不是 U+FFFD），`emit-java` 把孤立代理印成轉義而非 U+FFFD。
-  **仍然不做的**（不是忘了）：`Character.isLetter`／`isWhitespace`／`isDigit`／`getType`／
-  `isSurrogate`／`charCount`、大小寫映射（`"ß".toUpperCase()` 應為 `SS`）、`strip()` 認
-  U+3000、`Integer.parseInt("１２３")`——這些是 Unicode 資料那一塊（W5 的第 4–6 項），
-  t230／t231／t236 仍以 known-failures 釘著；正則引擎逐 code unit 比對，所以
+  **寫入那一半（W5 的第 4–6 項）在同一個分支上完成**：分類與大小寫映射是 **Unicode 15.0**
+  （JDK 21 的版本），表的來源是標準自己的資料檔而不是 ASCII 範圍強行延伸——`internal/tools/
+  genunicode/data/` 的三個檔（UnicodeData、SpecialCasing、PropList）由 `internal/tools/
+  genunicode` 產生 `internal/runtime/src/tyrt_unicode.c`（兩級 byte 表 + 排序的稀疏表，
+  `make unicode-tables` 重跑，`go test ./internal/tools/genunicode` 盯著入庫的檔案與資料一致）。
+  `Character` 因此有 `isLetter`／`isDigit`／`isLetterOrDigit`／`isAlphabetic`／`isUpperCase`／
+  `isLowerCase`／`isTitleCase`／`isWhitespace`／`isSpaceChar`／`isDefined`／`getType`（30 個
+  類別常數照 JDK 編號）／`toUpperCase`／`toLowerCase`／`toTitleCase`／`digit`／`forDigit`／
+  `getNumericValue` 的 **code point 形式**（int 參數；char 形式是 Teyru 寫的一行轉呼），加上
+  `isSupplementaryCodePoint`／`isBmpCodePoint`／`isValidCodePoint`／`charCount`／`toCodePoint`／
+  `highSurrogate`／`lowSurrogate`／`isSurrogate`／`isSurrogatePair`／`toString(int)`。字串那邊：
+  `toUpperCase`／`toLowerCase` 走 code point 並套 **SpecialCasing**（`"ß".toUpperCase()` 是
+  `SS`、`"İ".toLowerCase()` 是 `i` + U+0307）與 **Final_Sigma**（`"ΟΔΟΣ".toLowerCase()` 是
+  `οδος`）；`strip`／`stripLeading`／`stripTrailing`／`isBlank` 是 `isWhitespace` 的集合
+  （U+3000 剝得掉、U+00A0 剝不掉）；`Integer.parseInt`／`Long.parseLong`／`Byte`／`Short` 收
+  JDK 收的每一個 Nd 數字（含全形與他種文字，但不含 BMP 以上的 OSMANYA 數字，因為 Java 逐
+  unit 讀）；`Double.parseDouble` 仍然只收 ASCII 數字（Java 就是如此）但**會**依 `trim()` 略過
+  前後空白。**這裡量出來的每一條都由 JDK 逐個碼點驗證**：`t251_unicode_tables` 走完
+  1,114,112 個碼點，把 `getType`、十個判定、三個映射（含 `digit(36)`）與 `getNumericValue`
+  折成計數與一個雜湊，與 JDK 的輸出逐位元組相同；`t250_string_utf16_builders` 與
+  `t252_character_api` 是逐項的行為（builder 的 method 與代理對、分類與映射常數、strip 家族、
+  解析、忽略大小寫的比較）。**這一段取代先前記的「仍然不做」**——那五項都做了。
+  **還沒有做、也不假裝做了的**：Final_Sigma 的「字」用的是自己寫的邊界判定（字母／數字／記號
+  相鄰、連接號與 `-`／`.`／`'` 相連、表意字自成一個字），它是**對著 JDK 量出來的**而不是
+  UAX #29（JDK 的 BreakIterator 是自己的規則）；兩者在造出來的 8000 個字串上零分歧，但一個
+  `.` 後面緊接組合記號再接字母這種形狀仍會不同（`AGENTS.md` 這一段就是它的記錄處）。語言的
+  大小寫映射是 **locale-insensitive** 的（Java 的 `Locale.ROOT`）：土耳其／亞塞拜然／立陶宛
+  的條件映射（`tr`／`az`／`lt`）沒有實作，因為沒有 locale。`StringBuilder` 沒有
+  `codePointAt`／`codePointCount`（Java 的 AbstractStringBuilder 有），`capacity()` 的預設值
+  也不同（這裡 32 個 unit、Java 16 個字元）；`new Integer(int)` 與 `new Boolean(boolean)` 仍
+  沒有宣告（那是 boxing 那一項）。正則引擎逐 code unit 比對，所以
   `"😀a".matches(".a")` 這裡是 false 而 JDK 是 true（Java 的 `.` 吃一個 code point），
   但 `Matcher` 報的位移已經是 unit 索引；`offsetByCodePoints` 越界時丟的是
   `StringIndexOutOfBoundsException`，JDK 丟父類別 `IndexOutOfBoundsException`（執行期沒有
   父類別的 handle，用 `catch (IndexOutOfBoundsException)` 仍接得到）；`StringBuilder`
   的 `setLength`／`setCharAt` 回傳 builder，Java 回傳 void（寬鬆的超集，先前就在）。
-  測試：`t249_string_utf16_reads` 與 `t250_string_utf16_builders`（期望輸出由
+  測試：`t250_string_utf16_builders`（`t249` 已被 W8 的 t249_probe_boxed_compound_shapes 用掉）
+  與 `t251_unicode_tables`、`t252_character_api`（期望輸出由
   OpenJDK 21.0.11+10 跑 `.java.ref` 產生）。
 
 ## 11. 送出前檢查清單

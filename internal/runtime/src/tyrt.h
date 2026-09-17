@@ -996,9 +996,6 @@ double ty_to_radians(double deg);
 double ty_to_degrees(double rad);
 double ty_random(void);
 int32_t ty_isnan(double v);
-int32_t ty_is_digit(uint16_t c);
-int32_t ty_is_letter(uint16_t c);
-int32_t ty_is_space(uint16_t c);
 int64_t ty_millis(void);
 int64_t ty_nanos(void);
 void ty_exit(int32_t code);
@@ -1111,15 +1108,87 @@ int32_t ty_in_read(void *self);
 tystr *ty_in_readln(void *self);
 
 /* Character */
-int32_t ty_is_whitespace(uint16_t c);
-int32_t ty_is_letter_or_digit(uint16_t c);
-int32_t ty_is_upper_case(uint16_t c);
-int32_t ty_is_lower_case(uint16_t c);
-int32_t ty_is_alphabetic(uint16_t c);
-int32_t ty_char_upper(uint16_t c);
-int32_t ty_char_lower(uint16_t c);
-int32_t ty_char_numeric(uint16_t c);
-int32_t ty_char_digit(uint16_t c, int32_t radix);
+/*
+ * The classification and the case mappings are Unicode's, from the tables
+ * genunicode generates into tyrt_unicode.c (Unicode 15.0.0, the release the
+ * reference implementation OpenJDK 21 carries). A code point is an int32_t
+ * everywhere below, not a uint16_t: most of the classification is only
+ * answerable for a supplementary code point, and the JDK's own methods take an
+ * int for the same reason. The char-shaped methods in lib/04_boxing.teyru call
+ * these with the value of the char, which is what the JDK's char methods do too.
+ */
+int32_t ty_is_digit(int32_t cp);
+int32_t ty_is_letter(int32_t cp);
+int32_t ty_is_letter_or_digit(int32_t cp);
+int32_t ty_is_alphabetic(int32_t cp);
+int32_t ty_is_upper_case(int32_t cp);
+int32_t ty_is_lower_case(int32_t cp);
+int32_t ty_is_title_case(int32_t cp);
+int32_t ty_is_whitespace(int32_t cp);
+int32_t ty_is_space_char(int32_t cp);
+int32_t ty_is_defined(int32_t cp);
+int32_t ty_char_type(int32_t cp);
+int32_t ty_char_upper(int32_t cp);
+int32_t ty_char_lower(int32_t cp);
+int32_t ty_char_title(int32_t cp);
+int32_t ty_char_numeric(int32_t cp);
+int32_t ty_char_digit(int32_t cp, int32_t radix);
+
+/* The longest expansion any code point has in the full case mappings, which is
+   what a caller's buffer has to hold: U+FB03 is "FFI". genunicode refuses data
+   that needs more than this. */
+#define TY_UC_MAX_EXPANSION 3
+
+/* The general categories, as Character's constants are numbered: Character.getType
+   answers with these numbers and a program compares its answer against the
+   constants, so the numbers are part of the API rather than an encoding. The
+   generator writes the tables in the same numbering, and
+   internal/tools/genunicode checks this block against it. */
+#define TY_UC_UNASSIGNED 0
+#define TY_UC_UPPERCASE_LETTER 1
+#define TY_UC_LOWERCASE_LETTER 2
+#define TY_UC_TITLECASE_LETTER 3
+#define TY_UC_MODIFIER_LETTER 4
+#define TY_UC_OTHER_LETTER 5
+#define TY_UC_NON_SPACING_MARK 6
+#define TY_UC_ENCLOSING_MARK 7
+#define TY_UC_COMBINING_SPACING_MARK 8
+#define TY_UC_DECIMAL_DIGIT_NUMBER 9
+#define TY_UC_LETTER_NUMBER 10
+#define TY_UC_OTHER_NUMBER 11
+#define TY_UC_SPACE_SEPARATOR 12
+#define TY_UC_LINE_SEPARATOR 13
+#define TY_UC_PARAGRAPH_SEPARATOR 14
+#define TY_UC_CONTROL 15
+#define TY_UC_FORMAT 16
+#define TY_UC_PRIVATE_USE 18
+#define TY_UC_SURROGATE 19
+#define TY_UC_DASH_PUNCTUATION 20
+#define TY_UC_START_PUNCTUATION 21
+#define TY_UC_END_PUNCTUATION 22
+#define TY_UC_CONNECTOR_PUNCTUATION 23
+#define TY_UC_OTHER_PUNCTUATION 24
+#define TY_UC_MATH_SYMBOL 25
+#define TY_UC_CURRENCY_SYMBOL 26
+#define TY_UC_MODIFIER_SYMBOL 27
+#define TY_UC_OTHER_SYMBOL 28
+#define TY_UC_INITIAL_QUOTE_PUNCTUATION 29
+#define TY_UC_FINAL_QUOTE_PUNCTUATION 30
+
+/* The generated tables (tyrt_unicode.c). They are read through these and not
+   directly: the layout of an entry is the generator's business. */
+int32_t ty_uc_category(int32_t cp);
+int32_t ty_uc_props(int32_t cp);
+int32_t ty_uc_case(int32_t cp, int32_t which);
+int32_t ty_uc_digit_value(int32_t cp);
+int32_t ty_uc_numeric_value(int32_t cp);
+int32_t ty_uc_special(int32_t cp, int32_t upper, int32_t *out, int32_t cap);
+/* The property bits of the second table, as Character's predicates are. */
+#define TY_UC_WHITE_SPACE 1
+#define TY_UC_OTHER_ALPHABETIC 2
+#define TY_UC_OTHER_UPPERCASE 4
+#define TY_UC_OTHER_LOWERCASE 8
+#define TY_UC_IDEOGRAPHIC 16
 
 /* The wrappers: parsing, radix formatting and the bit twiddling Integer and
    Long expose. A parse either succeeds or throws, which is why each type has a

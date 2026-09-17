@@ -8,7 +8,7 @@ BIN     ?= teyru
 OPT     ?= -O2
 PREFIX  ?= /usr/local
 
-.PHONY: all build test test-go test-programs submodule bench backend-matrix fmt vet lint notices check ci jdk-diff progen hooks clean install examples
+.PHONY: all build test test-go test-programs submodule bench backend-matrix fmt vet lint notices unicode-tables check ci jdk-diff progen hooks clean install examples
 
 all: build
 
@@ -130,6 +130,16 @@ bench: build
 # scripts/backend-matrix-allow.txt; anything not listed there fails the target.
 backend-matrix:
 	./scripts/backend-matrix.sh
+
+## unicode-tables: regenerate the Unicode tables the runtime reads
+#
+# The tables in internal/runtime/src/tyrt_unicode.c are generated from the
+# Unicode 15.0.0 data files in internal/tools/genunicode/data, which are in the
+# tree (no network, no JDK). `make check` does not run this -- it checks that the
+# file is current instead, through the generator's own test, so that a tree that
+# regenerated it without committing cannot land quietly.
+unicode-tables:
+	$(GO) run ./internal/tools/genunicode
 
 ## notices: check THIRD-PARTY-NOTICES.md against the tree
 #
