@@ -75,19 +75,19 @@ t263, which pins a decision the JDK has no counterpart for).
 | `lib/42_iostream.teyru:313` | `* It implements both of this file's output shapes: an OutputStream for the data` | BYTES (comment) | "because one byte is one character" |
 | `lib/42_iostream.teyru:382` | `/* The Writer half: the string's UTF-8, which is what a Writer writes and the` | BYTES (comment) | "the string's own bytes, which is the identity" |
 | `lib/42_iostream.teyru:410` | `/* Java's toString() decodes the bytes with the default charset, which is UTF-8` | BYTES (comment) | "the bytes themselves" |
-| `lib/42_iostream.teyru:438` | `* A lone surrogate is the one place this and Java agree about nothing. Java` | BYTES (comment) | "it becomes U+FFFD" (it becomes `?`) |
-| `lib/42_iostream.teyru:498` | `/* Java's message, which names the string and not only the length: its` | BYTES (comment) | "The ends are eight BYTES here" |
-| `lib/42_iostream.teyru:646` | `* writeBytes and writeChars, Java's two String writers that are defined on` | BYTES (comment) | "writeChars has no UTF-16 to write" |
-| `lib/42_iostream.teyru:763` | `* a byte is a character when a byte stream is read as one, so a data stream can` | BYTES (comment) | "a byte is a character here" |
-| `lib/42_iostream.teyru:973` | `return v` | BYTES (code, T254) | `return v & 255` in BufferedReader.read() over a String |
-| `lib/42_iostream.teyru:1010` | `* autoFlush. Both halves are here: the Writer half writes the text it is given,` | BYTES (comment) | "a Teyru string's bytes are already UTF-8" |
-| `lib/43_util_extra.teyru:86` | `/* \p{javaWhitespace}, narrowed to the ten characters of it that are ASCII:` | BYTES (comment) | "a Teyru char is one byte of UTF-8" |
-| `lib/43_util_extra.teyru:110` | `while (pos < input.length() && isWhitespace(input.charAt(pos))) {` | BYTES (code, T253) | `input.charAt(pos) & 255` in skipDelimiters |
-| `lib/43_util_extra.teyru:124` | `while (pos < input.length() && !isWhitespace(input.charAt(pos))) {` | BYTES (code, T253) | `input.charAt(pos) & 255` in take() |
-| `lib/43_util_extra.teyru:227` | `LineScanner read them. U+2028, U+2029 and U+0085 are line separators to` | BYTES (comment) | "in a UTF-8 string they are two-byte sequences" |
-| `lib/43_util_extra.teyru:239` | `int c = input.charAt(pos)` | BYTES (code, T253) | `input.charAt(pos) & 255` in nextLine() |
-| `lib/43_util_extra.teyru:248` | `if (pos < input.length() && input.charAt(pos) == 10) {` | BYTES (code, T253) | `(input.charAt(pos) & 255) == 10` in nextLine() |
-| `lib/47_wiretest.teyru:237` | `res.body = Net.stringFrom(res.bodyBytes, 0, res.bodyBytes.length)` | BYTES (code, T258) | an unframed body was built through a String |
+| `lib/42_iostream.teyru:438` | `* Both directions are written over code units and not over the string's bytes,` | BYTES (comment, fixed) | was "the last sentence here said a lone surrogate comes back as `?`"; it is Java's three bytes now (t260) |
+| `lib/42_iostream.teyru:495` | `/* Java's message, which names the string and not only the length: its` | BYTES (comment) | "The ends are eight BYTES here" |
+| `lib/42_iostream.teyru:586` | `* writeBytes and writeChars, Java's two String writers that are defined on` | BYTES (comment) | "writeChars has no UTF-16 to write" |
+| `lib/42_iostream.teyru:703` | `* a byte is a character when a byte stream is read as one, so a data stream can` | BYTES (comment) | "a byte is a character here" |
+| `lib/42_iostream.teyru:133` | `return v` | BYTES (code, T254) | `return v & 255` in BufferedReader.read() over a String |
+| `lib/42_iostream.teyru:950` | `* autoFlush. Both halves are here: the Writer half writes the text it is given,` | BYTES (comment) | "a Teyru string's bytes are already UTF-8" |
+| `lib/43_util_extra.teyru:86` | `/* \p{javaWhitespace}, which is Character.isWhitespace and not a rule of this` | BYTES (comment, fixed) | was "the ten characters of it that are ASCII" and "a Teyru char is one byte"; the set is Java's own now (t261) |
+| `lib/43_util_extra.teyru:106` | `while (pos < input.length() && isWhitespace(input.charAt(pos))) {` | BYTES (code, T253) | `input.charAt(pos) & 255` in skipDelimiters |
+| `lib/43_util_extra.teyru:120` | `while (pos < input.length() && !isWhitespace(input.charAt(pos))) {` | BYTES (code, T253) | `input.charAt(pos) & 255` in take() |
+| `lib/43_util_extra.teyru:222` | `*     are Java's Scanner's, which are the whole of` | BYTES (comment, fixed) | was "the three terminators java.io uses and on nothing else" / "in a UTF-8 string they are two-byte sequences"; the set is Java's own now (t262) |
+| `lib/43_util_extra.teyru:236` | `int c = input.charAt(pos)` | BYTES (code, T253) | `input.charAt(pos) & 255` in nextLine() |
+| `lib/43_util_extra.teyru:245` | `if (pos < input.length() && input.charAt(pos) == 10) {` | BYTES (code, T253) | `(input.charAt(pos) & 255) == 10` in nextLine() |
+| `lib/47_wiretest.teyru:211` | `res.body = Net.stringFrom(res.bodyBytes, 0, res.bodyBytes.length)` | BYTES (code, T258) | an unframed body was built through a String |
 
 ## The four UNSURE rows, worked
 
@@ -99,7 +99,7 @@ settled here.
 |---|---|---|
 | `lib/42_iostream.teyru` (was the lone-surrogate row) | `writeUTF` of a lone surrogate wrote `?` (Java `0003EDA0BD`, here `00013F`) | **fixed** in `lib/42_iostream.teyru`'s `ModifiedUtf8`: both directions walk code units now, as Java's do, and a lone surrogate is written as itself and read back as itself. `t260_modified_utf8` prints the bytes and the round trip for eight strings; its output is `t260_modified_utf8.java.ref`'s on OpenJDK 21.0.11+10. This also removed the hand-rolled UTF-8 decoder that `encode` began with -- it is tell #1 of this audit, and it was reading a string's bytes to find characters in them. |
 | `lib/43_util_extra.teyru:96` | the Scanner delimiter set was `\p{javaWhitespace}` narrowed to its ASCII ten | **fixed**: the set is `Character.isWhitespace`, which is what `\p{javaWhitespace}` is, so U+3000, U+2000..U+200A, U+205F and U+1680 separate tokens and U+00A0, U+2007 and U+202F do not. `t261_scanner_delimiters` asks sixteen code points, against OpenJDK 21.0.11+10. |
-| `lib/43_util_extra.teyru:232` | the line terminators were LF, CRLF and CR only | **fixed**: the terminators are Java's own set, `\r\n|[\n\r\u2028\u2029\u0085]`. `t262_scanner_line_terminators` reads thirteen strings, against the same JDK. |
+| `lib/43_util_extra.teyru:237` | the line terminators were LF, CRLF and CR only | **fixed**: the terminators are Java's own set, `\r\n|[\n\r\u2028\u2029\u0085]`. `t262_scanner_line_terminators` reads thirteen strings, against the same JDK. |
 | `lib/42_iostream.teyru:186` | `ByteArrayInputStream` and `DataInputStream` as Readers answer one byte per character where Java's `InputStreamReader` decodes | **decided, not changed.** `read()` is one method with two contracts -- `InputStream.read()` is "the next byte as 0..255" and `Reader.read()` over it would be "the next character" -- and the byte contract is the one the class can keep: it IS a byte array, and `read(byte[])`, `skip()` and `available()` are over the same position. Java never chooses: its byte array stream is not a Reader, and decoding is a second object (`InputStreamReader`, or this library's `Net.stringFrom`). The tree already documents it at `lib/42_iostream.teyru`'s `Reader` interface ("here one byte is one character, so a buffer read is a loop of read() calls") and in the two class comments; `t263_reader_over_bytes` pins the behaviour so that reversing the decision is a diff and not a silence. |
 
 ## The other 182 byte-context sites: CHARS
@@ -119,22 +119,22 @@ happens to be `0x`-shaped.
 | `lib/10_json.teyru:1497` | `int c = (int) value.charAt(i)` | CHARS |
 | `lib/10_json.teyru:1504` | `out.append(value.substring(last, i))` | CHARS |
 | `lib/10_json.teyru:1505` | `out.append(c == 0x2028 ? "\\u2028" : "\\u2029")` | CHARS |
-| `lib/10_json.teyru:1521` | `out.append('"')` | CHARS |
+| `lib/10_json.teyru:1494` | `out.append('"')` | CHARS |
 | `lib/10_json.teyru:1549` | `sb.append("\\u00")` | CHARS |
 | `lib/10_json.teyru:1550` | `sb.append(hexDigit((c >> 4) & 15))` | CHARS |
 | `lib/10_json.teyru:1551` | `sb.append(hexDigit(c & 15))` | CHARS |
-| `lib/10_json.teyru:2285` | `return src.substring(start, pos)` | CHARS |
+| `lib/10_json.teyru:2119` | `return src.substring(start, pos)` | CHARS |
 | `lib/10_json.teyru:2294` | `char quote = src.charAt(pos)` | CHARS |
 | `lib/10_json.teyru:2310` | `sb.append(src.substring(start, pos))` | CHARS |
-| `lib/10_json.teyru:2325` | `sb.append(src.substring(start, pos))` | CHARS |
+| `lib/10_json.teyru:2310` | `sb.append(src.substring(start, pos))` | CHARS |
 | `lib/10_json.teyru:2398` | `if (pos + 1 < src.length() && src.charAt(pos) == '\\' && src.charAt(pos + 1) == 'u') {` | CHARS |
 | `lib/10_json.teyru:2403` | `sb.append((char) cp)` | CHARS |
 | `lib/10_json.teyru:2404` | `sb.append((char) low)` | CHARS |
 | `lib/10_json.teyru:2409` | `sb.append(REPLACEMENT)` | CHARS |
-| `lib/10_json.teyru:2413` | `sb.append(REPLACEMENT)` | CHARS |
-| `lib/10_json.teyru:2416` | `sb.append((char) cp)` | CHARS |
+| `lib/10_json.teyru:2409` | `sb.append(REPLACEMENT)` | CHARS |
+| `lib/10_json.teyru:2403` | `sb.append((char) cp)` | CHARS |
 | `lib/14_util_arrays.teyru:337` | `return x.compareTo(b)` | CHARS |
-| `lib/14_util_arrays.teyru:1256` | `sb.append("]")` | CHARS |
+| `lib/14_util_arrays.teyru:1192` | `sb.append("]")` | CHARS |
 | `lib/15_net.teyru:412` | `byte[] all = s.getBytes()` | CHARS |
 | `lib/15_net.teyru:914` | `sb.append(Net.stringFrom(buf, pos, count - pos))` | CHARS |
 | `lib/15_net.teyru:930` | `sb.append(Net.stringFrom(buf, pos, nl - pos))` | CHARS |
@@ -150,11 +150,11 @@ happens to be `0x`-shaped.
 | `lib/18_web.teyru:357` | `b.append((char) (bodyBytes[i] & 0xff))` | CHARS |
 | `lib/18_web.teyru:382` | `bodyBytes = text.getBytes()` | CHARS |
 | `lib/18_web.teyru:761` | `b.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n")` | CHARS |
-| `lib/18_web.teyru:762` | `b.append("\r\n")` | CHARS |
+| `lib/18_web.teyru:759` | `b.append("\r\n")` | CHARS |
 | `lib/18_web.teyru:777` | `return body.getBytes().length` | CHARS |
 | `lib/18_web.teyru:2342` | `head.append(line).append("\r\n")` | CHARS |
 | `lib/18_web.teyru:2351` | `return line.getBytes().length` | CHARS |
-| `lib/21_regex.teyru:353` | `char c = src.charAt(pos)` | CHARS |
+| `lib/21_regex.teyru:333` | `char c = src.charAt(pos)` | CHARS |
 | `lib/21_regex.teyru:375` | `if (pos < src.length() && src.charAt(pos) == ',') {` | CHARS |
 | `lib/21_regex.teyru:382` | `if (pos >= src.length() \|\| src.charAt(pos) != '}') {` | CHARS |
 | `lib/23_math.teyru:2439` | `buf.append(this.intVal.toString())` | CHARS |
@@ -162,27 +162,27 @@ happens to be `0x`-shaped.
 | `lib/23_math.teyru:2455` | `buf.insert(insertionPoint, '.')` | CHARS |
 | `lib/23_math.teyru:2457` | `buf.insert(0, '-')` | CHARS |
 | `lib/23_math.teyru:2462` | `buf.append(signum < 0 ? "-0." : "0.")` | CHARS |
-| `lib/23_math.teyru:2464` | `buf.append('0')` | CHARS |
+| `lib/23_math.teyru:2441` | `buf.append('0')` | CHARS |
 | `lib/23_math.teyru:2466` | `buf.append(intString)` | CHARS |
 | `lib/23_math.teyru:2482` | `buf.append('-')` | CHARS |
 | `lib/23_math.teyru:2484` | `int coeffLen = coeff.length()` | CHARS |
-| `lib/23_math.teyru:2489` | `buf.append('0')` | CHARS |
+| `lib/23_math.teyru:2441` | `buf.append('0')` | CHARS |
 | `lib/23_math.teyru:2490` | `buf.append('.')` | CHARS |
-| `lib/23_math.teyru:2492` | `buf.append('0')` | CHARS |
+| `lib/23_math.teyru:2441` | `buf.append('0')` | CHARS |
 | `lib/23_math.teyru:2494` | `buf.append(coeff)` | CHARS |
 | `lib/23_math.teyru:2496` | `buf.append(coeff.substring(0, -pad))` | CHARS |
-| `lib/23_math.teyru:2497` | `buf.append('.')` | CHARS |
+| `lib/23_math.teyru:2490` | `buf.append('.')` | CHARS |
 | `lib/23_math.teyru:2498` | `buf.append(coeff.substring(-pad))` | CHARS |
 | `lib/23_math.teyru:2502` | `buf.append(coeff.charAt(0))` | CHARS |
-| `lib/23_math.teyru:2504` | `buf.append('.')` | CHARS |
+| `lib/23_math.teyru:2490` | `buf.append('.')` | CHARS |
 | `lib/23_math.teyru:2505` | `buf.append(coeff.substring(1))` | CHARS |
-| `lib/23_math.teyru:2516` | `buf.append('0')` | CHARS |
+| `lib/23_math.teyru:2441` | `buf.append('0')` | CHARS |
 | `lib/23_math.teyru:2518` | `buf.append("0.00")` | CHARS |
 | `lib/23_math.teyru:2521` | `buf.append("0.0")` | CHARS |
-| `lib/23_math.teyru:2525` | `buf.append(coeff)` | CHARS |
-| `lib/23_math.teyru:2527` | `buf.append('0')` | CHARS |
+| `lib/23_math.teyru:2494` | `buf.append(coeff)` | CHARS |
+| `lib/23_math.teyru:2441` | `buf.append('0')` | CHARS |
 | `lib/23_math.teyru:2530` | `buf.append(coeff.substring(0, sig))` | CHARS |
-| `lib/23_math.teyru:2531` | `buf.append('.')` | CHARS |
+| `lib/23_math.teyru:2490` | `buf.append('.')` | CHARS |
 | `lib/23_math.teyru:2532` | `buf.append(coeff.substring(sig))` | CHARS |
 | `lib/23_math.teyru:2536` | `buf.append('E')` | CHARS |
 | `lib/23_math.teyru:2538` | `buf.append('+')` | CHARS |
@@ -190,27 +190,27 @@ happens to be `0x`-shaped.
 | `lib/24_text.teyru:378` | `return lhs.compareTo(rhs)` | CHARS |
 | `lib/25_util_misc.teyru:373` | `long mostSigBits = Long.parseLong(name.substring(0, dash1), 16) & 0xffffffffL` | CHARS |
 | `lib/25_util_misc.teyru:375` | `mostSigBits = mostSigBits \| (Long.parseLong(name.substring(dash1 + 1, dash2), 16) & 0xf` | CHARS |
-| `lib/25_util_misc.teyru:377` | `mostSigBits = mostSigBits \| (Long.parseLong(name.substring(dash2 + 1, dash3), 16) & 0xf` | CHARS |
+| `lib/25_util_misc.teyru:375` | `mostSigBits = mostSigBits \| (Long.parseLong(name.substring(dash2 + 1, dash3), 16) & 0xf` | CHARS |
 | `lib/25_util_misc.teyru:378` | `long leastSigBits = Long.parseLong(name.substring(dash3 + 1, dash4), 16) & 0xffffL` | CHARS |
 | `lib/25_util_misc.teyru:380` | `leastSigBits = leastSigBits \| (Long.parseLong(name.substring(dash4 + 1), 16) & 0xffffff` | CHARS |
 | `lib/25_util_misc.teyru:452` | `return Long.toHexString(high \| (value & (high - 1))).substring(1)` | CHARS |
 | `lib/25_util_misc.teyru:968` | `sb.append("}")` | CHARS |
 | `lib/25_util_misc.teyru:1333` | `for (int i = 0 : i < s.length() : i++) {` | CHARS |
-| `lib/25_util_misc.teyru:1356` | `out.append('\\')` | CHARS |
-| `lib/25_util_misc.teyru:1357` | `out.append(c)` | CHARS |
+| `lib/25_util_misc.teyru:1337` | `out.append('\\')` | CHARS |
+| `lib/25_util_misc.teyru:1339` | `out.append(c)` | CHARS |
 | `lib/25_util_misc.teyru:1359` | `out.append("\\u" + hex4(c))` | CHARS |
-| `lib/25_util_misc.teyru:1365` | `out.append("\\u" + hex4(c))` | CHARS |
+| `lib/25_util_misc.teyru:1359` | `out.append("\\u" + hex4(c))` | CHARS |
 | `lib/25_util_misc.teyru:1380` | `sb.append(digits.charAt((c >> shift) & 0xF))` | CHARS |
 | `lib/25_util_misc.teyru:1787` | `b.append(ALPHABET.charAt((n >> 18) & 63))` | CHARS |
 | `lib/25_util_misc.teyru:1788` | `b.append(ALPHABET.charAt((n >> 12) & 63))` | CHARS |
 | `lib/25_util_misc.teyru:1789` | `b.append(ALPHABET.charAt((n >> 6) & 63))` | CHARS |
 | `lib/25_util_misc.teyru:1790` | `b.append(ALPHABET.charAt(n & 63))` | CHARS |
-| `lib/25_util_misc.teyru:1795` | `b.append(ALPHABET.charAt((n >> 18) & 63))` | CHARS |
-| `lib/25_util_misc.teyru:1796` | `b.append(ALPHABET.charAt((n >> 12) & 63))` | CHARS |
+| `lib/25_util_misc.teyru:1787` | `b.append(ALPHABET.charAt((n >> 18) & 63))` | CHARS |
+| `lib/25_util_misc.teyru:1788` | `b.append(ALPHABET.charAt((n >> 12) & 63))` | CHARS |
 | `lib/25_util_misc.teyru:1797` | `b.append("==")` | CHARS |
-| `lib/25_util_misc.teyru:1802` | `b.append(ALPHABET.charAt((n >> 18) & 63))` | CHARS |
-| `lib/25_util_misc.teyru:1803` | `b.append(ALPHABET.charAt((n >> 12) & 63))` | CHARS |
-| `lib/25_util_misc.teyru:1804` | `b.append(ALPHABET.charAt((n >> 6) & 63))` | CHARS |
+| `lib/25_util_misc.teyru:1787` | `b.append(ALPHABET.charAt((n >> 18) & 63))` | CHARS |
+| `lib/25_util_misc.teyru:1788` | `b.append(ALPHABET.charAt((n >> 12) & 63))` | CHARS |
+| `lib/25_util_misc.teyru:1789` | `b.append(ALPHABET.charAt((n >> 6) & 63))` | CHARS |
 | `lib/25_util_misc.teyru:1805` | `b.append("=")` | CHARS |
 | `lib/25_util_misc.teyru:1814` | `return encodeToString(text.getBytes())` | CHARS |
 | `lib/30_websocket.teyru:111` | `out.write(WebSocketFrame.encode(WebSocketFrame.TEXT, text.getBytes()))` | CHARS |
@@ -241,18 +241,16 @@ happens to be `0x`-shaped.
 | `lib/41_hexformat.teyru:206` | `return (HexFormat.fromHexDigit(string.charAt(index)) << 4) \|` | CHARS |
 | `lib/41_hexformat.teyru:207` | `HexFormat.fromHexDigit(string.charAt(index + 1))` | CHARS |
 | `lib/41_hexformat.teyru:255` | `return table.charAt(value & 0xF)` | CHARS |
-| `lib/42_iostream.teyru:385` | `byte[] b = s.getBytes()` | CHARS |
-| `lib/42_iostream.teyru:454` | `byte[] in = s.getBytes()` | CHARS |
-| `lib/42_iostream.teyru:507` | `int length = s.length()` | CHARS |
-| `lib/42_iostream.teyru:508` | `return "encoded string (" + s.substring(0, 8) + "..." + s.substring(length - 8, length) ` | CHARS |
-| `lib/42_iostream.teyru:1088` | `if (pending != null && pending.length() > 0) {` | CHARS |
-| `lib/42_iostream.teyru:1089` | `byte[] b = pending.toString().getBytes()` | CHARS |
-| `lib/42_iostream.teyru:1091` | `pending.delete(0, pending.length())` | CHARS |
+| `lib/42_iostream.teyru:504` | `int length = s.length()` | CHARS |
+| `lib/42_iostream.teyru:505` | `return "encoded string (" + s.substring(0, 8) + "..." + s.substring(length - 8, length) ` | CHARS |
+| `lib/42_iostream.teyru:1028` | `if (pending != null && pending.length() > 0) {` | CHARS |
+| `lib/42_iostream.teyru:1029` | `byte[] b = pending.toString().getBytes()` | CHARS |
+| `lib/42_iostream.teyru:1031` | `pending.delete(0, pending.length())` | CHARS |
 | `lib/44_zip.teyru:2859` | `return compress(text.getBytes())` | CHARS |
 | `lib/45_zip_archive.teyru:198` | `if (name.length() > 0xFFFF) {` | CHARS |
 | `lib/45_zip_archive.teyru:510` | `byte[] bytes = c.getBytes()` | CHARS |
 | `lib/45_zip_archive.teyru:778` | `byte[] nameBytes = e.name.getBytes()` | CHARS |
-| `lib/45_zip_archive.teyru:810` | `byte[] nameBytes = e.name.getBytes()` | CHARS |
+| `lib/45_zip_archive.teyru:778` | `byte[] nameBytes = e.name.getBytes()` | CHARS |
 | `lib/45_zip_archive.teyru:818` | `byte[] commentBytes = e.comment == null ? null : e.comment.getBytes()` | CHARS |
 | `lib/47_wiretest.teyru:345` | `return sendFrame(opcode, text.getBytes(), fin)` | CHARS |
 
