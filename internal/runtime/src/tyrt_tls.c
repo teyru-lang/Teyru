@@ -296,9 +296,9 @@ static SSL *ty_tls_session_of(int32_t handle) {
    contain a NUL cannot name a host or hold a PEM document, and truncating it
    silently would use the wrong one. */
 static const char *ty_tls_cstr(tystr *s) {
-  if (!s || !s->data) return NULL;
-  if ((int64_t)strlen(s->data) != s->len) return NULL;
-  return s->data;
+  if (!s) return NULL;
+  if ((int64_t)strlen(TY_STR_DATA(s)) != s->blen) return NULL;
+  return TY_STR_DATA(s);
 }
 
 /* A byte[] is the only array this file reads or writes, and the element size is
@@ -437,10 +437,10 @@ int32_t ty_tls_client_context(tystr *ca_pem) {
   ty_tls_bio_err = 0;
   const char *pem = NULL;
   int64_t len = 0;
-  if (ca_pem && ca_pem->len > 0) {
+  if (ca_pem && ca_pem->blen > 0) {
     pem = ty_tls_cstr(ca_pem);
     if (!pem) return -EINVAL;
-    len = ca_pem->len;
+    len = ca_pem->blen;
   }
   ty_tls_ready();
   ERR_clear_error();
@@ -498,7 +498,7 @@ int32_t ty_tls_server_context(tystr *cert_pem, tystr *key_pem) {
     ty_tls_reason_openssl();
     return TY_TLS_CONFIG;
   }
-  BIO *cbio = BIO_new_mem_buf(cert, (int)cert_pem->len);
+  BIO *cbio = BIO_new_mem_buf(cert, (int)cert_pem->blen);
   if (!cbio) {
     SSL_CTX_free(ctx);
     ty_tls_reason("out of memory reading the certificate");
@@ -539,7 +539,7 @@ int32_t ty_tls_server_context(tystr *cert_pem, tystr *key_pem) {
      what it is, and the error queue holds a decode complaint that is not one. */
   ERR_clear_error();
   BIO_free(cbio);
-  BIO *kbio = BIO_new_mem_buf(key, (int)key_pem->len);
+  BIO *kbio = BIO_new_mem_buf(key, (int)key_pem->blen);
   if (!kbio) {
     SSL_CTX_free(ctx);
     ty_tls_reason("out of memory reading the private key");
@@ -768,16 +768,16 @@ int32_t ty_tls_write_all(int32_t session, tyarr *buf, int32_t off, int32_t len) 
 
 int32_t ty_tls_write_str(int32_t session, tystr *s) {
   if (!s) return -EINVAL;
-  if (s->len <= 0) return 0;
-  if (s->len > INT32_MAX) return -EINVAL;
+  if (s->blen <= 0) return 0;
+  if (s->blen > INT32_MAX) return -EINVAL;
   /* The string's bytes are the same shape as an array's, and the write loop is
      the same loop: an array view of them would allocate on every write. */
   tyarr view;
   memset(&view, 0, sizeof view);
-  view.len = s->len;
-  view.data = s->data;
+  view.len = s->blen;
+  view.data = TY_STR_DATA(s);
   view.esize = 1;
-  return ty_tls_write_all(session, &view, 0, (int32_t)s->len);
+  return ty_tls_write_all(session, &view, 0, (int32_t)s->blen);
 }
 
 int32_t ty_tls_close(int32_t session) {

@@ -20,11 +20,57 @@ struct tyobj {
   tyclass *cls;
 };
 
+/* A string is WTF-8 bytes and the two lengths Java needs, in one allocation.
+
+   `blen` counts the bytes; `ulen` counts the UTF-16 code units they spell,
+   which is the measure Java has for a string. The two agree below 0x80 and part
+   company above it, where one code unit is two or three bytes.
+
+   Java strings are sequences of UTF-16 code units, and a sequence need not be
+   well formed: "\uD800" on its own is a string Java holds, and substring can
+   cut an astral character in half. WTF-8 is UTF-8 extended to encode a
+   surrogate standing alone (as the three-byte form UTF-8 reserves for it), so
+   those strings are representable here; a high surrogate followed by its low
+   one is stored as the single four-byte sequence they are as a code point.
+   That joining rule is what makes byte equality and UTF-16 equality the same
+   relation, which is what lets the equality and comparison helpers stay byte
+   comparisons.
+
+   flags is TY_SF_ASCII when no byte has the high bit set -- then a code unit
+   index and a byte offset are the same number, and the index conversions are
+   the identity -- and TY_SF_BC once the breadcrumb table has been built. The
+   table is what keeps random access linear in the string's length rather than
+   in the whole of it: bc[k] is the byte offset of code unit 64*k, so reaching
+   unit i1 starts at bc[i1 >> 6] and decodes at most 63 units. It lives inside
+   the string's own block (so the collector has nothing new to trace) and is
+   built on first use, because a string that is never indexed should not pay
+   for it. */
 typedef struct tystr {
   tyobj obj;
-  int64_t len;
-  char *data;
+  int64_t blen;
+  int32_t ulen;
+  uint32_t flags;
 } tystr;
+
+#define TY_SF_ASCII 1u
+#define TY_SF_BC 2u
+/* Breadcrumb granularity, in code units. */
+#define TY_BC_UNITS 64
+
+/* The bytes follow the header, and the breadcrumbs follow the terminating NUL
+   (padded up to the alignment an int32 needs). Offsets rather than pointers,
+   because the bytes are the string's own tail: there is nothing to point at. */
+#define TY_STR_DATA(s) ((char *)(s) + sizeof(tystr))
+/* Where the breadcrumb table starts, from the byte length: after the bytes and
+   their terminator, raised to the alignment an int32 needs. It is separate from
+   the accessor because a compiler-emitted literal is a C struct whose table has
+   to land exactly here, and the generated code asserts that it does. */
+#define TY_STR_BC_OFF(blen) ((sizeof(tystr) + (size_t)(blen) + 1 + 3) & ~(size_t)3)
+#define TY_STR_BC(s) ((int32_t *)((char *)(s) + TY_STR_BC_OFF((s)->blen)))
+/* Entries, one per 64 code units, plus the entry for unit zero. Only exists
+   when the string is not ASCII; an ASCII string needs no index. */
+#define TY_STR_NBC(s) (((s)->flags & TY_SF_ASCII) ? 0 : ((s)->ulen >> 6) + 1)
+#define TY_STR_ASCII(s) (((s)->flags & TY_SF_ASCII) != 0)
 
 typedef struct tyarr {
   tyobj obj;
@@ -585,8 +631,15 @@ void ty_mon_notify(void *obj);
 void ty_mon_notify_all(void *obj);
 
 /* ---- strings ---------------------------------------------------------- */
+/* ty_str_new takes canonical WTF-8 -- the runtime's own bytes. Bytes that came
+   from outside go through ty_str_of_utf8, which validates them and replaces
+   what is not a well-formed sequence with U+FFFD, and ty_str_of_bytes does the
+   same for a range of a byte[]. */
 tystr *ty_str_new(const char *data, int64_t len);
 tystr *ty_str_intern(const char *data);
+tystr *ty_str_of_utf8(const char *data, int64_t len);
+tystr *ty_str_of_bytes(tyarr *b, int32_t off, int32_t len);
+tystr *ty_str_of_bytes_all(tyarr *b);
 int64_t ty_str_len(tystr *s);
 tystr *ty_str_concat(tystr *a, tystr *b);
 int32_t ty_str_eq(tystr *a, tystr *b);

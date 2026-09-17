@@ -88,6 +88,42 @@ func Signature(name string, params []ast.Type) string {
 	return b.String()
 }
 
+// ParamDescriptor is one parameter's component of a key: a primitive keeps its
+// single letter and a class its simple name, but an array carries its element's
+// descriptor after the `A`.
+//
+// A bare `A` for every array is not injective, and the compiler builds method
+// keys from these -- the native method table's keys and the C symbol of a
+// user-declared native method both. With one letter for every array,
+// String(char[]) and String(byte[]) share a key and one of the two constructors
+// runs the other's helper; `size(int[])` and `size(String[])` were the same
+// symbol. `int[]` is `AI` and `int[][]` is `AAI`.
+//
+// This is the sema package's old nativeParam, moved here because the codegen
+// table key and the native symbol have to be the same rule.
+func ParamDescriptor(t ast.Type) string {
+	if at, ok := t.(*ast.ArrayType); ok {
+		return "A" + ParamDescriptor(at.Elem)
+	}
+	return Descriptor(t)
+}
+
+// KeySignature renders the parameter list a method is looked up by: the same as
+// Signature, except that an array parameter names its element.
+func KeySignature(name string, params []ast.Type) string {
+	var b strings.Builder
+	b.WriteString(name)
+	b.WriteByte('(')
+	for i, p := range params {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(ParamDescriptor(p))
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
 // FloatLiteral renders a floating point value as a C literal of the right
 // width. The value must keep a fractional or exponent part, because an
 // integral spelling such as 10 would turn the surrounding expression into

@@ -110,7 +110,7 @@ func EmitLLVM(p *sema.Program) (ir string, ref *Refusal) {
 // program compiled against internal/runtime/src/tyrt.h (clang 22, x86-64 Linux):
 //
 //	jmp_buf 200          tycatch { buf 0, prev 200, ex 208 }              216
-//	tystr  { obj 0, len 8, data 16 }                                      24
+//	tystr  { obj 0, blen 8, ulen 16, flags 20 }                           24
 //	tyarr  { obj 0, len 8, data 16, esize 24, refs 28, elemcls 32 }       40
 //	tymap  { sel 0, fn 8 }                                                16
 //	tyclass { name 0, id 8, flags 12, super 16, niface 24, ifaces 32,
@@ -190,8 +190,9 @@ var tymapLayout = []rtField{
 
 var tystrLayout = []rtField{
 	{"obj", "ptr", 0},
-	{"len", "i64", 8},
-	{"data", "ptr", 16},
+	{"blen", "i64", 8},
+	{"ulen", "i32", 16},
+	{"flags", "i32", 20},
 }
 
 var tyarrLayout = []rtField{
@@ -867,17 +868,28 @@ func (e *llvmEmitter) teyruString(s string) string {
 
 func (e *llvmEmitter) emitStrings() {
 	for i, s := range e.strOrder {
-		// The literal carries a terminating NUL, exactly as the C back end's
-		// string literal does (`static tystr S0 = {...}` points at "abc\0").
-		// It is not a convenience: the runtime's string helpers read the
-		// character after the last one -- ty_str_lastindexof_ch_from walks to
-		// `data[len]` -- so a literal that stops at its length makes them read
-		// whatever the linker put next, which is a wrong answer and, under
-		// AddressSanitizer, a global-buffer-overflow.
-		fmt.Fprintf(&e.globals, "@.sb%d = private unnamed_addr constant [%d x i8] c\"%s\", align 1\n",
-			i, len(s)+1, llvmBytes(s, true))
-		fmt.Fprintf(&e.globals, "@S%d = internal global %%tystr { ptr @cls_%s, i64 %d, ptr @.sb%d }, align 8\n",
-			i, util.Mangle(e.p.Builtins.String.Full), len(s), i)
+		// A literal is the whole object, byte for byte the shape the C back end
+		// emits and the runtime reads: the header with both lengths and the
+		// ASCII bit filled in, the bytes and their terminating NUL, and the
+		// breadcrumb table's space. The table is zeroed and its bit left clear,
+		// so the first index operation builds it -- which is why the object is
+		// writable (`internal global`) rather than a constant.
+		//
+		// The terminating NUL is not a convenience: the runtime's string
+		// helpers read the character after the last one -- lastIndexOf walks to
+		// `data[len]` -- so a literal that stopped at its length would make
+		// them read whatever the linker put next, which is a wrong answer and,
+		// under AddressSanitizer, a global-buffer-overflow.
+		units, ascii := util.StringUnits(s)
+		flags := 0
+		if ascii {
+			flags = util.StrFlagASCII
+		}
+		nbc := util.StrBreadcrumbs(units, ascii)
+		fmt.Fprintf(&e.globals, "@S%d = internal global { %%tystr, [%d x i8], [%d x i32] } "+
+			"{ %%tystr { ptr @cls_%s, i64 %d, i32 %d, i32 %d }, [%d x i8] c\"%s\", [%d x i32] zeroinitializer }, align 8\n",
+			i, len(s)+1, nbc, util.Mangle(e.p.Builtins.String.Full), len(s), units, flags,
+			len(s)+1, llvmBytes(s, true), nbc)
 	}
 	for i, s := range e.cstrOrder {
 		fmt.Fprintf(&e.globals, "@.cs%d = private unnamed_addr constant [%d x i8] c\"%s\", align 1\n",

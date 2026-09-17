@@ -282,7 +282,7 @@ int32_t ty_ann_argindex(int64_t ah, tystr *name) {
   if (!a || !name) return -1;
   for (int32_t i = 0; i < a->nargs; i++) {
     const char *have = a->args[i].name;
-    if (strlen(have) == (size_t)name->len && memcmp(have, name->data, (size_t)name->len) == 0) {
+    if (strlen(have) == (size_t)name->blen && memcmp(have, TY_STR_DATA(name), (size_t)name->blen) == 0) {
       return i;
     }
   }
@@ -536,16 +536,16 @@ void *ty_class_forname_in(tystr *name, tyclass **table, int32_t count, tyclass *
   if (!name) ty_throw(builtin_ex(TY_NPE, "name is null"));
   for (int32_t i = 0; i < count; i++) {
     tyclass *k = table[i];
-    if (k && k->name && strlen(k->name) == (size_t)name->len &&
-        strncmp(k->name, name->data, (size_t)name->len) == 0) {
+    if (k && k->name && strlen(k->name) == (size_t)name->blen &&
+        strncmp(k->name, TY_STR_DATA(name), (size_t)name->blen) == 0) {
       return ty_class_make(H(k), clscls);
     }
   }
   /* The message is the name that was asked for. It is built as a string object
      so the bytes are the collector's to free, rather than a C buffer this
      function would leak on the way out. */
-  tystr *asked = ty_str_new(name->data, name->len);
-  ty_throw(builtin_ex(TY_CNF, asked->data));
+  tystr *asked = ty_str_new(TY_STR_DATA(name), name->blen);
+  ty_throw(builtin_ex(TY_CNF, TY_STR_DATA(asked)));
   return NULL;
 }
 

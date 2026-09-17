@@ -241,9 +241,15 @@ func (l *lexer) escape(sb *strings.Builder) {
 					if v2, err := strconv.ParseUint(l.src[l.pos+2:l.pos+6], 16, 32); err == nil {
 						r = ((r - 0xD800) << 10) + (rune(v2) - 0xDC00) + 0x10000
 						l.pos += 6
+						sb.WriteRune(r)
+						return
 					}
 				}
-				sb.WriteRune(r)
+				// A code unit on its own, which here means a lone surrogate:
+				// "\uD800" is a string Java can hold, and Go's WriteRune would
+				// write U+FFFD for it instead, because a surrogate is not a
+				// code point. WTF-8 has the encoding Java needs.
+				writeUnit(sb, r)
 				return
 			}
 		}
@@ -261,6 +267,25 @@ func (l *lexer) escape(sb *strings.Builder) {
 }
 
 func utf16IsSurrogate(r rune) bool { return r >= 0xD800 && r < 0xDC00 }
+
+// writeUnit appends one UTF-16 code unit: its WTF-8 encoding as a string, which
+// is one, two or three bytes below 0x10000. The three-byte branch is the one
+// that matters -- it is how a surrogate with no partner is stored, and a
+// surrogate pair never reaches here, since the caller merges it into the code
+// point it spells.
+func writeUnit(sb *strings.Builder, u rune) {
+	switch {
+	case u < 0x80:
+		sb.WriteByte(byte(u))
+	case u < 0x800:
+		sb.WriteByte(byte(0xC0 | u>>6))
+		sb.WriteByte(byte(0x80 | u&0x3F))
+	default:
+		sb.WriteByte(byte(0xE0 | u>>12))
+		sb.WriteByte(byte(0x80 | (u>>6)&0x3F))
+		sb.WriteByte(byte(0x80 | u&0x3F))
+	}
+}
 
 func (l *lexer) stringLit() {
 	start := l.pos
