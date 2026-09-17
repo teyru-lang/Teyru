@@ -228,12 +228,30 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
 - checked exception 沒有編譯期檢查。
 - `sealed` 的 `permits` 子句沒有被驗證：沒有 `permits` 的 sealed 型別在 switch
   窮盡性上被視為不可判定而要求 `default`。
+- **`HashMap`／`HashSet` 的走訪順序照 JDK 的版面（W6，決策 D7）**：`HashMap` 走的是桶
+  ——`h ^ (h >>> 16)` 擾動、容量為 2 的冪、0.75 負載因子、**新項目追加到桶尾**、擴容時
+  lo／hi 拆分並保持相對順序、門檻在擴容時加倍、`putMapEntries` 對還沒有表的 map 依來源
+  大小預先定量——所以 `toString`、`keySet`、`values`、`entrySet` 與 `HashSet` 的迭代順序
+  與 JDK 21 逐字相同。`tests/programs/t250_map_order` 把每一條規則各釘一行，期望值由 JDK
+  跑 `t250_map_order.java.ref` 產生：五個字串鍵（桶 0、0、1、1、12）、同一桶的四個整數鍵、
+  第 13 個鍵擴到 32 桶、複製建構子的預先定量、負載因子 0.6 的門檻加倍（9 → 18，不是
+  `(int)(32*0.6)=19`）、`putAll` 的預先定量。`toString` 以前走的是插入序連結串列
+  （`LinkedHashMap` 用的那一條），現在走 `entryIterator()`，兩個類別各自印出自己的順序。
+  **未涵蓋**：桶裡有 8 個以上項目、且表已達 64 桶時 Java 會把該桶樹化，而 `treeifyBin`
+  把樹根搬到桶的前端——那個桶的走訪順序於是取決於樹的形狀。非 Comparable、雜湊又分不出
+  高低的鍵用 `System.identityHashCode` 決勝，原理上不可重現，所以沒有實作；64 桶以下的表
+  不會樹化，那些表在任何鍵集合下都與 Java 同序。
 - 反射在 `lib/26_reflect.teyru`：`Class`、`Field`、`Method`、`Constructor`、
   `Modifier`、`Array` 與 `java.lang.reflect` 的六個例外，讀的是編譯器為每個類別
   產生的靜態表（欄位、方法、修飾子、列舉常數），所以查一次資料是走一次陣列，
   執行期不建表。與 Java 的差異（都已實測，不是未驗證）：
-  - 類別名是 Teyru 的：`String.class.getName()` 是 `teyru.String`，
-    `Class.forName` 兩種寫法都收（`java.lang.String` 會找到同一類別）。
+  - 類別名報告的是 JDK 的名字（W6、決策 D8）：`String.class.getName()` 是
+    `java.lang.String`，`Map.Entry` 是 `java.util.Map$Entry`，例外類別因此是
+    `java.lang.IllegalStateException` 而不是 `teyru.IllegalStateException`（未攔截的
+    輸出、`Throwable.toString` 與訊息裡的類別名都跟著改）。程式自己宣告的類別仍以
+    自己的名字報告，而**查詢用的是二元名**：`Class.forName` 兩種寫法都收
+    （`java.lang.String` 與 `teyru.String` 會找到同一類別）。不在 JDK 對照表裡的
+    標準程式庫類別（`Array`、web、JSON、socket 那幾層）仍報 `teyru.*`。
   - 註解反射有，但元素是**按名字讀**：`Class`／`Field`／`Method`／`Constructor`
     上的 `getAnnotations()`、`getAnnotation(Class)`、`isAnnotationPresent(Class)` 是
     Java 的，`Annotation` 則沒有「每個註解型別一個實作類別」——所以要
