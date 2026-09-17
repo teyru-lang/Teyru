@@ -116,6 +116,60 @@ class RawClient {
     return in.read()
   }
 
+  /* ---- a request whose answer may be a while ---- */
+
+  // What ask answers when there was no status line: the connection ended first,
+  // or the attempts ran out. A marker rather than null, so that a run which
+  // fails this way is a line in a diff rather than an absence.
+  public static final String CLOSED_WITHOUT_ANSWER = "<closed with no answer>"
+  public static final String NO_ANSWER = "<no answer>"
+
+  // RETRY_READ_MS is how long one read waits, and RETRY_ATTEMPTS how many of
+  // them ask() takes before it gives up: fifteen seconds of patience in pieces
+  // of half a second.
+  public static final int RETRY_READ_MS = 500
+  public static final int RETRY_ATTEMPTS = 30
+
+  /* ask sends one request and answers the first line of the answer -- the status
+     line -- retrying a read that timed out with nothing in hand.
+
+     The retry is not robustness for its own sake and it is not a workaround for
+     a flaky socket. It is this runtime's collector, which is cooperative: a
+     thread blocked inside a native recv() is not at a safepoint, and a test's
+     own client waiting for an answer is exactly such a thread. A collection
+     that starts while the handler is running therefore waits for the client,
+     which is waiting for the answer -- so a single long read sees the answer
+     only when it gives up, and a live server looks like a dead one. Reading in
+     short pieces is what turns that into an answer that arrives half a second
+     late, and it is bound to this property: when the safepoint gap is closed
+     (W3.11) this retry should be *deleted*, and the test that says so is the
+     one that then shows the answer arriving to a single blocking read. Until
+     such a test exists, a read in one long piece is not measuring a server, it
+     is measuring the collector.
+
+     Nothing has been read when the retry happens, so a retry is reading from
+     the start of the answer and never into the middle of one. */
+  public String ask(String request) {
+    return ask(request, RETRY_READ_MS, RETRY_ATTEMPTS)
+  }
+
+  public String ask(String request, int readMs, int attempts) {
+    send(request)
+    for (int attempt = 0 : attempt < attempts : attempt++) {
+      socket.setSoTimeout(readMs)
+      try {
+        String line = in.readLine()
+        if (line == null) {
+          return CLOSED_WITHOUT_ANSWER
+        }
+        return line
+      } catch (SocketTimeoutException e) {
+        // nothing read yet: the server is paused rather than gone
+      }
+    }
+    return NO_ANSWER
+  }
+
   // readFully is exactly len bytes off the stream, which is what a body framed
   // by a length or by chunks is: a short read is not a short body, it is a
   // connection that ended in the middle of one.
