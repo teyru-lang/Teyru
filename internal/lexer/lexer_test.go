@@ -46,13 +46,40 @@ func TestNewlineFlag(t *testing.T) {
 	}
 }
 
-func TestSemicolonIsRejected(t *testing.T) {
-	_, errs := lex("int x = 1;")
-	if errs == "" {
-		t.Fatal("a semicolon must be rejected")
+// A semicolon ends a statement the way a newline does (decision D6): it is an
+// ordinary token, and the token after it starts a new logical line.
+func TestSemicolonEndsTheStatement(t *testing.T) {
+	toks, errs := lex("int x = 1; int y = 2;")
+	if errs != "" {
+		t.Fatalf("a semicolon must be accepted: %s", errs)
 	}
-	if !contains(errs, "TY-SYN-0001") {
-		t.Errorf("wrong diagnostic: %s", errs)
+	semis, after := 0, 0
+	for i, tk := range toks {
+		if tk.Kind != Op || tk.Text != ";" {
+			continue
+		}
+		semis++
+		if i+1 < len(toks) && toks[i+1].NL {
+			after++
+		}
+	}
+	if semis != 2 {
+		t.Errorf("expected 2 semicolon tokens, got %d", semis)
+	}
+	if after != 2 {
+		t.Errorf("the token after a semicolon must carry the NL flag: %d of %d", after, semis)
+	}
+}
+
+// A semicolon terminates the statement it follows, so it is the last token on
+// its line as far as the flag is concerned.
+func TestSemicolonOnItsOwnLine(t *testing.T) {
+	toks, errs := lex(";;")
+	if errs != "" {
+		t.Fatalf("empty statements are legal: %s", errs)
+	}
+	if got := kinds(toks); len(got) != 3 || got[0] != Op || got[1] != Op || got[2] != EOF {
+		t.Errorf("expected two semicolons and EOF, got %v", got)
 	}
 }
 

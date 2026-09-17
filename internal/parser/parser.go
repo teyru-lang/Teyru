@@ -125,6 +125,12 @@ func (p *parser) lineBreak() bool { return p.nlSig() && p.tok().NL }
 
 // terminator checks that a statement/declaration ends here.
 func (p *parser) terminator() {
+	// A statement ends at a line break, at a ';', or at the '}' that closes the
+	// body it is the last statement of. Both spellings are accepted, and the
+	// lexer already flags the token after a ';' as starting a new line, so a
+	// run of them is consumed here rather than reported as an empty statement.
+	for p.accept(";") {
+	}
 	t := p.tok()
 	if t.NL || t.Kind == lexer.EOF || p.is("}") {
 		return
@@ -229,6 +235,10 @@ func (p *parser) parseFile() *ast.File {
 	var implicit *ast.ClassDecl
 	for p.tok().Kind != lexer.EOF {
 		start := p.i
+		if p.accept(";") {
+			// a lone ';' between declarations is Java's empty declaration
+			continue
+		}
 		pos := p.pos()
 		annos := p.parseAnnotations()
 		mods := p.parseModifiers()
@@ -241,7 +251,9 @@ func (p *parser) parseFile() *ast.File {
 				if i := strings.LastIndexAny(name, "/\\"); i >= 0 {
 					name = name[i+1:]
 				}
-				name = strings.TrimSuffix(name, ".teyru")
+				// A `.java` file names the implicit class the same way: it is
+				// the file name, and both extensions are source spellings.
+				name = strings.TrimSuffix(strings.TrimSuffix(name, ".teyru"), ".java")
 				implicit = &ast.ClassDecl{Pos: pos, Kind: ast.KindClass, Name: sanitizeName(name), Implicit: true, Mods: ast.ModFinal}
 				file.Types = append(file.Types, implicit)
 			}
@@ -574,6 +586,11 @@ func (p *parser) parseClassBody(cd *ast.ClassDecl) {
 		p.parseEnumConstants(cd)
 	}
 	for !p.is("}") && p.tok().Kind != lexer.EOF {
+		if p.accept(";") {
+			// Java allows ';' in a class body: after the enum constants, after
+			// a member, and after the body of an anonymous class
+			continue
+		}
 		start := p.i
 		pos := p.pos()
 		annos := p.parseAnnotations()
@@ -607,6 +624,12 @@ func (p *parser) parseEnumConstants(cd *ast.ClassDecl) {
 		if !p.accept(",") {
 			break
 		}
+	}
+	// Java writes ';' after the constant list, Teyru writes ':'; the ';' is
+	// consumed here, and the class body loop would skip it as an empty
+	// declaration if it were not.
+	if p.accept(";") {
+		return
 	}
 	if !p.accept(":") && !p.is("}") {
 		p.errf(p.pos(), "TY-SYN-0104", "expected ',' ':' or '}' after enum constants")
@@ -901,6 +924,11 @@ func (p *parser) parseStatement() ast.Stmt {
 	pos := p.pos()
 	t := p.tok()
 	switch {
+	case p.is(";"):
+		// the empty statement of Java (`if (x);`): the statement that does
+		// nothing and completes normally
+		p.next()
+		return &ast.Empty{Pos: pos}
 	case p.is("{"):
 		return p.parseBlock()
 	case p.is("if"):
@@ -934,7 +962,7 @@ func (p *parser) parseStatement() ast.Stmt {
 	case p.is("return"):
 		p.next()
 		s := &ast.Return{Pos: pos}
-		if !p.tok().NL && !p.is("}") && p.tok().Kind != lexer.EOF {
+		if !p.tok().NL && !p.is(";") && !p.is("}") && p.tok().Kind != lexer.EOF {
 			s.X = p.parseExpr()
 		}
 		p.terminator()
@@ -1060,7 +1088,7 @@ func (p *parser) tryLocalVar(allowMulti bool) *ast.LocalVar {
 		if p.tok().Kind != lexer.Ident || p.tok().NL {
 			return false
 		}
-		if !(p.isAt(1, "=") || p.isAt(1, ",") || p.isAt(1, "[") || p.isAt(1, ":") || p.isAt(1, ")") || p.peekN(1).NL || p.isAt(1, "}") || p.peekN(1).Kind == lexer.EOF) {
+		if !(p.isAt(1, "=") || p.isAt(1, ",") || p.isAt(1, "[") || p.isAt(1, ":") || p.isAt(1, ")") || p.isAt(1, ";") || p.peekN(1).NL || p.isAt(1, "}") || p.peekN(1).Kind == lexer.EOF) {
 			return false
 		}
 		lv = &ast.LocalVar{Pos: pos, Mods: mods, Type: typ, Annos: annos}
@@ -1125,7 +1153,7 @@ func (p *parser) parseFor() ast.Stmt {
 		return fe
 	}
 	s := &ast.For{Pos: pos}
-	if !p.is(":") {
+	if !p.isForSep() {
 		if lv := p.tryLocalVar(true); lv != nil {
 			s.Init = append(s.Init, lv)
 		} else {
@@ -1138,11 +1166,11 @@ func (p *parser) parseFor() ast.Stmt {
 			}
 		}
 	}
-	p.expect(":")
-	if !p.is(":") {
+	p.forSep()
+	if !p.isForSep() {
 		s.Cond = p.parseExpr()
 	}
-	p.expect(":")
+	p.forSep()
 	if !p.is(")") {
 		for {
 			s.Update = append(s.Update, p.parseExpr())
@@ -1155,6 +1183,19 @@ func (p *parser) parseFor() ast.Stmt {
 	p.expect(")")
 	s.Body = p.parseStatement()
 	return s
+}
+
+// isForSep reports whether the classic for header is at one of its separators.
+func (p *parser) isForSep() bool { return p.is(":") || p.is(";") }
+
+// forSep consumes the separator between the three parts of a classic for
+// header. Teyru spells it ':' and Java spells it ';'; both are accepted
+// (decision D6), and the diagnostic for a missing one keeps the older wording.
+func (p *parser) forSep() {
+	if p.accept(";") {
+		return
+	}
+	p.expect(":")
 }
 
 func (p *parser) parseTry() ast.Stmt {
@@ -1170,6 +1211,11 @@ func (p *parser) parseTry() ast.Stmt {
 				p.pushNL(false)
 				s.Resources = append(s.Resources, &ast.ExprStmt{Pos: rp, X: p.parseExpr()})
 				p.popNL()
+			}
+			if p.accept(";") {
+				// Java separates the resources with ';', Teyru with a line
+				// break; the ';' is the end of the one just read either way.
+				continue
 			}
 			if !p.is(")") && !p.tok().NL {
 				p.errf(p.pos(), "TY-SYN-0107", "try resources must be separated by line breaks")
