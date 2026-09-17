@@ -83,21 +83,17 @@ class Scanner extends Object implements AutoCloseable {
     this.input = source
   }
 
-  /* \p{javaWhitespace}, narrowed to the ten characters of it that are ASCII:
-     the six whitespace characters and the four control separators. Java's
-     delimiter is the whole of Character.isWhitespace, so the two disagree
-     above U+007F -- U+00A0, U+2007 and U+202F are not whitespace there while
-     U+1680, U+2000..U+200A, U+2028, U+2029, U+205F and U+3000 are -- and this
-     side of the boundary is what the class was built for: a scanner over a
-     line of fields. The narrowing is a decision about which characters
-     separate fields and not a consequence of how a string is stored; the
-     character that reaches it is a code unit, which is what String.charAt
-     answers. */
+  /* \p{javaWhitespace}, which is Character.isWhitespace and not a rule of this
+     class's own: the six ASCII whitespace characters, the four control
+     separators, and the Unicode space characters except the three non-breaking
+     ones (U+00A0, U+2007 and U+202F are not whitespace to Java; U+1680,
+     U+2000..U+200A, U+2028, U+2029, U+205F and U+3000 are). The narrowing to
+     ASCII ten this used to make was a byte-era decision that nothing needed:
+     the runtime classifies code points for Character already, and
+     StringTokenizer -- the one class whose default set really is five ASCII
+     characters -- says so in lib/25_util_misc.teyru and keeps its own. */
   private static boolean isWhitespace(int c) {
-    if (c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13) {
-      return true
-    }
-    return c >= 0x1C && c <= 0x1F
+    return Character.isWhitespace(c)
   }
 
   private void requireOpen() {
@@ -222,13 +218,14 @@ class Scanner extends Object implements AutoCloseable {
     return pos < input.length()
   }
 
-  /* The rest of the current line, terminator and all consumed; the separators
-     are LF, CRLF and a lone CR, as java.io's readers and this library's
-     LineScanner read them. U+2028, U+2029 and U+0085 are line separators to
-     Java's Scanner and are not treated as ones here: this reader splits on the
-     three terminators java.io uses and on nothing else, which is the same
-     narrowing the delimiter set above makes and is recorded here as a
-     difference rather than left to be discovered. */
+  /* The rest of the current line, terminator and all consumed. The terminators
+     are Java's Scanner's, which are the whole of
+     "\r\n|[\n\r\u2028\u2029\u0085]" and not the three java.io's readers use:
+     CRLF is one terminator, and a lone CR, a lone LF, U+2028 (LINE SEPARATOR),
+     U+2029 (PARAGRAPH SEPARATOR) and U+0085 (NEXT LINE) are each one on their
+     own. Splitting on the narrower set was wrong in both directions -- a line
+     of text holding a U+2028 came back as one line, and a U+2028 that Java
+     ends a line at was a token character here. */
   public String nextLine() {
     requireOpen()
     if (pos >= input.length()) {
@@ -237,7 +234,7 @@ class Scanner extends Object implements AutoCloseable {
     int start = pos
     while (pos < input.length()) {
       int c = input.charAt(pos)
-      if (c == 10) {
+      if (c == 10 || c == 0x2028 || c == 0x2029 || c == 0x0085) {
         String line = input.substring(start, pos)
         pos = pos + 1
         return line
