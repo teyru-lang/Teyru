@@ -863,8 +863,8 @@ class JsonPrimitive extends JsonElement {
     if (s.length() == 0) {
       throw new UnsupportedOperationException("String value is empty")
     }
-    // the first byte of a UTF-8 string, where Java takes the first UTF-16 code
-    // unit: the language's String is bytes and cannot offer the other
+    // Java's getAsString().charAt(0), which is what Gson answers: a char is one
+    // UTF-16 code unit here, and the cast is the one Gson's signature asks for
     return (char) s.charAt(0)
   }
 
@@ -1485,10 +1485,10 @@ class JsonWriter {
     }
   }
 
-  /* Gson's replacement table, applied byte by byte. Strings here are UTF-8, so
-     a byte above 0x7f is never a character on its own: it is part of a
-     multi-byte sequence that has to be copied verbatim (which substring does)
-     rather than re-appended as a char, which would encode the byte again. */
+  /* Gson's replacement table, applied one code unit at a time. What is not
+     escaped here is not touched either: the run between two escapes is copied
+     with substring rather than re-appended unit by unit, so a character outside
+     ASCII arrives as it was, including the two halves an astral one is held as. */
   private void escape(String value) {
     int length = value.length()
     out.append('"')
@@ -2285,11 +2285,11 @@ class JsonReader {
     return src.substring(start, pos)
   }
 
-  /* Everything between the quotes is UTF-8, so the bytes of a multi-byte
-     character are copied with substring and never re-appended one by one; only
-     escapes are decoded. A single quote opens a string too when the reader is
-     lenient, which is Gson's other spelling of a string; the two are not
-     interchangeable inside one literal -- `'a"` is unterminated. */
+  /* Everything between the quotes is copied with substring and never re-appended
+     one code unit at a time, so a character outside ASCII survives as it
+     arrived; only escapes are decoded. A single quote opens a string too when
+     the reader is lenient, which is Gson's other spelling of a string; the two
+     are not interchangeable inside one literal -- `'a"` is unterminated. */
   private String parseStringLiteral() {
     char quote = src.charAt(pos)
     pos++

@@ -16,11 +16,11 @@ package teyru
 //     lookbehind, no backreferences, no named groups, no \p{...} classes.
 //     Anything unsupported is refused by Pattern.compile with a message naming
 //     it, rather than silently matching something else.
-//   - Matching is over bytes, because this library's String counts bytes rather
-//     than UTF-16 code units (`docs/language.md` §11). For ASCII -- which is
-//     what the patterns in ordinary code are -- the two are the same thing; for
-//     text outside it, `.` and a character class see one byte at a time where
-//     Java sees one character.
+//   - Matching is over UTF-16 code units, which is the unit this library's
+//     String is indexed by. For ASCII -- which is what the patterns in ordinary
+//     code are -- that is the same thing as Java's code points; for text outside
+//     it, `.` and a character class take one unit at a time where Java takes one
+//     code point, so an astral character is two of them here and one there.
 
 // ---------------------------------------------------------------- syntax tree
 
