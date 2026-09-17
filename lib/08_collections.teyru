@@ -908,11 +908,23 @@ class HashMap<K, V> implements Map<K, V> {
      doubled on resize by splitting each one in place. None of that is
      specified -- iteration order is explicitly unspecified -- but all of it is
      observable, and reproducing it is what lets this map's order be checked
-     against javac instead of against itself. */
+     against javac instead of against itself.
+
+     What that costs is the one thing Java does that this does not: a bin of
+     eight or more entries treeifies once the table has 64 slots
+     (TREEIFY_THRESHOLD), and treeifyBin moves the tree's root to the front of
+     the bin -- so the walk order of such a bin is the tree's shape rather than
+     its insert order. Reproducing that would mean reproducing the red-black
+     tree, and for keys that are neither Comparable nor distinguishable by hash
+     Java breaks the tie with System.identityHashCode, which is not
+     reproducible in principle. Nothing below 64 slots treeifies, so a table
+     that small walks in Java's order whatever its keys are. */
   private Object[] table
   private int count
   private int threshold
-  private double loadFactor = DEFAULT_LOAD_FACTOR
+  /* float, as Java's is: the field is read as a double where a threshold is
+     computed from it, and a float load factor is what the JDK multiplies by. */
+  private float loadFactor = DEFAULT_LOAD_FACTOR
 
   /* Insertion order, or access order in a LinkedHashMap with accessOrder set;
      both are maintained by the base class, see linkNode/unlinkNode.
@@ -922,7 +934,8 @@ class HashMap<K, V> implements Map<K, V> {
   HashEntry<K, V> tail
 
   private static final int DEFAULT_CAPACITY = 16
-  private static final double DEFAULT_LOAD_FACTOR = 0.75
+  // 0.75f, as Java's constant is: the field it initializes is a float
+  private static final float DEFAULT_LOAD_FACTOR = 0.75f
 
   public HashMap() {
   }
@@ -995,8 +1008,19 @@ class HashMap<K, V> implements Map<K, V> {
     }
     int index = hash & (table.length - 1)
     e = new HashEntry<K, V>(hash, key, value)
-    e.next = (HashEntry<K, V>) table[index]
-    table[index] = e
+    /* Appended to the bin's tail rather than prepended to its head, which is
+       what Java 8 does and what makes a bin walk in insert order. Java 7
+       prepended, and that is one of the two reasons this map's order did not
+       match the JDK's. */
+    HashEntry<K, V> last = (HashEntry<K, V>) table[index]
+    if (last == null) {
+      table[index] = e
+    } else {
+      while (last.next != null) {
+        last = last.next
+      }
+      last.next = e
+    }
     linkNode(e)
     count++
     afterNodeInsertion(true)
@@ -1007,6 +1031,27 @@ class HashMap<K, V> implements Map<K, V> {
   }
 
   public void putAll(Map<? extends K, ? extends V> m) {
+    int s = m.size()
+    if (s > 0 && table == null) {
+      /* Java's putMapEntries sizes a map that has no table yet from the source
+         rather than leaving it at the default 16: ceil(size / loadFactor)
+         rounded up to a power of two. Both the capacity and the threshold it
+         leaves differ from letting the first put build the default table --
+         and the capacity is what decides the bins, so the walk order differs
+         with it. (The other half of Java's rule, resizing first when the source
+         is already larger than the threshold, is not here because it is not
+         observable: it doubles the same threshold the inserts would have
+         doubled, one entry earlier, and the entries are the same either way.) */
+      double wanted = (double) s / loadFactor
+      int t = (int) wanted
+      if ((double) t < wanted) {
+        t++
+      }
+      int cap = tableSizeFor(t)
+      if (cap > threshold) {
+        threshold = cap
+      }
+    }
     for (Object k : m.keySet()) {
       put((K) k, (V) m.get(k))
     }
@@ -1162,7 +1207,27 @@ class HashMap<K, V> implements Map<K, V> {
   private void resize() {
     Object[] old = table
     int oldCap = old == null ? 0 : old.length
-    int newCap = oldCap == 0 ? (threshold > 0 ? threshold : DEFAULT_CAPACITY) : oldCap * 2
+    int newCap
+    int newThr = 0
+    if (oldCap > 0) {
+      newCap = oldCap * 2
+      /* Java doubles the threshold rather than recomputing it once the table
+         has grown at least once, and the two are not the same number when the
+         load factor does not divide the capacity: 0.6 over 16 slots is 9, and
+         the next threshold is 18 rather than (int) (32 * 0.6) = 19. The
+         difference moves the growth after that, which moves the bins. */
+      if (oldCap >= DEFAULT_CAPACITY) {
+        newThr = threshold * 2
+      }
+    } else if (threshold > 0) {
+      // the capacity a constructor stashed; the threshold follows below
+      newCap = threshold
+    } else {
+      newCap = DEFAULT_CAPACITY
+    }
+    if (newThr == 0) {
+      newThr = (int) (newCap * loadFactor)
+    }
     Object[] next = new Object[newCap]
     if (old != null) {
       for (int i = 0 : i < oldCap : i++) {
@@ -1203,7 +1268,7 @@ class HashMap<K, V> implements Map<K, V> {
       }
     }
     table = next
-    threshold = (int) (newCap * loadFactor)
+    threshold = newThr
   }
 
   // the smallest power of two that is at least cap, never less than 1
@@ -1253,11 +1318,16 @@ class HashMap<K, V> implements Map<K, V> {
     StringBuilder sb = new StringBuilder()
     sb.append("{")
     boolean first = true
-    for (HashEntry<K, V> e = head : e != null : e = e.after) {
+    /* Through the map's own entry iterator, which is what Java's
+       AbstractMap.toString does: HashMap walks the bins, LinkedHashMap walks
+       its insertion links, and the order a map prints is the order it walks.
+       Walking `head` here is what made a HashMap print in insertion order. */
+    Iterator<Map.Entry<K, V>> it = entryIterator()
+    while (it.hasNext()) {
       if (!first) {
         sb.append(", ")
       }
-      sb.append(e)
+      sb.append(it.next())
       first = false
     }
     sb.append("}")

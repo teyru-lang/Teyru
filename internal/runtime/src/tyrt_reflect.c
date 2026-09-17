@@ -624,7 +624,7 @@ void ty_field_set(int64_t cm, int32_t declared, int32_t i, void *self, void *v, 
     ty_throw(builtin_ex(TY_ILLACCESS, "can not set a static final field"));
   }
   if ((f->mods & 0x0010) && !accessible) { /* Modifier.FINAL */
-    char *msg = describe(f->owner ? f->owner->name : "?", f->name);
+    char *msg = describe(ty_class_jname(f->owner), f->name);
     ty_throw(builtin_ex(TY_ILLACCESS, msg ? msg : "field is final"));
   }
   void *p = field_addr(f, self);
@@ -701,13 +701,13 @@ void *ty_method_invoke(int64_t cm, int32_t declared, int32_t i, void *self, tyar
   const tymethod *m = method_at((tyclass *)(intptr_t)cm, declared, i);
   void **a = args && args->len ? (void **)args->data : NULL;
   if (args && args->len != m->nparams) {
-    char *msg = describe(m->owner ? m->owner->name : "?", m->name);
+    char *msg = describe(ty_class_jname(m->owner), m->name);
     ty_throw(builtin_ex(TY_ILLARG, msg ? msg : "wrong number of arguments"));
   }
   if (!(m->kind & TY_METH_STATIC)) {
     if (!self) ty_throw(builtin_ex(TY_NPE, "invoke on null"));
     if (!ty_instanceof(self, m->owner)) {
-      char *msg = describe(m->owner ? m->owner->name : "?", m->name);
+      char *msg = describe(ty_class_jname(m->owner), m->name);
       ty_throw(builtin_ex(TY_ILLARG, msg ? msg : "receiver is not an instance"));
     }
   } else {
@@ -747,7 +747,7 @@ void *ty_class_newinst(int64_t cm) {
     ty_throw(builtin_ex(TY_INSTANTIATION, "cannot instantiate a primitive or an array class"));
   }
   if ((k->flags & 1) || (k->mods & 0x0400)) { /* interface or abstract */
-    ty_throw(builtin_ex(TY_INSTANTIATION, k->name));
+    ty_throw(builtin_ex(TY_INSTANTIATION, ty_class_jname(k)));
   }
   for (int32_t j = 0; j < k->nmethods; j++) {
     const tymethod *m = &k->methods[j];
@@ -755,7 +755,7 @@ void *ty_class_newinst(int64_t cm) {
       return call_invoker(m->fn, NULL, NULL);
     }
   }
-  ty_throw(builtin_ex(TY_INSTANTIATION, k->name));
+  ty_throw(builtin_ex(TY_INSTANTIATION, ty_class_jname(k)));
   return NULL;
 }
 

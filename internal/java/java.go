@@ -22,6 +22,7 @@ import (
 
 	"github.com/teyru-lang/Teyru/internal/ast"
 	"github.com/teyru-lang/Teyru/internal/source"
+	"github.com/teyru-lang/Teyru/internal/util"
 )
 
 // DiagCode is the diagnostic every refusal is reported with.
@@ -95,150 +96,18 @@ func Translate(files []*ast.File) *Result {
 
 // ---------------------------------------------------------------- the table
 //
-// javaOf maps a standard-library class name to the java.* class of the same
-// name, which is the one whose API the Teyru class is a copy of. Everything
-// listed here is translated; everything the standard library has that Java
-// does not is in refuseStdlib below and is refused by name.
-var javaOf = map[string]string{}
-
+// Which standard-library class stands for which java.* class is not decided
+// here: internal/util/javaname.go holds that mapping, because the code
+// generator needs the same one (decision D8: Class.getName reports the JDK's
+// name). Everything the mapping lists is translated; everything the standard
+// library has that Java does not is in refuseStdlib below and is refused by
+// name.
+//
 // refuseStdlib maps a standard-library class name with no java.* equivalent to
 // the reason, which is also the classification the report groups by.
 var refuseStdlib = map[string]string{}
 
 func init() {
-	// java.lang: no import is needed for any of these, and the name is the
-	// same on both sides, so translating one is a no-op that only says the
-	// name is known.
-	for _, n := range []string{
-		"Object", "String", "StringBuilder", "StringBuffer", "Math", "System",
-		"Throwable", "Exception", "RuntimeException", "Error",
-		"NullPointerException", "IndexOutOfBoundsException",
-		"ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException",
-		"ArithmeticException", "ClassCastException", "IllegalArgumentException",
-		"NumberFormatException", "IllegalStateException", "IllegalMonitorStateException",
-		"NegativeArraySizeException", "AssertionError",
-		"ArrayStoreException", "UnsupportedOperationException", "StackOverflowError",
-		"OutOfMemoryError", "Class", "Number", "Integer", "Long", "Short", "Byte",
-		"Character", "Double", "Float", "Boolean", "Void", "Cloneable",
-		"Comparable", "AutoCloseable", "Iterable", "Runnable", "Thread", "Enum",
-		"Record", "CharSequence", "ReflectiveOperationException",
-		"ClassNotFoundException", "IllegalAccessException", "InstantiationException",
-		"InvocationTargetException", "NoSuchMethodException", "NoSuchFieldException",
-		"InterruptedException", "CloneNotSupportedException", "Deprecated",
-		"Override", "SuppressWarnings", "SafeVarargs", "FunctionalInterface",
-	} {
-		javaOf[n] = "java.lang." + n
-	}
-	// java.util and the rest: these are the ones the printer has to import.
-	for _, n := range []string{
-		"List", "ArrayList", "LinkedList", "Map", "HashMap", "LinkedHashMap",
-		"TreeMap", "Set", "HashSet", "LinkedHashSet", "TreeSet", "Collection",
-		"Iterator", "ListIterator", "SortedMap", "NavigableMap", "SortedSet",
-		"NavigableSet", "Queue", "Deque", "ArrayDeque", "Arrays", "Collections",
-		"Objects", "Optional", "OptionalInt", "OptionalLong", "OptionalDouble",
-		"UUID", "Random", "StringTokenizer", "BitSet", "Base64", "HexFormat",
-		"Comparator", "Spliterator", "StringJoiner", "Enumeration",
-		"NoSuchElementException", "InputMismatchException",
-		"Scanner", "Date", "Calendar", "TimeZone",
-	} {
-		javaOf[n] = "java.util." + n
-	}
-	for _, n := range []string{
-		"NumberFormat", "DecimalFormat", "DateFormat", "SimpleDateFormat",
-		"MessageFormat", "DateFormatSymbols", "DecimalFormatSymbols",
-		"ParsePosition", "ChoiceFormat", "Format", "ParseException",
-	} {
-		javaOf[n] = "java.text." + n
-	}
-	javaOf["Spliterators"] = "java.util.Spliterators"
-	javaOf["Random"] = "java.util.Random"
-	for _, n := range []string{
-		"Stream", "IntStream", "LongStream", "DoubleStream", "Collector", "Collectors",
-	} {
-		javaOf[n] = "java.util.stream." + n
-	}
-	javaOf["StreamSupport"] = "java.util.stream.StreamSupport"
-	for _, n := range []string{
-		"Function", "BiFunction", "Consumer", "Supplier", "Predicate",
-		"UnaryOperator", "BinaryOperator", "BiConsumer", "BiPredicate",
-	} {
-		javaOf[n] = "java.util.function." + n
-	}
-	for _, n := range []string{
-		"IntFunction", "IntConsumer", "IntPredicate", "IntSupplier",
-		"IntUnaryOperator", "IntBinaryOperator",
-		"LongFunction", "LongConsumer", "LongPredicate", "LongSupplier",
-		"LongUnaryOperator", "LongBinaryOperator",
-		"DoubleFunction", "DoubleConsumer", "DoublePredicate", "DoubleSupplier",
-		"DoubleUnaryOperator", "DoubleBinaryOperator",
-		"ToIntFunction", "ToLongFunction", "ToDoubleFunction",
-		"ObjIntConsumer", "ObjLongConsumer", "ObjDoubleConsumer",
-	} {
-		javaOf[n] = "java.util.function." + n
-	}
-	for _, n := range []string{"Pattern", "Matcher", "MatchResult", "PatternSyntaxException"} {
-		javaOf[n] = "java.util.regex." + n
-	}
-	for _, n := range []string{"BigInteger", "BigDecimal", "MathContext", "RoundingMode"} {
-		javaOf[n] = "java.math." + n
-	}
-	for _, n := range []string{
-		"LocalDate", "LocalTime", "LocalDateTime", "Instant", "Duration", "Period",
-		"ZoneId", "ZoneOffset", "ZonedDateTime", "DayOfWeek", "Month",
-		"DateTimeException", "UnsupportedTemporalTypeException", "Clock",
-		"MonthDay", "YearMonth", "Year", "OffsetDateTime", "OffsetTime",
-	} {
-		javaOf[n] = "java.time." + n
-	}
-	for _, n := range []string{"DateTimeFormatter", "DateTimeParseException", "FormatStyle", "ResolverStyle"} {
-		javaOf[n] = "java.time.format." + n
-	}
-	for _, n := range []string{"ZoneOffsetTransition", "ZoneRules", "ZoneRulesException"} {
-		javaOf[n] = "java.time.zone." + n
-	}
-	for _, n := range []string{
-		"IOException", "EOFException", "UncheckedIOException", "PrintStream",
-		"PrintWriter", "InputStream", "OutputStream", "Reader", "Writer",
-		"BufferedReader", "BufferedWriter", "BufferedInputStream",
-		"BufferedOutputStream", "DataInputStream", "DataOutputStream",
-		"ByteArrayInputStream", "ByteArrayOutputStream", "FileInputStream",
-		"FileOutputStream", "FileNotFoundException", "File", "Serializable",
-		"Closeable", "Flushable",
-	} {
-		javaOf[n] = "java.io." + n
-	}
-	for _, n := range []string{
-		"ZipEntry", "ZipFile", "ZipInputStream", "ZipOutputStream", "ZipException",
-		"DataFormatException", "Adler32", "CRC32", "Checksum", "Deflater",
-		"Inflater", "GZIPInputStream", "GZIPOutputStream",
-	} {
-		javaOf[n] = "java.util.zip." + n
-	}
-	for _, n := range []string{
-		"MessageDigest", "DigestException", "GeneralSecurityException",
-		"NoSuchAlgorithmException",
-	} {
-		javaOf[n] = "java.security." + n
-	}
-	for _, n := range []string{"Files", "Path", "Paths", "NoSuchFileException"} {
-		javaOf[n] = "java.nio.file." + n
-	}
-	for _, n := range []string{
-		"Executor", "ExecutorService", "Callable", "Future", "Executors",
-		"FutureTask", "ConcurrentHashMap", "CountDownLatch", "TimeUnit",
-		"RejectedExecutionException", "ExecutionException", "CancellationException",
-		"ConcurrentMap", "CopyOnWriteArrayList", "BlockingQueue",
-		"LinkedBlockingQueue", "ArrayBlockingQueue", "Semaphore", "ThreadFactory",
-	} {
-		javaOf[n] = "java.util.concurrent." + n
-	}
-	for _, n := range []string{"AtomicInteger", "AtomicLong", "AtomicBoolean", "AtomicReference"} {
-		javaOf[n] = "java.util.concurrent.atomic." + n
-	}
-	for _, n := range []string{"Field", "Method", "Constructor", "Modifier", "Parameter"} {
-		javaOf[n] = "java.lang.reflect." + n
-	}
-
 	// The standard library that Java has no class for, by layer: the reason
 	// names the layer, because that is the decision a reader has to make.
 	web := "the web framework is Teyru's: java.* has no HttpServer, Router or Application"
@@ -300,7 +169,7 @@ func init() {
 	refuseStdlib["Logger"] = logging
 	refuseStdlib["Log"] = logging
 	for _, n := range []string{"Reflect", "Annotation", "Array"} {
-		if _, isJava := javaOf[n]; !isJava {
+		if _, isJava := util.JavaClassOf(n); !isJava {
 			refuseStdlib[n] = reflect
 		}
 	}
@@ -322,7 +191,7 @@ func init() {
 		"RegexSyntax", "PatternParser", "LineScanner", "Fs", "PropertiesFile",
 		"Properties", "Sha1", "DecimalBig", "HttpSession",
 	} {
-		if _, isJava := javaOf[n]; !isJava {
+		if _, isJava := util.JavaClassOf(n); !isJava {
 			refuseStdlib[n] = utilx
 		}
 	}
@@ -347,7 +216,7 @@ func init() {
 		"StreamConcatIterator", "CollectorChars", "CollectorImpl",
 		"MessageElement", "LinkedNode", "MatchState",
 	} {
-		if _, isJava := javaOf[n]; !isJava {
+		if _, isJava := util.JavaClassOf(n); !isJava {
 			refuseStdlib[n] = utilx
 		}
 	}

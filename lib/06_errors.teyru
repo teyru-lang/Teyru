@@ -29,9 +29,10 @@ class Throwable extends Object {
   }
   /* Java's shape: the class name, then ": " and the message when there is one,
      and the name alone when there is not -- so `throw new IllegalStateException()`
-     reads as "teyru.IllegalStateException". The package is this runtime's rather
-     than java.lang's, which is the one place a Teyru program cannot print what
-     javac would: the class it was thrown from really is teyru.IllegalStateException. */
+     reads as "java.lang.IllegalStateException", which is what javac prints for
+     the same line. getName answers the JDK name of the class this one stands in
+     for (decision D8, see the note on names in lib/26_reflect.teyru), so the
+     uncaught report at the top of main reads as Java's does. */
   public String toString() {
     String name = getClass().getName()
     if (message == null) {

@@ -117,7 +117,8 @@ func EmitLLVM(p *sema.Program) (ir string, ref *Refusal) {
 //	          nvt 40, vtable 48, clinit 56, isize 64, isel 68, imap 72,
 //	          nsub 80, subs 88, nref 96, refoffs 104, mods 112, prim 116,
 //	          fields 120, nfields 128, methods 136, nmethods 144,
-//	          consts 152, nconsts 160, annos 168, nannos 176 }           184
+//	          consts 152, nconsts 160, annos 168, nannos 176,
+//	          jname 184 }                                                 192
 //	tythread { bump 0, bump_end 8, alloc_since 16, chunk 24, roots 32, sp 40 }
 type rtField struct {
 	name string
@@ -171,6 +172,9 @@ var tyclassLayout = []rtField{
 	{"nconsts", "i32", 160},
 	{"annos", "ptr", 168},
 	{"nannos", "i32", 176},
+	// the JDK name this class reports, or null when it is named as it is
+	// (lib side: internal/runtime/src/tyrt.h, struct tyclass)
+	{"jname", "ptr", 184},
 }
 
 // tySB is StringBuilder's own struct: its state is the runtime's, not the
@@ -1346,6 +1350,13 @@ func (e *llvmEmitter) emitPrimClassRecords() {
 func (e *llvmEmitter) emitName(cl *ast.Class) {
 	fmt.Fprintf(&e.globals, "@.cn%s = private unnamed_addr constant [%d x i8] c\"%s\", align 1\n",
 		util.Mangle(cl.Full), len(cl.Full)+1, llvmBytes(cl.Full, true))
+	// The name the class reports when a program is shown one, which for a
+	// standard-library class is the JDK class it stands in for. Written only
+	// when the two differ, the way the C back end writes it.
+	if j := util.JavaName(cl.Full); j != cl.Full {
+		fmt.Fprintf(&e.globals, "@.jn%s = private unnamed_addr constant [%d x i8] c\"%s\", align 1\n",
+			util.Mangle(cl.Full), len(j)+1, llvmBytes(j, true))
+	}
 }
 
 // classFlags is the runtime's flag word: the class is an interface, the class
@@ -1507,6 +1518,9 @@ func (e *llvmEmitter) emitClassRecord(cl *ast.Class) {
 		"nconsts":  "i32 0",
 		"annos":    "ptr null",
 		"nannos":   "i32 0",
+	}
+	if j := util.JavaName(cl.Full); j != cl.Full {
+		vals["jname"] = "ptr @.jn" + n
 	}
 	fmt.Fprintf(&e.globals, "@cls_%s = internal global %%tyclass %s, align 8\n",
 		n, recordInit(e.tyclassEntries, vals))
