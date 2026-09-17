@@ -738,7 +738,13 @@ tystr *ty_file_temp_dir(tystr *prefix) {
   typlat_temp_root(base, sizeof base);
   char pfx[TY_PREFIX_MAX];
   size_t k = 0;
-  if (prefix && TY_STR_DATA(prefix)) {
+  /* The bytes are the string's own tail, so a string that is not NULL always
+     has them: `TY_STR_DATA(prefix)` is `(char *)prefix + sizeof(tystr)` and
+     cannot be NULL here. Testing it anyway is what `gcc -O2 -Wall -Wextra`
+     reports as -Waddress ("the comparison will always evaluate as 'true'"),
+     and the runtime is required to compile without warnings under exactly
+     those flags (AGENTS.md 4). */
+  if (prefix) {
     for (int64_t i = 0; i < prefix->blen && k + 1 < sizeof pfx; i++) {
       char c = TY_STR_DATA(prefix)[i];
       /* A slash in the prefix would turn the template into a different
