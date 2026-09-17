@@ -51,6 +51,9 @@ jobs:
       - name: the checks a CI job would run (format, vet, the suite under clang and gcc)
         run: make ci
 
+      - name: the unmodified-Java corpus (tests/java-compat)
+        run: make java-compat
+
       - name: the JDK differential
         run: make jdk-diff
 
