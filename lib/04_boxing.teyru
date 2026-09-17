@@ -953,6 +953,25 @@ final class Character extends Object implements Comparable<Character> {
   public static int charCount(int codePoint) {
     return codePoint >= MIN_SUPPLEMENTARY_CODE_POINT ? 2 : 1
   }
+  /* Java's toChars: the spelling of a code point, one unit below the BMP and a
+     surrogate pair above it. The counting form writes into the caller's array
+     and answers how many units it wrote. Both are named in the plan's W5 item 4
+     and neither was declared. */
+  public static char[] toChars(int codePoint) {
+    if (isBmpCodePoint(codePoint)) {
+      return new char[] {(char) codePoint}
+    }
+    return new char[] {highSurrogate(codePoint), lowSurrogate(codePoint)}
+  }
+  public static int toChars(int codePoint, char[] dst, int dstIndex) {
+    if (isBmpCodePoint(codePoint)) {
+      dst[dstIndex] = (char) codePoint
+      return 1
+    }
+    dst[dstIndex] = highSurrogate(codePoint)
+    dst[dstIndex + 1] = lowSurrogate(codePoint)
+    return 2
+  }
   public static int toCodePoint(char high, char low) {
     int hi = high - MIN_HIGH_SURROGATE
     int lo = low - MIN_LOW_SURROGATE
@@ -985,7 +1004,8 @@ final class Character extends Object implements Comparable<Character> {
   /* Java's toString(int): the string a code point spells, which is one char for
      a code point below the BMP and two for one above it. */
   public static String toString(int codePoint) {
-    return new String(new int[] {codePoint}, 0, 1)
+    char[] units = toChars(codePoint)
+    return new String(units, 0, units.length)
   }
   public static int hashCode(char c) {
     return c
