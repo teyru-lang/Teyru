@@ -74,7 +74,7 @@ jobs:
           # whatever the tree's default happens to be.
           version="${tag#v}"
           mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             os="${target%%/*}"
             arch="${target##*/}"
             ext=""
