@@ -1498,15 +1498,12 @@ class JsonWriter {
       if (c >= 128) {
         /* U+2028 and U+2029 are the only non-ASCII characters Gson escapes:
            valid JSON, but a line break if the text later ends up inside a
-           <script>. They are E2 80 A8 and E2 80 A9 here. */
-        if (c == 0xe2 && i + 2 < length && (int) value.charAt(i + 1) == 0x80) {
-          int third = (int) value.charAt(i + 2)
-          if (third == 0xa8 || third == 0xa9) {
-            out.append(value.substring(last, i))
-            out.append(third == 0xa8 ? "\\u2028" : "\\u2029")
-            i += 2
-            last = i + 1
-          }
+           <script>. A Teyru string is indexed by UTF-16 code unit, so the unit
+           read here is the character itself. */
+        if (c == 0x2028 || c == 0x2029) {
+          out.append(value.substring(last, i))
+          out.append(c == 0x2028 ? "\\u2028" : "\\u2029")
+          last = i + 1
         }
         continue
       }
@@ -2390,10 +2387,10 @@ class JsonReader {
     throw error("invalid escape sequence '\\" + e + "'")
   }
 
-  /* \uXXXX, pairing a high surrogate with the low surrogate after it. A
-     surrogate without a partner has no UTF-8 spelling that this language's
-     16-bit char can produce (appendChar would encode it as CESU-8, which is
-     not valid UTF-8), so it becomes U+FFFD. */
+  /* \uXXXX, pairing a high surrogate with the low surrogate after it: the pair
+     is appended as the two UTF-16 code units it is, which is the character. A
+     surrogate without a partner is not a character at all, and Gson replaces
+     it, so this does too. */
   private void appendUnicodeEscape(StringBuilder sb) {
     pos++
     int cp = readHex4()
@@ -2403,7 +2400,8 @@ class JsonReader {
         pos += 2
         int low = readHex4()
         if (low >= 0xdc00 && low <= 0xdfff) {
-          sb.append(encodeCodePoint(0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00)))
+          sb.append((char) cp)
+          sb.append((char) low)
           return
         }
         pos = save
@@ -2445,21 +2443,6 @@ class JsonReader {
       return c - 87
     }
     return -1
-  }
-
-  /* A code point above the BMP cannot be appended as a char: char is 16 bits
-     and StringBuilder.append(char) encodes its value, so a surrogate would come
-     out as three bytes of CESU-8 instead of the four UTF-8 wants. The four bytes
-     are written through String.replace, which substitutes single bytes, and the
-     placeholder bytes 0x01-0x04 cannot collide with any of them: a UTF-8 lead
-     or continuation byte is always 0x80 or above. */
-  private static String encodeCodePoint(int cp) {
-    String s = "\u0001\u0002\u0003\u0004"
-    s = s.replace((char) 1, (char) (0xf0 | (cp >> 18)))
-    s = s.replace((char) 2, (char) (0x80 | ((cp >> 12) & 0x3f)))
-    s = s.replace((char) 3, (char) (0x80 | ((cp >> 6) & 0x3f)))
-    s = s.replace((char) 4, (char) (0x80 | (cp & 0x3f)))
-    return s
   }
 
   private void expect(String literal) {
