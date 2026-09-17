@@ -116,12 +116,37 @@ const reflectOnly = "/* reflection-only */"
 // shape, and a dependency is the failure that does not stop anybody from
 // getting their program.
 func pruneVtables(src string) (string, bool) {
-	p := parseC(src)
+	p := parseC(src, true)
 	if p == nil {
 		return src, true
 	}
 	p.live, p.need = p.reach(false)
 	return p.rewrite(), p.reachesTLS()
+}
+
+// pruneVtablesWith is pruneVtables for a build of two translation units, the
+// standard library's and the program's. The scan reads both -- a program's
+// dispatch site is what keeps a library vtable slot filled, and a library call
+// is what a program's own code can reach -- and only the program's unit is
+// rewritten: the library's unit carries no vtables, exactly so that it does not
+// depend on the program.
+func pruneVtablesWith(library, program string) (string, bool) {
+	whole := library + program
+	p := parseC(whole, false)
+	if p == nil {
+		return program, true
+	}
+	p.live, p.need = p.reach(false)
+	// The library's lines come back untouched -- it carries no vtables -- so
+	// the program's part is what follows them. The two are split by line, not
+	// by byte: pruning makes the program's lines shorter, and a byte offset
+	// would cut them in the wrong place.
+	libLines := strings.Count(library, "\n")
+	out := strings.Split(p.rewrite(), "\n")
+	if libLines >= len(out) {
+		return program, true
+	}
+	return strings.Join(out[libLines:], "\n"), p.reachesTLS()
 }
 
 // reachesTLS reports whether the program can reach a call to one of the runtime's
@@ -201,9 +226,12 @@ type slotKey struct {
 }
 
 type cparse struct {
-	lines []string
-	defs  []*cdef
-	index map[string]int
+	// staticOnly is whether every definition carries a storage class: true for
+	// a build of one translation unit, false for a split one.
+	staticOnly bool
+	lines      []string
+	defs       []*cdef
+	index      map[string]int
 	// roots is the entry point's references: the seed of the fixpoint. It is not
 	// one of the defs, because main is written without `static`.
 	roots *cdef
@@ -232,9 +260,9 @@ type cparse struct {
 // table Class.forName searches, is deliberately not a definition of its own: it
 // sits in the body of the function that searches it, and the fixpoint has to see
 // its references as that function's, which is exactly why it is written there.
-func parseC(src string) *cparse {
+func parseC(src string, staticOnly bool) *cparse {
 	lines := strings.Split(src, "\n")
-	p := &cparse{lines: lines, index: map[string]int{}}
+	p := &cparse{lines: lines, index: map[string]int{}, staticOnly: staticOnly}
 	owned := make([]int, len(lines))
 	for i := range owned {
 		owned[i] = -1
@@ -245,16 +273,40 @@ func parseC(src string) *cparse {
 		if mainAt < 0 && strings.HasPrefix(l, "int main(") {
 			mainAt = i
 		}
-		if !strings.HasPrefix(l, "static ") {
+		if staticOnly && !strings.HasPrefix(l, "static ") {
 			continue
 		}
-		name, sep, ok := declName(l)
+		name, sep, ok := declName(l, staticOnly)
 		if !ok {
 			continue
 		}
 		// A prototype names a definition written elsewhere; it has no body and
-		// belongs to nothing.
-		if sep == '(' && strings.HasSuffix(strings.TrimRight(l, " \t"), ");") {
+		// belongs to nothing. So does a declaration with nothing after it: the
+		// vtables a split build's program unit defines are declared in the
+		// header, and a table filled at startup (`void* cts_X[3];`) has no
+		// initializer to scan either.
+		//
+		// A `_Static_assert` is the same shape and has to be skipped the same
+		// way: the emitter writes one under every string literal it lays out to
+		// tie the literal's struct offsets to the macros the runtime reads, and
+		// its `==` inside the call is what a "no initializer" test would take
+		// for an initializer. Read as a function -- the name is followed by a
+		// parenthesis and the line ends in a semicolon -- defEnd would run past
+		// it looking for a closing brace and swallow the definitions that
+		// follow, whose dispatches are then never reached and whose vtable slots
+		// are dropped.
+		//
+		// A `_Static_assert` is the same shape and has to be skipped the same
+		// way: the emitter writes one under every string literal it lays out to
+		// tie the literal's struct offsets to the macros the runtime reads, and
+		// its `==` inside the call is what a "no initializer" test would take
+		// for an initializer. Read as a function -- the name is followed by a
+		// parenthesis and the line ends in a semicolon -- defEnd would run past
+		// it looking for a closing brace and swallow the definitions that
+		// follow, whose dispatches are then never reached and whose vtable slots
+		// are dropped.
+		if trimmed := strings.TrimRight(l, " \t"); strings.HasSuffix(trimmed, ";") &&
+			(sep == '(' || !strings.Contains(l, "=")) {
 			continue
 		}
 		d := &cdef{name: name, fn: sep == '(', start: i, end: i,
@@ -456,8 +508,17 @@ func defEnd(lines []string, start int, fn bool) (int, bool) {
 
 // declName returns the name a file-scope definition declares, and the separator
 // that follows it: '(' for a function, '[' for a table, '=' for a variable.
-func declName(l string) (string, byte, bool) {
-	rest := l[len("static "):]
+// declName reads the name and shape of a definition. A build of one unit
+// writes every definition with a storage class and staticOnly is set; a split
+// build's definitions are external, and then a line without one is a definition
+// like any other.
+func declName(l string, staticOnly bool) (string, byte, bool) {
+	rest := l
+	if strings.HasPrefix(l, "static ") {
+		rest = l[len("static "):]
+	} else if staticOnly {
+		return "", 0, false
+	}
 	sep := strings.IndexAny(rest, "([=")
 	if sep < 0 {
 		return "", 0, false
@@ -712,7 +773,14 @@ func (p *cparse) rewrite() string {
 		if !dropped {
 			continue
 		}
-		out[d.start] = "static void* " + d.name + "[" + strconv.Itoa(len(kept)) +
+		// The storage class of the line is kept as written: a single-unit
+		// build's vtables are file-local and a split build's are external,
+		// because the library's class records name them from another unit.
+		prefix := ""
+		if i := strings.Index(p.lines[d.start], d.name+"["); i >= 0 {
+			prefix = p.lines[d.start][:i]
+		}
+		out[d.start] = prefix + d.name + "[" + strconv.Itoa(len(kept)) +
 			"] = {" + strings.Join(kept, ", ") + "};"
 	}
 	return strings.Join(out, "\n")
