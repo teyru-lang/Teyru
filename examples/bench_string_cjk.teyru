@@ -12,10 +12,21 @@
 // comparison: this side counts UTF-8 bytes where Java counts UTF-16 units, so
 // the same scale means more bytes here, and `text.charAt(i) == '中'` never holds
 // because the byte it reads is not a character. The output difference is the
-// evidence -- 28890 against 16890, and 0 matches against 1000 -- and it is
-// printed rather than hidden so that the row cannot be read as a benchmark of
-// two implementations of the same thing. It becomes a fair comparison at the
-// same moment the outputs agree.
+// evidence, and it is printed rather than hidden so that the row cannot be read
+// as a benchmark of two implementations of the same thing. At the two scales the
+// harness uses (200000 and 4000000) the two sides print:
+//
+//   200000    teyru concat=3288890 walked=0 sliced=4
+//             java  concat=2088890 walked=1000 sliced=4
+//   4000000   teyru concat=70888890 walked=0 sliced=4
+//             java  concat=46888890 walked=1000 sliced=4
+//
+// Every index that lands on '中' misses on this side (walked=0 against 1000),
+// and the concatenated lengths differ because the same join is counted in bytes
+// here and in UTF-16 units there. scripts/bench.sh prints !(out) instead of a
+// ratio for exactly this row -- the ratio of two different amounts of work is not
+// a comparison -- and it becomes a fair comparison at the same moment the two
+// outputs agree.
 class BenchStringCjk {
   public static void main(String[] args) {
     int n = 200000

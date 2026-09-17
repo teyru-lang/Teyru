@@ -30,6 +30,22 @@
 # Measure on a quiet machine. Every number here is a wall clock, so a compiler
 # build or another agent working in the background shows up as a slower program,
 # and the "best of RUNS" in the short table is the most sensitive to it.
+# Since "measure on a quiet machine" is a request nobody can verify after the
+# fact, the run prints the host, the tree and the load average it saw on both
+# sides of the tables: a table pasted into a document without them is a table
+# nobody can tell apart from one taken on a loaded box. The load line on the way
+# out includes this script's own compiler work, which is why the line on the way
+# in is the one that says whether the box was quiet.
+#
+# A ratio is printed as !(out) rather than a number when the two sides printed
+# different answers: those two runs are not the same program, so the ratio would
+# not be a comparison of two implementations. The answer is the last line each
+# side prints, which is where every benchmark here puts its result, so the check
+# separates "the two sides did different work" from "the two sides reported
+# different stopwatch readings" -- bench_invoke prints two timings of its own
+# before the line that is its answer. bench_string_cjk is the row that prints
+# !(out) today, and it stops being one when the string semantics land and its
+# answers agree.
 set -e
 cd "$(dirname "$0")/.."
 # The compiler is built from the tree being measured, unless BIN names one to
@@ -51,6 +67,37 @@ LIMIT=${LIMIT:-3600}
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"; [ -z "$BIN_TEMP" ] || rm -f "$BIN_TEMP"' EXIT
+
+# loadavg: the three load averages, or "?" where there is no /proc
+loadavg() {
+  if [ -r /proc/loadavg ]; then
+    cut -d' ' -f1-3 /proc/loadavg
+  else
+    printf '?'
+  fi
+}
+
+# the tree the numbers came from, so a pasted table names its own build: the
+# compiler is built from the working tree, and a working tree is not a version
+tree=$(git rev-parse --short HEAD 2>/dev/null || printf '?')
+subject=$(git log -1 --format=%s 2>/dev/null || printf '?')
+dirty=""
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  dirty=" + uncommitted changes"
+fi
+host=$(uname -n 2>/dev/null || printf '?')
+arch=$(uname -m 2>/dev/null || printf '?')
+cpus=$( (nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '?') | tr -d '\n')
+if [ -n "$BIN_TEMP" ]; then
+  binsrc="built from this tree"
+else
+  binsrc="BIN=$BIN"
+fi
+
+printf '# %s %s, %s cpus\n' "$host" "$arch" "$cpus"
+printf '# tree %s (%s)%s, compiler %s\n' "$tree" "$subject" "$dirty" "$binsrc"
+printf '# RUNS=%s JAVA=%s -O2, whole-program wall clock including process start\n' "$RUNS" "$JAVA"
+printf '# load average (1m 5m 15m) entering the tables: %s\n' "$(loadavg)"
 
 # best: runs the command $RUNS times and prints the smallest wall time
 best() {
@@ -76,21 +123,55 @@ fmt_ratio() {
   fi
 }
 
-# best_rss: runs the program $RUNS times and prints the smallest peak RSS in kB
-# (/usr/bin/time -v is GNU time; without it the measurement is skipped)
-best_rss() {
+# answer_of: the last line the command prints. Every benchmark here prints its
+# answer last -- a sum, a length, or bench_invoke's equality flag -- so the two
+# sides' last lines are what "the same work" means, and a row whose answers differ
+# has its ratio replaced by !(out) instead of printed. The same scale argument is
+# not a guarantee of the same work: bench_string_cjk reads the same argument and,
+# today, counts bytes on one side and characters on the other.
+#
+# Comparing the last line rather than all of them is deliberate: line-set
+# comparison was the first version, and it flipped bench_invoke to !(out) whenever
+# its two stopwatch lines happened to read the same in both of that side's runs --
+# a check that is right by luck is worse than no check, because the row it broke is
+# the one row that loses and whose factor the README quotes.
+answer_of() {
+  timeout "$LIMIT" "$@" 2>/dev/null | awk 'NF { last = $0 } END { print last }' || true
+}
+
+# worst_rss: runs the program $RUNS times and prints the largest peak RSS in kB
+# (/usr/bin/time -v is GNU time; without it the measurement is skipped).
+#
+# Largest, not smallest. The timing columns are the smallest of RUNS because a
+# slow run is a run that was interfered with; a *small* memory reading is not the
+# same kind of evidence -- the same hello world measures 2,116 kB on about one run
+# in twenty and 4,200-4,450 kB on the rest, and the small reading means the run did
+# not fault its heap in rather than that the program needs less. A row whose
+# purpose is the program's footprint should therefore report the worst run, and
+# five runs is enough to land on the mode: the largest of five sits at 4,400-4,450
+# kB, while the smallest of five is the one that occasionally reads 2,116.
+#
+# The program is the direct child of /usr/bin/time, and the timeout wraps both:
+# `timeout LIMIT /usr/bin/time -v prog` reports prog's peak, while
+# `/usr/bin/time -v timeout LIMIT prog` reports the wrapper's, and the wrapper's
+# is a floor of about 9.9 MB rather than an offset -- `timeout 5 /bin/true` is
+# 9,892 kB against 1,424 kB for /bin/true, the same hello is 9,904 against 4,172,
+# and a Java hello that really does use 51 MB is unaffected. That floor is what
+# made this row say "5.1x less memory" for a program that differs by 12x, and it
+# also floors every light row of the long table.
+worst_rss() {
   [ -x /usr/bin/time ] || return 0
   i=0
   out=""
   while [ "$i" -lt "$RUNS" ]; do
-    v=$(/usr/bin/time -v timeout "$LIMIT" "$@" 2>&1 >/dev/null | awk -F': ' '/Maximum resident set size/ {print $2}')
+    v=$(timeout "$LIMIT" /usr/bin/time -v "$@" 2>&1 >/dev/null | awk -F': ' '/Maximum resident set size/ {print $2}')
     if [ -n "$v" ]; then
       out="$out$v
 "
     fi
     i=$((i+1))
   done
-  printf '%s' "$out" | sort -g | head -1
+  printf '%s' "$out" | sort -g | tail -1
 }
 
 # scale_of: the argument a benchmark gets at each scale. A program that does not
@@ -154,13 +235,24 @@ table() {
     fi
     ratio="-"
     if [ -n "$j" ]; then
-      ratio=$(awk -v a="$j" -v b="$t" 'BEGIN{ if (b>0) printf "%.2fx", a/b; else print "-" }')
+      if [ -n "$scale" ]; then
+        to=$(answer_of "$exe" "$scale")
+        jo=$(answer_of java -cp "$TMP" "$name" "$scale")
+      else
+        to=$(answer_of "$exe")
+        jo=$(answer_of java -cp "$TMP" "$name")
+      fi
+      if [ "$to" != "$jo" ]; then
+        ratio="!(out)"
+      else
+        ratio=$(awk -v a="$j" -v b="$t" 'BEGIN{ if (b>0) printf "%.2fx", a/b; else print "-" }')
+      fi
     fi
     if [ "$which" = long ]; then
       if [ -n "$scale" ]; then
-        r=$(best_rss "$exe" "$scale")
+        r=$(worst_rss "$exe" "$scale")
       else
-        r=$(best_rss "$exe")
+        r=$(worst_rss "$exe")
       fi
       printf '%-20s %9ss %9ss %10s %10skB\n' "$name" "$t" "${j:--}" "$ratio" "${r:-?}"
     else
@@ -189,6 +281,9 @@ EOF
 
 # run100 runs the program it is given 100 times, so `best` returns the best of
 # $RUNS batches of 100 runs (a single process start is too short to time).
+# This row is the one the README quotes, so it prints the byte count rather than
+# a rounded KB: the number moves with almost every landing, and a rounded one
+# cannot be compared against the previous measurement.
 cat > "$TMP/run100.sh" <<'EOF'
 #!/bin/sh
 i=0
@@ -201,8 +296,8 @@ chmod +x "$TMP/run100.sh"
 
 $BIN build -O2 -o "$TMP/hello" "$TMP/hello.teyru" >/dev/null
 startup=$(best "$TMP/run100.sh" "$TMP/hello")
-size=$(wc -c < "$TMP/hello" | awk '{printf "%.1f", $1/1024}')
-rss=$(best_rss "$TMP/hello")
+size=$(wc -c < "$TMP/hello" | tr -d ' ')
+rss=$(worst_rss "$TMP/hello")
 
 jstartup=""
 jrss=""
@@ -216,7 +311,7 @@ public class Hello {
 EOF
   if javac -d "$TMP" "$TMP/Hello.java" 2>/dev/null; then
     jstartup=$(best "$TMP/run100.sh" java -cp "$TMP" Hello)
-    jrss=$(best_rss java -cp "$TMP" Hello)
+    jrss=$(worst_rss java -cp "$TMP" Hello)
   fi
 fi
 
@@ -232,5 +327,10 @@ fi
 printf '\n'
 printf '%-20s %10s %10s %10s\n' metric teyru java teyru-java
 printf '%-20s %10s %10s %10s\n' startup-100x "${startup}s" "$jstartup_cell" "$(fmt_ratio "$jstartup" "$startup")"
-printf '%-20s %10s %10s %10s\n' hello-size "${size}KB" - -
+printf '%-20s %10s %10s %10s\n' hello-size "${size}B" - -
 printf '%-20s %10s %10s %10s\n' peak-rss "${rss:-?}kB" "$jrss_cell" "$(fmt_ratio "$jrss" "$rss")"
+
+# The load on the way out, beside the line on the way in: this one includes the
+# compiles this script just did, so when the two disagree it is the entering line
+# that says whether the box was quiet while the programs were timed.
+printf '# load average (1m 5m 15m) leaving the tables: %s\n' "$(loadavg)"
