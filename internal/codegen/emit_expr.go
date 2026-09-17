@@ -1055,6 +1055,93 @@ func (e *Emitter) lvalueTemp(x ast.Expr) (string, string) {
 	return t + "* " + n + " = (" + t + "*)&(" + e.lvalue(x) + "); ", "(*" + n + ")"
 }
 
+// assignBoxed renders `x op= y` when x is a wrapper. The compound assignment is
+// `x = (T)((x) op (y))` (JLS 15.26.2 with 5.1.8 and 5.1.7): the target's own
+// value is read out of the box, the operation runs in the type the checker
+// recorded for it -- the target's own primitive, since a compound form that
+// would need a narrowing conversion back into the box is not a legal Java
+// program and the checker refuses it -- and the result is converted back and
+// boxed with the wrapper's own valueOf.
+//
+// A wrapper is immutable, so the result is a *new* wrapper and the store
+// replaces the reference the target held; writing the operation through the
+// reference, which is what C's `*p op= y` would do, is pointer arithmetic on
+// the box. The shape is boxedUpdate's, which does the same for `++` and `--`.
+func (e *Emitter) assignBoxed(v *ast.Assign, lv string, k ast.PrimKind) string {
+	xt := v.X.GetType()
+	own := &ast.PrimType{Kind: k}
+	if tp, ok := v.TargetPrim.(*ast.PrimType); ok {
+		own = tp
+	}
+	ot := own
+	if tp, ok := v.OpType.(*ast.PrimType); ok {
+		ot = tp
+	}
+	// The read is unboxCall's: it tests the receiver, so a null target raises
+	// NullPointerException here, before the operation, where Java raises it.
+	// It is bound to a temporary of its own because the right operand may have
+	// side effects, and Java reads the target's value before it evaluates them
+	// (JLS 15.7.1): an unsequenced read beside that operand is undefined in C.
+	n := e.tmpName()
+	value := e.compoundOp(v, n, ot)
+	back := e.wrapperCall(e.wrapperStatic(k, "valueOf"), "("+e.ctype(own)+")("+value+")")
+	return "({ " + e.ctype(own) + " " + n + " = " + e.unboxCall(lv, xt, own) + "; " +
+		lv + " = " + back + "; })"
+}
+
+// compoundOp renders the operation of a compound assignment over read, the
+// target's value already unboxed and converted to the operation's type ot. It
+// is the boxed counterpart of the operator handling in assignInner, and the
+// widths come from ot rather than from the target, which is a wrapper here.
+func (e *Emitter) compoundOp(v *ast.Assign, read string, ot *ast.PrimType) string {
+	op := v.Op[:len(v.Op)-1]
+	y := e.operand(v.Y, ot)
+	switch op {
+	case "/", "%":
+		if isFloating(ot) {
+			// floating point division and remainder never throw
+			if op == "%" {
+				return "fmod(" + read + ", " + y + ")"
+			}
+			return "(" + read + " / " + y + ")"
+		}
+		fn := "ty_div_int"
+		if op == "%" {
+			fn = "ty_rem_int"
+		}
+		if ot.Kind == ast.Long {
+			if op == "%" {
+				fn = "ty_rem_long"
+			} else {
+				fn = "ty_div_long"
+			}
+		}
+		return fn + "(" + read + ", " + y + ")"
+	case "<<", ">>":
+		// the count is masked by the width the shift happens at, and the
+		// width itself is named so the shift is a long one where Java's is
+		return "(" + e.ctype(ot) + ")(" + read + " " + op + " " + shiftCount(y, ot) + ")"
+	case ">>>":
+		// `>>>=` is an unsigned shift: the operand is read as unsigned so the
+		// bits shifted in are zeros, and only then converted back
+		ut := "uint32_t"
+		if ot.Kind == ast.Long {
+			ut = "uint64_t"
+		}
+		return "(" + e.ctype(ot) + ")((" + ut + ")(" + read + ") >> " + shiftCount(y, ot) + ")"
+	}
+	if ot.Kind == ast.Boolean || isFloating(ot) {
+		return "(" + read + " " + op + " " + y + ")"
+	}
+	// Java wraps where C leaves signed overflow undefined, so the operation
+	// goes through an unsigned value of the operation's width.
+	ut := "uint32_t"
+	if ot.Kind == ast.Long {
+		ut = "uint64_t"
+	}
+	return "(" + e.ctype(ot) + ")((" + ut + ")(" + read + ") " + op + " " + y + ")"
+}
+
 // lvalue renders an assignable expression. Static targets are returned without
 // the class-initialization wrapper because a comma expression is not assignable;
 // assignClinit adds it around the whole assignment instead.
@@ -1509,12 +1596,20 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 		// holds before the store
 		return "(" + lv + " = (tystr*)" + e.concatFrom("(tystr*)"+lv, v.Y) + ")"
 	}
+	// A compound assignment whose target is boxed: the target is unboxed, the
+	// operation runs in its own type and the result is boxed again (JLS 15.26.2
+	// with 5.1.8 and 5.1.7). Every operator has that shape, which is why it is
+	// one dispatch rather than one per operator.
+	if k, ok := e.boxKindOf(v.X.GetType()); ok {
+		return e.assignBoxed(v, lv, k)
+	}
 	op := v.Op[:len(v.Op)-1]
-	// a compound shift masks its count exactly like the binary form; the target
-	// also gives the type the count is unboxed to, since sema leaves the
-	// operation type of a compound assignment unset
+	// a compound shift masks its count exactly like the binary form, at the
+	// width the checker recorded for the operation: the target's own type,
+	// promoted. A boxed target never reaches here -- it was unboxed above, at
+	// the type the same record names.
 	if op == "<<" || op == ">>" || op == ">>>" {
-		st := shiftType(v.X.GetType())
+		st := v.OpType
 		count := shiftCount(e.operand(v.Y, st), st)
 		if op == ">>>" {
 			ut := "uint32_t"

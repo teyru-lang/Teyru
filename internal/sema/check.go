@@ -2098,21 +2098,34 @@ func (ctx *methodCtx) checkAssign(v *ast.Assign) {
 		v.SetType(ast.ErrorType{})
 		return
 	}
+	// Every compound form reads the target's own value and writes the result
+	// back through the target's own type, so xp -- the target unboxed -- is
+	// what a back end reads at and boxes from (JLS 15.26.2 with 5.1.8).
+	v.TargetPrim = xp
 	switch {
 	case xp.Kind == ast.Boolean:
 		if v.Op != "&=" && v.Op != "|=" && v.Op != "^=" {
 			ctx.errf(v.Pos, "TY-TYP-0066", "operator '%s' cannot be applied to boolean", v.Op)
 		}
+		// boolean does not promote: `&`, `|` and `^` on two booleans are
+		// boolean (JLS 15.22.2), which is the target's own type
+		v.OpType = xp
 		v.SetType(xt)
 	case v.Op == "<<=" || v.Op == ">>=" || v.Op == ">>>=":
 		if !xp.IsIntegral() || !yp.IsIntegral() {
 			ctx.errf(v.Pos, "TY-TYP-0063", "operator '%s' requires integral operands", v.Op)
 		}
+		// a shift's type is its left operand's, promoted (JLS 15.19), which
+		// is also the width the count is reduced to; the right operand is
+		// only unary-promoted, so it does not enter the operation's type
+		v.OpType = promoteUnary(xp)
 		v.SetType(xt)
 	case v.Op == "&=" || v.Op == "|=" || v.Op == "^=":
 		if !xp.IsIntegral() || !yp.IsIntegral() {
 			ctx.errf(v.Pos, "TY-TYP-0062", "operator '%s' requires integral operands", v.Op)
 		}
+		// both operands undergo binary numeric promotion (JLS 15.22.1)
+		v.OpType = numericPromote(xp, yp)
 		v.SetType(xt)
 	default:
 		if !xp.IsNumeric() || !yp.IsNumeric() {
@@ -2122,6 +2135,19 @@ func (ctx *methodCtx) checkAssign(v *ast.Assign) {
 		}
 		v.OpType = numericPromote(xp, yp)
 		v.SetType(xt)
+	}
+	// The compound form is `E1 = (T) ((E1) op (E2))` (JLS 15.26.2). When the
+	// target is boxed, that cast is a cast to a reference type, so it can only
+	// be the boxing conversion of a value that is already the target's own
+	// primitive: `Integer a; a += 1` boxes an int, while `Short s; s += 1`
+	// would have to box an int into a Short, which javac rejects as an
+	// incompatible type. Teyru used to accept those and then fail to generate
+	// code for the wrapper the back end was handed.
+	if _, boxed := c.unboxed(xt); boxed {
+		if ot, ok := v.OpType.(*ast.PrimType); ok && ot.Kind != xp.Kind {
+			ctx.errf(v.Pos, "TY-TYP-0116", "incompatible types: %s cannot be converted to %s", ot, xt)
+			v.SetType(ast.ErrorType{})
+		}
 	}
 }
 
