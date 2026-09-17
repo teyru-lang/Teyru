@@ -62,7 +62,7 @@ func (c *Checker) checkBodies(cl *ast.Class) {
 			// its parameters, so its body binds those names directly
 			ctx := c.newCtx(cl, d.Sym)
 			ctx.checkBlock(d.Body, false)
-			if d.Sym.Result != ast.TVoid && !d.Sym.IsCtor && !exitsAlways(d.Body) {
+			if d.Sym.Result != ast.TVoid && !d.Sym.IsCtor && canCompleteNormally(d.Body) {
 				ctx.errf(d.Body.End, "TY-TYP-0020", "missing return statement")
 			}
 		case *ast.FieldDecl:
@@ -107,7 +107,7 @@ func (c *Checker) checkBodies(cl *ast.Class) {
 		m.Checked = true
 		ctx := c.newCtx(cl, m)
 		ctx.checkBlock(m.Body, false)
-		if m.Result != ast.TVoid && !m.IsCtor && !exitsAlways(m.Body) {
+		if m.Result != ast.TVoid && !m.IsCtor && canCompleteNormally(m.Body) {
 			ctx.errf(m.Body.End, "TY-TYP-0020", "missing return statement")
 		}
 	}
@@ -129,59 +129,134 @@ func (c *Checker) constFieldInit(isStatic bool, e ast.Expr) any {
 
 func isStaticField(f *ast.Field) bool { return f.Mods.Has(ast.ModStatic) }
 
-func endsWithReturn(b *ast.Block) bool {
-	if len(b.Stmts) == 0 {
-		return false
-	}
-	switch s := b.Stmts[len(b.Stmts)-1].(type) {
-	case *ast.Return:
+// canCompleteNormally reports whether a statement can finish without leaving
+// the method it belongs to: "can complete normally" as JLS 14.22 defines it,
+// which is what decides whether a value-returning method that ends in the
+// statement needs a return after it (JLS 8.4.7).
+//
+// The rules are javac's, and each was checked against it:
+//
+//   - a block finishes where its last statement does;
+//   - an if with no else finishes, and one with an else finishes when either
+//     branch does;
+//   - a loop whose condition is the constant true finishes only through a
+//     break (`while (true)`, `for (;;)` and `do ... while (true)` alike), and
+//     an enhanced for may not run at all, so it always finishes;
+//   - a try finishes when the body or a catch finishes, and not at all when
+//     its finally cannot;
+//   - a switch finishes per switchCanCompleteNormally below;
+//   - a declaration, an expression statement, an assertion, a yield and the
+//     empty statement finish, and a return, throw, break or continue does not.
+func canCompleteNormally(s ast.Stmt) bool {
+	switch v := s.(type) {
+	case nil:
 		return true
+	case *ast.Return, *ast.Throw, *ast.Break, *ast.Continue:
+		return false
 	case *ast.Block:
-		return endsWithReturn(s)
+		return len(v.Stmts) == 0 || canCompleteNormally(v.Stmts[len(v.Stmts)-1])
 	case *ast.If:
-		return s.Else != nil && endsWithReturn(fromStmt(s.Then)) && endsWithReturn(fromStmt(s.Else))
-	case *ast.Switch:
-		if s.Kind == ast.SwitchType {
-			return true
-		}
+		return v.Else == nil || canCompleteNormally(v.Then) || canCompleteNormally(v.Else)
+	case *ast.While:
+		return !constTrue(v.Cond) || hasBreak(v.Body)
+	case *ast.DoWhile:
+		return !constTrue(v.Cond) || hasBreak(v.Body)
+	case *ast.For:
+		return (v.Cond != nil && !constTrue(v.Cond)) || hasBreak(v.Body)
 	case *ast.Try:
-		// A finally block that never completes normally decides the outcome
-		// on its own; otherwise the statement exits when the body does and
-		// every catch does too (JLS 14.21).
-		if s.Finally != nil && exitsAlways(s.Finally) {
-			return true
-		}
-		if !exitsAlways(s.Body) {
+		if v.Finally != nil && !canCompleteNormally(v.Finally) {
 			return false
 		}
-		if len(s.Catches) == 0 {
+		if canCompleteNormally(v.Body) {
 			return true
 		}
-		for _, cat := range s.Catches {
-			if !exitsAlways(cat.Body) {
-				return false
+		for _, cat := range v.Catches {
+			if canCompleteNormally(cat.Body) {
+				return true
 			}
 		}
-		return true
-	case *ast.ExprStmt:
-		if _, ok := s.X.(*ast.Call); ok {
-			return false
-		}
+		return false
 	case *ast.Sync:
-		return endsWithReturn(s.Body)
+		return canCompleteNormally(v.Body)
 	case *ast.Labeled:
-		return endsWithReturn(fromStmt(s.Body))
-	case *ast.While:
-		// `while (true)` with no break never completes normally (JLS 14.21), so
-		// a method that ends in one needs no return after it -- which is the
-		// shape a parser's main loop has.
-		return constTrue(s.Cond) && !hasBreak(s.Body)
-	case *ast.For:
-		// `for (;;)` is the same statement spelled differently: no condition
-		// means true.
-		return (s.Cond == nil || constTrue(s.Cond)) && !hasBreak(s.Body)
-	case *ast.DoWhile:
-		return constTrue(s.Cond) && !hasBreak(s.Body)
+		// A break inside the labeled statement leaves it, so it finishes even
+		// when what it labels cannot (`L: while (true) { break L; }`).
+		return canCompleteNormally(v.Body) || hasBreak(v.Body)
+	case *ast.Switch:
+		return switchCanCompleteNormally(v)
+	}
+	return true
+}
+
+// switchCanCompleteNormally is the switch rule of JLS 14.22, in the shape javac
+// implements it, which is not quite the same shape for the two forms of switch:
+//
+//   - the block has to be total -- a default label, or a pattern switch that
+//     covers every value of its selector (JLS 14.11.2). An enum switch with
+//     every constant and no default is total to a reader and not to javac, so
+//     it is not total here either;
+//   - no break may leave the switch, and
+//   - in the arrow form every arm has to leave the method (`case 1 -> { return
+//     1; } default -> throw ...` ends the method; `case 1 -> { } default ->
+//     throw ...` does not), while in the colon form the last statement group
+//     decides, and a label with no statements after it falls out of the switch.
+//
+// A pattern switch whose coverage is not decidable here is the one case left to
+// the reader: it is answered "cannot complete normally", the permissive reading,
+// because a sealed type without a permits clause is undecidable for this
+// checker (AGENTS.md §10) and rejecting a switch that does cover every value
+// would be the worse error.
+func switchCanCompleteNormally(s *ast.Switch) bool {
+	total := false
+	for _, cs := range s.Cases {
+		if cs.Default {
+			total = true
+		}
+	}
+	if !total && (s.Kind != ast.SwitchType || !s.Exhaustive) {
+		return true
+	}
+	if switchBreak(s) {
+		return true
+	}
+	if s.Arrow {
+		for _, cs := range s.Cases {
+			if armCanCompleteNormally(cs) {
+				return true
+			}
+		}
+		return false
+	}
+	for i := len(s.Cases) - 1; i >= 0; i-- {
+		body := s.Cases[i].Body
+		if len(body) == 0 {
+			return true
+		}
+		return canCompleteNormally(body[len(body)-1])
+	}
+	return true
+}
+
+// armCanCompleteNormally reports whether one arm of an arrow switch finishes
+// without leaving the method. An arm written as an expression does finish: its
+// value is the statement's and the switch moves on.
+func armCanCompleteNormally(cs *ast.Case) bool {
+	if cs.ArrowX != nil || len(cs.Body) == 0 {
+		return true
+	}
+	return canCompleteNormally(cs.Body[len(cs.Body)-1])
+}
+
+// switchBreak reports whether a break inside the switch leaves the switch. A
+// break belonging to a nested loop or switch is not this switch's, and the
+// search stops descending at one.
+func switchBreak(s *ast.Switch) bool {
+	for _, cs := range s.Cases {
+		for _, st := range cs.Body {
+			if hasBreak(st) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -229,63 +304,6 @@ func hasBreak(s ast.Stmt) bool {
 		}
 	}
 	return false
-}
-
-// endsWithThrow reports whether the block always exits by throwing.
-func endsWithThrow(b *ast.Block) bool {
-	if len(b.Stmts) == 0 {
-		return false
-	}
-	switch s := b.Stmts[len(b.Stmts)-1].(type) {
-	case *ast.Throw:
-		return true
-	case *ast.Block:
-		return endsWithThrow(s)
-	case *ast.If:
-		if s.Else != nil && exitsAlways(fromStmt(s.Then)) && exitsAlways(fromStmt(s.Else)) {
-			return true
-		}
-	case *ast.Try:
-		if s.Finally != nil && exitsAlways(s.Finally) {
-			return true
-		}
-		if !exitsAlways(s.Body) {
-			return false
-		}
-		if len(s.Catches) == 0 {
-			return true
-		}
-		for _, cat := range s.Catches {
-			if !exitsAlways(cat.Body) {
-				return false
-			}
-		}
-		return true
-	case *ast.Sync:
-		return endsWithThrow(s.Body)
-	case *ast.Labeled:
-		return endsWithThrow(fromStmt(s.Body))
-	case *ast.While:
-		return constTrue(s.Cond) && !hasBreak(s.Body)
-	case *ast.For:
-		return (s.Cond == nil || constTrue(s.Cond)) && !hasBreak(s.Body)
-	case *ast.DoWhile:
-		return constTrue(s.Cond) && !hasBreak(s.Body)
-	}
-	return false
-}
-
-// exitsAlways reports whether a block always leaves through a return or a
-// throw, so that code after it is unreachable.
-func exitsAlways(b *ast.Block) bool {
-	return endsWithReturn(b) || endsWithThrow(b)
-}
-
-func fromStmt(s ast.Stmt) *ast.Block {
-	if b, ok := s.(*ast.Block); ok {
-		return b
-	}
-	return &ast.Block{Stmts: []ast.Stmt{s}}
 }
 
 func (c *Checker) newCtx(cl *ast.Class, m *ast.Method) *methodCtx {
@@ -1010,6 +1028,12 @@ func (ctx *methodCtx) checkSwitch(s *ast.Switch, expr bool) {
 	// value, a silent wrong answer. An enum selector and a sealed one are
 	// decidable here, so those are checked rather than refused outright like
 	// the others.
+	// A pattern switch records the answer either way: it is what decides
+	// whether a method may end in the switch without a return after it
+	// (canCompleteNormally, JLS 14.22).
+	if !hasDefault && s.Kind == ast.SwitchType {
+		s.Exhaustive = ctx.patternsExhaustive(s, xt)
+	}
 	if expr && !hasDefault {
 		switch s.Kind {
 		case ast.SwitchInt, ast.SwitchString:
@@ -1025,7 +1049,7 @@ func (ctx *methodCtx) checkSwitch(s *ast.Switch, expr bool) {
 				}
 			}
 		case ast.SwitchType:
-			if !ctx.patternsExhaustive(s, xt) {
+			if !s.Exhaustive {
 				ctx.errf(s.Pos, "TY-TYP-0096", "switch expression does not cover all possible input values")
 			}
 		}
@@ -2562,6 +2586,49 @@ type ovScore struct {
 	directVarargs bool
 }
 
+// onlyByArity returns the one candidate that can be called with n arguments,
+// or nil when the name is still ambiguous at that point. It is what gives an
+// argument that cannot type itself -- a lambda, a nested generic call -- a
+// target to be checked against before the overload is chosen.
+func onlyByArity(cands []*ast.Method, n int) *ast.Method {
+	var found *ast.Method
+	for _, m := range cands {
+		fixed := len(m.Params)
+		if m.Varargs {
+			if n < fixed-1 {
+				continue
+			}
+		} else if n != fixed {
+			continue
+		}
+		switch {
+		case found == nil:
+			found = m
+		case found == m || sameParams(found, m):
+			// the same declaration, reached twice through the type graph
+		default:
+			return nil
+		}
+	}
+	return found
+}
+
+// sameParams reports whether two methods declare the same parameter types. A
+// method is reachable by more than one path -- `Stream.collect` through the
+// interface and through its implementation -- and a candidate list holding it
+// twice is not an overload.
+func sameParams(a, b *ast.Method) bool {
+	if len(a.Params) != len(b.Params) || a.Varargs != b.Varargs {
+		return false
+	}
+	for i := range a.Params {
+		if !sameType(a.Params[i], b.Params[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // pickOverload chooses the method to call following the phases of JLS 15.12.2:
 // the candidates applicable without boxing or varargs are considered first, then
 // those that need boxing, and only if none applies the variable-arity ones. A
@@ -2575,21 +2642,22 @@ func (ctx *methodCtx) pickOverload(recv *ast.ClassType, cands []*ast.Method, arg
 	// A nested generic call needs one too, for the same reason: `id(chained())`
 	// where chained() has a type variable of its own leaves it open when the
 	// argument is checked with no target, and an open variable is a hole the
-	// inner call is then rejected for. When the name has a single candidate
-	// there is nothing to choose and its parameter types are the target; an
-	// overloaded name keeps checking with no target, because that target is
-	// what the overload is being chosen for.
-	var only *ast.Method
-	if len(cands) == 1 {
-		only = cands[0]
-	}
+	// inner call is then rejected for. That is where the JDK's collectors are
+	// used from: `collect(Collectors.toList())` is a `List<T>` because the
+	// parameter it is passed to says so, and checking `toList()` with no target
+	// settles its T on Object and then rejects the call. The target is taken
+	// from the one candidate whose parameter count fits the call, which is the
+	// first thing applicability asks anyway -- `Stream.collect` has a
+	// one-argument and a three-argument overload, and only one of them can be
+	// the target of a one-argument call.
+	only := onlyByArity(cands, len(args))
 	for i, a := range args {
 		if a.GetType() != nil || isLambdaLike(a) {
 			continue
 		}
 		var want ast.Type
 		if only != nil && i < len(only.Params) && !only.Varargs {
-			want = only.Params[i]
+			want = ctx.c.subst(only.Params[i], ctx.c.recvBind(recv, only))
 		}
 		ctx.checkExpr(a, want)
 	}
@@ -2782,6 +2850,25 @@ func samePackage(a, b *ast.File) bool {
 	return a.Package == b.Package
 }
 
+// recvBind is the receiver's contribution to a method's type arguments: the
+// declaring class's own type parameters bound to the type arguments of the
+// receiver, or of the supertype of it that declares the method. `List<String>`
+// as the receiver of `stream()` is what makes T of `Stream<T>` be String before
+// a single argument is looked at.
+func (c *Checker) recvBind(recv *ast.ClassType, m *ast.Method) map[*ast.TypeVar]ast.Type {
+	bind := map[*ast.TypeVar]ast.Type{}
+	if m.Owner == nil || len(m.Owner.TypeParams) == 0 || recv == nil {
+		return bind
+	}
+	if sup := c.asSuper(recv, m.Owner); sup != nil {
+		return bindings(m.Owner, sup.Args)
+	}
+	if recv.Class == m.Owner {
+		return bindings(m.Owner, recv.Args)
+	}
+	return bind
+}
+
 // applicable reports whether args can be passed to m together with a cost.
 // want is the type the call is expected to produce, which is what determines a
 // method type argument that no argument can pin down (a lambda has no type of
@@ -2789,16 +2876,7 @@ func samePackage(a, b *ast.File) bool {
 func (ctx *methodCtx) applicable(recv *ast.ClassType, m *ast.Method, args []ast.Expr, want ast.Type) (ovScore, bool) {
 	c := ctx.c
 	// substitute type variables from the receiver
-	bind := map[*ast.TypeVar]ast.Type{}
-	if m.Owner != nil && len(m.Owner.TypeParams) > 0 {
-		if recv != nil {
-			if sup := c.asSuper(recv, m.Owner); sup != nil {
-				bind = bindings(m.Owner, sup.Args)
-			} else if recv.Class == m.Owner {
-				bind = bindings(m.Owner, recv.Args)
-			}
-		}
-	}
+	bind := c.recvBind(recv, m)
 	params := make([]ast.Type, len(m.Params))
 	for i, p := range m.Params {
 		params[i] = c.subst(p, bind)
@@ -2879,8 +2957,24 @@ func (ctx *methodCtx) applicable(recv *ast.ClassType, m *ast.Method, args []ast.
 			// any functional interface will do; the argument is checked once the
 			// overload is known
 			if pt != nil {
+				// ... but not one whose single abstract method takes a different
+				// number of parameters: `Comparator.thenComparing` has a
+				// Comparator overload and a Function overload, both of which
+				// accept a lambda, and only one of them can take this one.
+				target := pt
 				if i < n {
-					params[i] = c.subst(pt, mbind)
+					target = c.subst(pt, mbind)
+					params[i] = target
+				}
+				switch arg := a.(type) {
+				case *ast.Lambda:
+					if !c.lambdaArityFits(arg, target) {
+						return ovScore{}, false
+					}
+				case *ast.MethodRef:
+					if !ctx.refArityFits(arg, target) {
+						return ovScore{}, false
+					}
 				}
 				s.total += 1
 				continue
@@ -2982,6 +3076,79 @@ func isLambdaLike(e ast.Expr) bool {
 	return false
 }
 
+// lambdaArityFits reports whether a lambda's parameter count matches the single
+// abstract method of the functional interface it is being passed as, which is
+// part of what makes a lambda congruent with that interface (JLS 15.27.3).
+// Nothing is decided when the target is not a class type or has no single
+// abstract method: the argument check reports those.
+func (c *Checker) lambdaArityFits(lam *ast.Lambda, want ast.Type) bool {
+	ct, ok := want.(*ast.ClassType)
+	if !ok || ct.Class == nil || !ct.Class.IsInterface() {
+		return true
+	}
+	sam := c.singleAbstract(ct)
+	if sam == nil {
+		return true
+	}
+	return len(lam.Params) == len(sam.Params)
+}
+
+// refArityFits reports whether a method reference can stand for the functional
+// interface in want: the one abstract method's parameter count has to be the
+// number the referenced method takes, plus one when the reference is unbound
+// (`String::length` takes the receiver as the first parameter, `s::length` does
+// not). JLS 15.28.2 asks the same question when it decides whether a method
+// reference is congruent with a function type, and it is what tells
+// `thenComparing(Comparator)` from `thenComparing(Function)` when the argument
+// is a reference rather than a lambda.
+//
+// Nothing is decided when the qualifier is not a type this checker can name:
+// the reference check reports that on its own.
+func (ctx *methodCtx) refArityFits(mr *ast.MethodRef, want ast.Type) bool {
+	c := ctx.c
+	ct, ok := want.(*ast.ClassType)
+	if !ok || ct.Class == nil || !ct.Class.IsInterface() {
+		return true
+	}
+	sam := c.singleAbstract(ct)
+	if sam == nil {
+		return true
+	}
+	n := len(sam.Params)
+	var recvType ast.Type
+	switch {
+	case mr.TypeX != nil:
+		recvType = c.resolveType(ctx.env, mr.TypeX)
+	case mr.X != nil:
+		if mr.X.GetType() == nil {
+			ctx.checkExpr(mr.X, nil)
+		}
+		recvType = mr.X.GetType()
+	}
+	rt := ctx.recvClassForRef(recvType)
+	if rt == nil {
+		return true
+	}
+	if mr.Name == "new" {
+		for _, ctor := range rt.Class.Ctors {
+			if len(ctor.Params) == n {
+				return true
+			}
+		}
+		return false
+	}
+	all := c.methodsFor(rt, mr.Name)
+	if len(all) == 0 {
+		return true
+	}
+	for _, m := range all {
+		if len(m.Params) == n || (!m.IsStatic() && len(m.Params)+1 == n) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Checker) inferTypeArg(param, arg ast.Type, bind map[*ast.TypeVar]ast.Type) ast.Type {
 	if param == nil || arg == nil {
 		return param
@@ -2990,6 +3157,15 @@ func (c *Checker) inferTypeArg(param, arg ast.Type, bind map[*ast.TypeVar]ast.Ty
 	case *ast.TypeVarType:
 		if _, ok := bind[p.Var]; ok {
 			if bind[p.Var] == nil {
+				// The argument may be a wildcard rather than a type: the
+				// target `Comparator<? super String>` says the same thing about
+				// `Comparator.naturalOrder()`'s T as `Comparator<String>` does,
+				// and taking the bound is what keeps T a String instead of a
+				// wildcard that every later use has to see through.
+				if w, isWild := arg.(*ast.WildcardType); isWild && w.Bound != nil {
+					bind[p.Var] = c.subst(w.Bound, bind)
+					return bind[p.Var]
+				}
 				// a primitive argument boxes when it becomes a type argument
 				if util.IsPrim(arg) {
 					bind[p.Var] = c.boxed(arg)
@@ -3243,11 +3419,27 @@ func (ctx *methodCtx) checkCall(v *ast.Call, want ast.Type) {
 	}
 	var rt ast.Type
 	if v.Recv != nil {
-		ctx.checkExpr(v.Recv, nil)
+		// The receiver of a chained call is checked with the call's own target:
+		// the type a method returns is often the receiver's own type parameter,
+		// so `Comparator.comparing(f).thenComparing(g)` standing where a
+		// `Comparator<? super String>` is wanted is what tells `comparing` that
+		// its T is String (JLS 18.5.2 reads the same constraint off the whole
+		// expression). A receiver whose type does not share a type variable
+		// with the result is unaffected: nothing matches and nothing binds.
+		var recvWant ast.Type
+		if _, isCall := v.Recv.(*ast.Call); isCall {
+			recvWant = want
+		}
+		ctx.checkExpr(v.Recv, recvWant)
 		rt = v.Recv.GetType()
 	}
 	for _, a := range v.Args {
-		if a.GetType() == nil && !isLambdaLike(a) {
+		// An argument that is itself a call is left to the overload choice
+		// below, which checks it with the parameter type as its target: that is
+		// what settles a type variable only the parameter can determine, as in
+		// `collect(Collectors.toList())`.
+		_, nested := a.(*ast.Call)
+		if a.GetType() == nil && !isLambdaLike(a) && !nested {
 			ctx.checkExpr(a, nil)
 		}
 	}
@@ -4067,7 +4259,7 @@ func (ctx *methodCtx) checkLambda(lam *ast.Lambda, want ast.Type) {
 		}
 	case *ast.Block:
 		lctx.checkBlock(b, false)
-		if m.Result != ast.TVoid && !exitsAlways(b) {
+		if m.Result != ast.TVoid && canCompleteNormally(b) {
 			lctx.errf(b.End, "TY-TYP-0020", "missing return statement")
 		}
 	}
