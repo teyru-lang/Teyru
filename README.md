@@ -92,7 +92,7 @@ OpenSSL 的目標（windows、macOS）對它是**指名拒絕**——在寫出�
 
 完整表格在 <https://docs.teyru.dev>，方法是 `RUNS=5 sh scripts/bench.sh`（五次取最佳、整支
 程式的 wall time、含行程啟動、`-O2`），同一台機器上與 HotSpot 對照：啟動快約 26 倍、
-hello 執行檔 54.6 KB（同一支程式在 `-O1` 是 75,232 位元組）、尖峰記憶體約 12 倍少，
+hello 執行檔 65.2 KB（同一支程式在 `-O1` 是 85,440、`-O3` 是 70,248 位元組）、尖峰記憶體約 12 倍少，
 `bench_fib`／`bench_oop`／`bench_string` 快 3.5～5 倍。**也有輸的一項**：`bench_invoke`
 慢約 2.4 倍（0.6019 s 對 0.2543 s，2000 萬次反射呼叫）。拆開來看，**貴的是配置不是反射**：
 每次呼叫約 27 ns，其中約 19 ns 是 `Object` API 逼出來的兩次配置（另外 5.7 ns 是執行期 invoker 的 setjmp catch frame）（呼叫端的引數裝箱、執行期
