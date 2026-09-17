@@ -1570,6 +1570,9 @@ func (e *Emitter) compoundOp(v *ast.Assign, read string, ot *ast.PrimType) strin
 			}
 			return "(" + read + " / " + y + ")"
 		}
+		if s := e.constDivOp(op, read, y, v.Y, ot); s != "" {
+			return s
+		}
 		fn := "ty_div_int"
 		if op == "%" {
 			fn = "ty_rem_int"
@@ -1977,11 +1980,14 @@ func (e *Emitter) equality(v *ast.Binary, lt, rt ast.Type) string {
 func (e *Emitter) divExpr(v *ast.Binary) string {
 	x, y := e.operand(v.X, v.OpType), e.operand(v.Y, v.OpType)
 	return e.sequence(pair(v.X, x, v.Y, y), func(a []string) string {
-		switch {
-		case ast.IsPrim(v.OpType, ast.Long):
-			return "ty_div_long(" + a[0] + ", " + a[1] + ")"
-		case isFloating(v.OpType):
+		if isFloating(v.OpType) {
 			return "((" + a[0] + ") / (" + a[1] + "))"
+		}
+		if s := e.constDivOp("/", a[0], a[1], v.Y, v.OpType); s != "" {
+			return s
+		}
+		if ast.IsPrim(v.OpType, ast.Long) {
+			return "ty_div_long(" + a[0] + ", " + a[1] + ")"
 		}
 		return "ty_div_int(" + a[0] + ", " + a[1] + ")"
 	})
@@ -1990,14 +1996,83 @@ func (e *Emitter) divExpr(v *ast.Binary) string {
 func (e *Emitter) remExpr(v *ast.Binary) string {
 	x, y := e.operand(v.X, v.OpType), e.operand(v.Y, v.OpType)
 	return e.sequence(pair(v.X, x, v.Y, y), func(a []string) string {
-		switch {
-		case ast.IsPrim(v.OpType, ast.Long):
-			return "ty_rem_long(" + a[0] + ", " + a[1] + ")"
-		case isFloating(v.OpType):
+		if isFloating(v.OpType) {
 			return "fmod(" + a[0] + ", " + a[1] + ")"
+		}
+		if s := e.constDivOp("%", a[0], a[1], v.Y, v.OpType); s != "" {
+			return s
+		}
+		if ast.IsPrim(v.OpType, ast.Long) {
+			return "ty_rem_long(" + a[0] + ", " + a[1] + ")"
 		}
 		return "ty_rem_int(" + a[0] + ", " + a[1] + ")"
 	})
+}
+
+// constDivOp renders an integral `/` or `%` whose divisor is a constant the
+// checker folded, and "" when the operation has to go to the runtime helper.
+//
+// The helpers exist for two reasons, and both are known here when the divisor
+// is: a zero divisor throws ArithmeticException, and `MIN / -1` is MIN where C
+// leaves the overflow undefined. Everything else is the operator itself,
+// because C defines integer division to discard the fraction (C11 6.5.5p6) and
+// the remainder to take the dividend's sign, which is what JLS 15.17.2 says.
+// Leaving it as a call instead is what kept `x % 7` out of line in a loop --
+// measured at 47% of bench_loop's inner iteration.
+//
+// a and b are the operands' C text, divisor the divisor's own expression, and
+// opType the type the operation is performed in.
+func (e *Emitter) constDivOp(op, a, b string, divisor ast.Expr, opType ast.Type) string {
+	if isFloating(opType) {
+		return ""
+	}
+	c, ok := e.intConst(divisor)
+	if !ok || c == 0 {
+		return ""
+	}
+	if op == "%" {
+		// `x % 1` and `x % -1` are both 0 in Java, and `x % -1` is the one C
+		// leaves undefined
+		if c == 1 || c == -1 {
+			return "0"
+		}
+		return "((" + a + ") % (" + b + "))"
+	}
+	switch c {
+	case 1:
+		return "(" + a + ")"
+	case -1:
+		// Java answers MIN / -1 with MIN; negate() goes through an unsigned
+		// value, which is the same answer with every input defined
+		if pt, ok := opType.(*ast.PrimType); ok && pt.IsIntegral() {
+			return negate(a, pt)
+		}
+		return ""
+	}
+	return "((" + a + ") / (" + b + "))"
+}
+
+// intConst reports the value of an integer expression the checker folded: a
+// literal, a `-` in front of one, or a constant field. Everything else is not
+// one, and saying so is what keeps the emitter from guessing.
+func (e *Emitter) intConst(x ast.Expr) (int64, bool) {
+	switch v := x.(type) {
+	case *ast.Literal:
+		switch v.Kind {
+		case ast.LitChar, ast.LitInt, ast.LitLong:
+			return int64(v.Int), true
+		}
+	case *ast.Unary:
+		if v.Op == "-" {
+			if c, ok := e.intConst(v.X); ok {
+				return -c, true
+			}
+		}
+	}
+	if cv := e.prog.ConstInt(x); cv != nil {
+		return *cv, true
+	}
+	return 0, false
 }
 
 // isFloating reports whether a type is float or double.
@@ -2204,6 +2279,11 @@ func (e *Emitter) assignInner(v *ast.Assign, lv, read string) string {
 			// an integral target that is the narrowing conversion a cast does --
 			// which C's own conversion of a double to an int does not define
 			return "(" + lv + " = (" + e.ctype(xt) + ")" + e.narrowTarget(v.OpType, xt, call) + ")"
+		}
+		if s := e.constDivOp(op, read, e.expr(v.Y), v.Y, v.OpType); s != "" {
+			// the result is converted back to the target's type, exactly as the
+			// helper's result is on the line below
+			return "(" + lv + " = (" + e.ctype(xt) + ")" + s + ")"
 		}
 		fn := "ty_div_int"
 		if op == "%" {
