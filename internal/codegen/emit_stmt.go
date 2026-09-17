@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/teyru-lang/Teyru/internal/ast"
@@ -21,6 +22,13 @@ func (e *Emitter) localName(v *ast.Var) string {
 	if v.ID < 0 {
 		return "this"
 	}
+	/* Every read and every write of a local comes through here, which is what
+	   makes it the place that knows a reference was mentioned: the kill pass
+	   (frames.go) never has to walk the tree and cannot miss a use the emitter
+	   makes, because a use it did not record here would not be in the C. */
+	if e.useNow != nil {
+		e.useNow[v] = true
+	}
 	if n, ok := e.locals[v]; ok {
 		return n
 	}
@@ -30,8 +38,76 @@ func (e *Emitter) localName(v *ast.Var) string {
 }
 
 func (e *Emitter) emitBlockInner(b *ast.Block) {
-	for _, s := range b.Stmts {
-		e.stmt(s)
+	if b == nil {
+		return
+	}
+	if !e.frameMap {
+		for _, s := range b.Stmts {
+			e.stmt(s)
+		}
+		return
+	}
+	/* One statement's text at a time, so that the store that ends a reference's
+	   life can be written after the last statement that mentions it rather than
+	   after every one of them. The variables this block declares are the only
+	   ones it decides for: a variable of the enclosing block is still live after
+	   this one, which is the case a kill written inside a branch would get
+	   wrong. */
+	decls := e.declInBlock(b)
+	texts := make([]string, len(b.Stmts))
+	uses := make([]map[*ast.Var]bool, len(b.Stmts))
+	for i, s := range b.Stmts {
+		s := s
+		outer := e.useNow
+		e.useNow = map[*ast.Var]bool{}
+		texts[i] = e.capture(func() { e.stmt(s) })
+		uses[i] = e.useNow
+		e.useNow = outer
+		/* A use inside a nested statement is a use of this statement too: the
+		   enclosing block decides for its own variables, and the loop or branch
+		   it is looking at is one statement of its sequence. */
+		for v := range uses[i] {
+			if e.useNow != nil {
+				e.useNow[v] = true
+			}
+		}
+	}
+	last := map[*ast.Var]int{}
+	for i, u := range uses {
+		for v := range u {
+			if decls[v] {
+				last[v] = i
+			}
+		}
+	}
+	kills := map[int][]*ast.Var{}
+	for v, i := range last {
+		kills[i] = append(kills[i], v)
+	}
+	for i := range texts {
+		e.code.WriteString(texts[i])
+		vs := kills[i]
+		sort.Slice(vs, func(a, b int) bool { return e.localName(vs[a]) < e.localName(vs[b]) })
+		for _, v := range vs {
+			if killsOff {
+				continue
+			}
+			e.line("%s = NULL;\n", e.localName(v))
+		}
+		/* The frame's own words for values that were in flight: a value cannot
+		   still be waiting for the call that consumes it once the statement is
+		   over, so the words they were held in go back. The word, not the
+		   variable -- what the expression answered with has been read out of it
+		   by now. */
+		if n := len(e.frameTemps); n > 0 {
+			for k := 0; k < n; k++ {
+				e.line("%s(&%s, %d, NULL);\n", framePut, frameVar, e.frameBase+k)
+			}
+		}
+		/* And where the statement ended, which is what tells the map's pass
+		   (frames.go) to give the temporaries *it* registered their words back
+		   in the same way. */
+		e.line("%s\n", frameStmtEnd)
 	}
 }
 
@@ -455,6 +531,13 @@ func (e *Emitter) stackNew(vd *ast.VarDeclarator, nw *ast.New, ct, name string) 
 	cl := cty.Class
 	slot := "_stack_" + name
 	e.line("%s %s;\n", cname(cl), slot)
+	// The object's reference fields are words of this frame -- it is a struct
+	// the emitter lays out here -- and a map that does not name them makes the
+	// collector stop reading them, which frees an object only they pointed at.
+	// The pass cannot see them in a declaration (the declaration is the struct,
+	// not a pointer), so they are named here, where the class is known and where
+	// the object's scope begins. See frameFieldsMark.
+	e.line("%s", e.stackFieldWords(slot, cl))
 	e.line("memset(&%s, 0, sizeof(%s));\n", slot, slot)
 	e.line("%s.obj.cls = &cls_%s;\n", slot, mangle(cl.Full))
 	if cl.Inner && cl.OuterField != nil {
@@ -463,6 +546,25 @@ func (e *Emitter) stackNew(vd *ast.VarDeclarator, nw *ast.New, ct, name string) 
 	e.line("%s", e.clinitStmt(cl))
 	e.line("%s;\n", e.callTo(e.argsWithCaptures("&"+slot, nw, cl), e.cfunc(nw.Ctor)+"(", ")"))
 	e.line("%s %s = &%s;\n", ct, name, slot)
+}
+
+// stackFieldWords renders the marker the frame pass expands into one
+// registration per reference field of a stack-promoted object (see
+// frameFieldsMark), or nothing when no map is being written for this body -- a
+// body without a map is scanned conservatively and names nothing. The fields
+// are the class's own, in the order the struct lays them out; a promoted class
+// is never a closure or a wrapper, so there are no captured or special fields.
+func (e *Emitter) stackFieldWords(slot string, cl *ast.Class) string {
+	if !e.frameMap || frameMapsOff {
+		return ""
+	}
+	var fields []string
+	for _, f := range cl.InstFields {
+		if ast.IsRef(f.Type) {
+			fields = append(fields, slot+".f_"+mangle(f.Name))
+		}
+	}
+	return frameFieldsMarkFor(fields)
 }
 
 // exprStmt emits an expression as a statement.
@@ -685,7 +787,12 @@ func (e *Emitter) syncBlock(lock string, nullTest bool, body func()) {
 	frame.emit = func() { e.line("ty_sync_exit(_lock);\n") }
 	e.line("{ tycatch %s; tyobj* %s_ex = NULL;\n", frame.name, frame.name)
 	e.indent++
-	e.line("%s.prev = ty_cur_catch; %s.ex = NULL; ty_cur_catch = &%s;\n", frame.name, frame.name, frame.name)
+	/* The frame chain as of this point, which is where ty_throw rewinds it to
+	   before it jumps: a longjmp drops every frame between the throw and this
+	   setjmp, and the collector must not walk the maps of frames whose storage
+	   the jump just freed. See tycatch in internal/runtime/src/tyrt.h. */
+	e.line("%s.prev = ty_cur_catch; %s.ex = NULL; %s.frames = ty_frames; ty_cur_catch = &%s;\n",
+		frame.name, frame.name, frame.name, frame.name)
 	e.line("if (setjmp(%s.buf) == 0) {\n", frame.name)
 	e.indent++
 	e.finallys = append(e.finallys, frame)
@@ -784,14 +891,20 @@ func (e *Emitter) emitTryCore(v *ast.Try, closeFn func()) {
 		frame.name = e.tmpName()
 		e.line("{ tycatch %s; tyobj* %s_ex = NULL;\n", frame.name, frame.name)
 		e.indent++
-		e.line("%s.prev = ty_cur_catch; %s.ex = NULL; ty_cur_catch = &%s;\n", frame.name, frame.name, frame.name)
+		/* The frame chain as of this point, which is where ty_throw rewinds it to
+		   before it jumps: a longjmp drops every frame between the throw and this
+		   setjmp, and the collector must not walk the maps of frames whose storage
+		   the jump just freed. See tycatch in internal/runtime/src/tyrt.h. */
+		e.line("%s.prev = ty_cur_catch; %s.ex = NULL; %s.frames = ty_frames; ty_cur_catch = &%s;\n",
+			frame.name, frame.name, frame.name, frame.name)
 		e.line("if (setjmp(%s.buf) == 0) {\n", frame.name)
 		e.indent++
 		e.finallys = append(e.finallys, frame)
 	}
 	if len(v.Catches) > 0 {
 		c := e.tmpName()
-		e.line("{ tycatch %s; %s.prev = ty_cur_catch; %s.ex = NULL; ty_cur_catch = &%s;\n", c, c, c, c)
+		e.line("{ tycatch %s; %s.prev = ty_cur_catch; %s.ex = NULL; %s.frames = ty_frames; ty_cur_catch = &%s;\n",
+			c, c, c, c, c)
 		e.indent++
 		e.line("if (setjmp(%s.buf) == 0) {\n", c)
 		e.indent++

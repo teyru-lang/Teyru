@@ -114,6 +114,7 @@ static int32_t prim_size(int32_t kind) {
 static void *call_invoker(void *fn, void *self, void **a) {
   tycatch frame;
   frame.prev = ty_cur_catch;
+  frame.frames = ty_frames;
   frame.ex = NULL;
   ty_cur_catch = &frame;
   if (setjmp(frame.buf) == 0) {

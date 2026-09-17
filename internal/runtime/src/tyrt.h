@@ -239,6 +239,14 @@ typedef struct tycatch {
   jmp_buf buf;
   struct tycatch *prev;
   tyobj *ex;
+  /* The frame chain as it was when this catch frame was armed. A longjmp lands
+     in the frame that armed the setjmp and drops every frame between the throw
+     and the landing point, and those frames' map records are storage that is
+     about to be reused: ty_throw rewinds the chain to this value before it
+     jumps, so the collector walks the landing frame's map and not a dead
+     frame's. Getting this wrong is not retention but a missing root -- the
+     live frames below the rewound point would not be walked at all. */
+  struct tyframe *frames;
 } tycatch;
 
 /* Per thread: see tyrt_thread.c's empty catch frames and ty_throw. */
@@ -366,6 +374,112 @@ static inline __attribute__((always_inline)) void ty_stack_check(void) {
 #define TY_BATCH 64
 #define TY_BATCH_CLASSES 64
 
+/* ---- frame maps --------------------------------------------------------
+
+   A frame map is what the compiler knows about a generated function's frame and
+   the collector does not: which of its words hold references, and where the
+   frame's own storage begins and ends. A function that has no reference of its
+   own in its frame -- no object-typed parameter, local or temporary -- emits no
+   map at all, and the collector treats its frame the way it treats the
+   runtime's own: conservatively, over the words between the mapped frames
+   around it. A function that has one emits a `tyframe` in its frame, records
+   the *addresses* of those words in it, and links the record into the thread's
+   chain at entry and unlinks it at every return.
+
+   Why addresses and not a bitmap over the frame: the frame's layout is the C
+   compiler's, not ours. We can say where our variables are; we cannot say what
+   is in the words around them, and a bitmap would have to be over the
+   compiler's layout. The set of words we can name is exactly the set we can
+   keep precise. A generated frame that registers nothing is scanned
+   conservatively, the old way; a frame that registers is read through its list
+   and its interior is *not* scanned (see the complement below), so a word of
+   such a frame that the emitter could have named and did not is a missing root
+   and not retention. That is the direction the emitter's side of this is
+   written to: every word it can name, it names -- the check is
+   internal/codegen/frames_test.go's TestEveryFrameWordIsMapped, which reads the
+   C of real programs. What covers the words it cannot name -- the compiler's
+   spill slots, the registers it saves, the outgoing arguments of the call in
+   flight -- is the register half of the map and the deliberately low floor
+   below, and the emitter's rule that a value created mid-expression goes into a
+   frame word first. The cost of the named words is retention, and the kill
+   store the emitter writes after a reference's last use (see tyrt.c's
+   `ty_gc_locked` and the emitter's frameSlots) is what stops them from holding
+   an object the program has dropped.
+
+   `lo` and `hi` are the frame's own C-stack extent. The collector scans the
+   *complement* of the mapped extents, so the runtime's frames -- which are not
+   mapped and hold objects in their own locals -- are still scanned exactly as
+   they were before; a mapped frame's interior is not, which is where its
+   precise word list replaces the walk. `lo` is deliberately a little below the
+   frame's floor and `hi` a little above its frame address: an extent that is
+   too small would exclude words that belong to a frame below (a runtime frame's
+   spilled registers, most of all), and that is the one direction that loses a
+   root instead of retaining one.
+
+   `saved` is the register half of the map. A value a generated frame holds only
+   in a callee-saved register is invisible to any word list, and the ABI hands
+   `ty_frame_enter` those registers' values as they were at the call: a
+   callee-saved register is preserved across the call, so its value inside
+   ty_frame_enter *is* the caller's. Every one of them is taken, whether it
+   holds a reference or not: deciding would mean knowing the C compiler's
+   register allocation, and the alternative -- not taking one that does -- is a
+   missing root. A non-reference word that happens to name an object costs one
+   object retained; TY_FRAME_REGS is the ABI's count of callee-saved registers,
+   which is 5 on x86-64 (rbx, r12-r15) and 10 on arm64 (x19-x28). */
+#define TY_FRAME_REGS 10
+
+typedef struct tyframe {
+  struct tyframe *prev; /* the frame that called this one */
+  /* The addresses of the frame's reference words. Written by the frame's own
+     prologue, read by the collector while the frame is stopped or while it is
+     the collector's own frame. */
+  void **slots;
+  int32_t nslots;
+  /* How many words the frame's slot array has room for. The generated code
+     writes through ty_frame_put, which checks this: a registration whose index
+     is past the end of the array would be a write into whatever the C compiler
+     put next to it, and that is a mistake this mechanism must not be able to
+     make quietly -- it is the map, and the map's failure mode is a missing
+     root, which nobody sees until the program reads a freed object. */
+  int32_t cap;
+  /* The map's identity: which function emitted it, as an index into the
+     program's frame-name table. Diagnostics only, and the reason a report can
+     say which function a suspicious word came from. */
+  int32_t fno;
+  char *lo, *hi; /* the frame's extent, [lo, hi) */
+  void *saved[TY_FRAME_REGS]; /* the callee-saved registers as of entry */
+} tyframe;
+
+/* The chain of frames this thread is inside. A collection reads the thread's
+   published copy (tythread.frames) and the collector reads its own through
+   this. */
+extern _Thread_local tyframe *ty_frames;
+
+/* Declare the map of a function whose frame holds at least one reference.
+ *
+ * noinline, and it is not a hint about performance: `lo` is the caller's stack
+ * pointer, and the only way to see it is from a frame below the caller's. A
+ * compiler that inlines this -- link-time optimisation did, and the two bounds
+ * then came out equal, which made the map's extent empty and the frame look like
+ * one that describes nothing. `lo` is worked out from this function's own frame
+ * address, which is the frame record of the call itself; the C ABI puts the
+ * caller's stack pointer 16 bytes above it on every architecture this builds
+ * for. */
+__attribute__((noinline)) void ty_frame_enter_(tyframe *f, void **slots, int32_t nslots, int32_t fno,
+                                               char *frame_addr);
+/* Undo it. A no-op when this frame is not the innermost one, which is what
+   makes it safe after a longjmp has already rewound the chain past it. */
+void ty_frame_leave(tyframe *f);
+/* Record one word of the frame's map. Aborts by name if the index is outside
+   the array the prologue declared for it. */
+void ty_frame_put(tyframe *f, int32_t k, void *p);
+
+/* __builtin_frame_address(0) is this function's own frame address, which is
+   what the map records as `hi`; ty_frame_enter_ derives `lo` from its own
+   frame, which is one call below the frame being mapped. */
+#define ty_frame_enter(f, slots, nslots, fno) \
+  ty_frame_enter_((f), (slots), (nslots), (fno), (char *)__builtin_frame_address(0))
+
 /* ---- threads and the per-thread state ---------------------------------
 
    Everything the runtime keeps for one thread lives in the struct below,
@@ -411,6 +525,13 @@ struct tythread {
      thread is scanned from there upwards. It only ever moves down, so it stays
      a lower bound on what has to be scanned. */
   char *stack_base, *stack_top, *park_sp;
+  /* The thread's frame chain as of the last time it stopped, published here for
+     the same reason park_sp is: the collector reads it from another thread, and
+     C11 has no way to reach another thread's thread-local storage. It is the
+     precise half of the scan -- the map of every generated frame the thread is
+     inside -- and the ranges it covers are the ones the conservative pass
+     leaves alone. */
+  tyframe *frames;
   typlat_thread tid;
   typlat_mutex mtx; /* guards the fields below, and signals a joiner */
   typlat_cond cv;
@@ -516,6 +637,8 @@ static inline void *ty_alloc(size_t size) {
 void *ty_alloc_arr(int64_t len, size_t elemsize);
 void ty_gc_init(void);
 void ty_gc(void);
+/* The live set as of the last collection, for System.liveBytes(). */
+int64_t ty_gc_live_bytes(void);
 void ty_gc_register_static(void *p);
 void ty_free_block(void *payload, size_t total);
 

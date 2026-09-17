@@ -432,6 +432,7 @@ var nativeTable = map[string]nativeFn{
 	"System.getenv(String)":           {fn: "ty_getenv", recv: "tystr*"},
 	"System.getProperty(String)":      {fn: "ty_get_property", recv: "tystr*"},
 	"System.gc()":                     {fn: "ty_gc"},
+	"System.liveBytes()":              {fn: "ty_gc_live_bytes"},
 
 	// System.in: its two methods take no arguments, so the receiver is the
 	// only thing the helpers see.
