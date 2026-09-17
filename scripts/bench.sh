@@ -38,13 +38,14 @@
 # in is the one that says whether the box was quiet.
 #
 # A ratio is printed as !(out) rather than a number when the two sides printed
-# different output: those two runs are not the same program, so the ratio would
-# not be a comparison of two implementations. "Different output" ignores lines a
-# side does not print the same way twice -- those are timings, and bench_invoke
-# prints two of them -- so the check separates "the two sides did different work"
-# from "the two sides reported different stopwatch readings". bench_string_cjk is
-# the row that prints !(out) today, and it stops being one when the string
-# semantics land and its outputs agree.
+# different answers: those two runs are not the same program, so the ratio would
+# not be a comparison of two implementations. The answer is the last line each
+# side prints, which is where every benchmark here puts its result, so the check
+# separates "the two sides did different work" from "the two sides reported
+# different stopwatch readings" -- bench_invoke prints two timings of its own
+# before the line that is its answer. bench_string_cjk is the row that prints
+# !(out) today, and it stops being one when the string semantics land and its
+# answers agree.
 set -e
 cd "$(dirname "$0")/.."
 # The compiler is built from the tree being measured, unless BIN names one to
@@ -122,19 +123,20 @@ fmt_ratio() {
   fi
 }
 
-# result_lines: the command's output, reduced to the lines it prints the same way
-# twice. The same scale argument is not a guarantee that the two sides did the
-# same work -- bench_string_cjk reads the same argument and, today, counts bytes
-# on one side and characters on the other -- so the two sides' output is
-# compared and a row that disagrees has its ratio replaced by !(out). The
-# filtering is the other half of that: bench_invoke prints its own two timings,
-# which differ on every run, and a line that is not stable within one side is a
-# measurement of the machine rather than an answer about the program, so it must
-# not be what makes two equal runs look unequal.
-result_lines() {
-  timeout "$LIMIT" "$@" 2>/dev/null | sort > "$TMP/out.1" || true
-  timeout "$LIMIT" "$@" 2>/dev/null | sort > "$TMP/out.2" || true
-  comm -12 "$TMP/out.1" "$TMP/out.2" || true
+# answer_of: the last line the command prints. Every benchmark here prints its
+# answer last -- a sum, a length, or bench_invoke's equality flag -- so the two
+# sides' last lines are what "the same work" means, and a row whose answers differ
+# has its ratio replaced by !(out) instead of printed. The same scale argument is
+# not a guarantee of the same work: bench_string_cjk reads the same argument and,
+# today, counts bytes on one side and characters on the other.
+#
+# Comparing the last line rather than all of them is deliberate: line-set
+# comparison was the first version, and it flipped bench_invoke to !(out) whenever
+# its two stopwatch lines happened to read the same in both of that side's runs --
+# a check that is right by luck is worse than no check, because the row it broke is
+# the one row that loses and whose factor the README quotes.
+answer_of() {
+  timeout "$LIMIT" "$@" 2>/dev/null | awk 'NF { last = $0 } END { print last }' || true
 }
 
 # worst_rss: runs the program $RUNS times and prints the largest peak RSS in kB
@@ -234,11 +236,11 @@ table() {
     ratio="-"
     if [ -n "$j" ]; then
       if [ -n "$scale" ]; then
-        to=$(result_lines "$exe" "$scale")
-        jo=$(result_lines java -cp "$TMP" "$name" "$scale")
+        to=$(answer_of "$exe" "$scale")
+        jo=$(answer_of java -cp "$TMP" "$name" "$scale")
       else
-        to=$(result_lines "$exe")
-        jo=$(result_lines java -cp "$TMP" "$name")
+        to=$(answer_of "$exe")
+        jo=$(answer_of java -cp "$TMP" "$name")
       fi
       if [ "$to" != "$jo" ]; then
         ratio="!(out)"
