@@ -54,6 +54,9 @@ jobs:
       - name: the JDK differential
         run: make jdk-diff
 
+      - name: the back-end matrix (every program under both back ends, -O0 and -O2, clang and gcc)
+        run: make backend-matrix
+
       - name: third-party notices and the tree agree
         run: make notices
 
