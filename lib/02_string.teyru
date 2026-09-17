@@ -20,10 +20,31 @@ class String extends Object implements Comparable<String> {
   public native String(String original)
   public native String(byte[] bytes)
   public native String(byte[] bytes, int offset, int length)
+  /* String(char[]) and String(char[],int,int) take the code units, which is
+     the one constructor that can name half of an astral character and the one
+     Java's own code uses to round-trip toCharArray. String(int[],int,int)
+     takes code points instead, so one supplementary character is one element
+     there and two units here. */
+  public native String(char[] value)
+  public native String(char[] value, int offset, int count)
+  public native String(int[] codePoints, int offset, int count)
   public native int length()
   public native boolean isEmpty()
   public native boolean isBlank()
   public native char charAt(int index)
+  /* The code point family. A code point is one or two code units, so these are
+     the index arithmetic that walks a supplementary character as the pair it
+     is: codePointAt(1) of one emoji is the low surrogate, codePointCount(0, 2)
+     is one, and offsetByCodePoints counts characters rather than positions. */
+  public native int codePointAt(int index)
+  public native int codePointBefore(int index)
+  public native int codePointCount(int begin, int end)
+  public native int offsetByCodePoints(int index, int codePointOffset)
+  public native void getChars(int srcBegin, int srcEnd, char[] dst, int dstBegin)
+  public native boolean regionMatches(boolean ignoreCase, int toffset, String other, int ooffset, int len)
+  public boolean regionMatches(int toffset, String other, int ooffset, int len) {
+    return regionMatches(false, toffset, other, ooffset, len)
+  }
   public native boolean equals(Object o)
   public native boolean equalsIgnoreCase(String s)
   public native int hashCode()
@@ -78,6 +99,39 @@ class String extends Object implements Comparable<String> {
   }
   public String[] split(String re, int limit) {
     return Pattern.compile(re).split(this, limit)
+  }
+
+  /* subSequence is Java's view of the string as a CharSequence. Teyru has no
+     CharSequence interface, so the return is spelled String -- which is what
+     Java's own subSequence answers too. */
+  public String subSequence(int from, int to) {
+    return substring(from, to)
+  }
+
+  /* chars() is the code units and codePoints() is the code points, as an
+     IntStream. IntStream's pipeline is boxed (lib/22_stream.teyru), so both
+     materialise the values into an int[] first; codePoints walks the pairing,
+     which is what makes it differ from chars(). */
+  public IntStream chars() {
+    int n = length()
+    int[] out = new int[n]
+    for (var i = 0 : i < n : i++) {
+      out[i] = charAt(i)
+    }
+    return IntStream.of(out)
+  }
+  public IntStream codePoints() {
+    int n = length()
+    int[] out = new int[codePointCount(0, n)]
+    int k = 0
+    int i = 0
+    while (i < n) {
+      int cp = codePointAt(i)
+      out[k] = cp
+      k++
+      i += (cp >= 0x10000 ? 2 : 1)
+    }
+    return IntStream.of(out)
   }
 
   /* Java's String.lines: the lines of this string as a stream. A line is a

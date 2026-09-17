@@ -1188,7 +1188,7 @@ func (e *Emitter) foldBinary(v *ast.Binary) (string, bool) {
 	}
 	// string concatenation of two literals
 	if v.Op == "+" && xl.Kind == ast.LitString && yl.Kind == ast.LitString {
-		return e.strLit(xl.Str + yl.Str), true
+		return e.strLit(util.StrConcat(xl.Str, yl.Str)), true
 	}
 	pt, isPrim := v.OpType.(*ast.PrimType)
 	if !isPrim || !pt.IsNumeric() {

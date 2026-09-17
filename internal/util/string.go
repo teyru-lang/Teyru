@@ -51,3 +51,55 @@ func StrBreadcrumbs(units int, ascii bool) int {
 	}
 	return units/64 + 1
 }
+
+// StrConcat joins two WTF-8 strings the way the runtime joins them, which is
+// the way Java's `+` joins two strings: a high surrogate ending the first and
+// its low one starting the second are one character, so they are written as the
+// single four-byte sequence they are and not as the two three-byte sequences
+// the halves take alone.
+//
+// A compile-time fold has to agree with the runtime about this, because byte
+// equality is what equals, string switch and the hash built on it use:
+// `("\uD83D" + "\uDE00").equals("😀")` is true in Java, and it is true here only
+// when the folded literal is the same bytes as the literal it is compared with.
+func StrConcat(a, b string) string {
+	hi, ok := trailingHighSurrogate(a)
+	if !ok {
+		return a + b
+	}
+	lo, ok := leadingLowSurrogate(b)
+	if !ok {
+		return a + b
+	}
+	cp := 0x10000 + (hi-0xD800)<<10 + (lo - 0xDC00)
+	return a[:len(a)-3] + string(rune(cp)) + b[3:]
+}
+
+// trailingHighSurrogate reads the three-byte WTF-8 sequence that ends s, if it
+// is one and if it spells a high surrogate.
+func trailingHighSurrogate(s string) (rune, bool) {
+	if len(s) < 3 {
+		return 0, false
+	}
+	r, ok := wtf8Unit(s[len(s)-3:])
+	return r, ok && r >= 0xD800 && r <= 0xDBFF
+}
+
+// leadingLowSurrogate reads the three-byte WTF-8 sequence that begins s, if it
+// is one and if it spells a low surrogate.
+func leadingLowSurrogate(s string) (rune, bool) {
+	if len(s) < 3 {
+		return 0, false
+	}
+	r, ok := wtf8Unit(s[:3])
+	return r, ok && r >= 0xDC00 && r <= 0xDFFF
+}
+
+// wtf8Unit decodes one three-byte sequence of WTF-8, which is the only width a
+// surrogate has: a canonical string never spells a pair this way.
+func wtf8Unit(s string) (rune, bool) {
+	if len(s) != 3 || s[0]&0xF0 != 0xE0 || s[1]&0xC0 != 0x80 || s[2]&0xC0 != 0x80 {
+		return 0, false
+	}
+	return rune(s[0]&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), true
+}
