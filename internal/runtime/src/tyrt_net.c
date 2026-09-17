@@ -874,3 +874,91 @@ tyarr *ty_sha1_bytes(tyarr *data) {
   ty_sha1(in, len, (uint8_t *)out->data);
   return out;
 }
+
+/* ------------------------------------------------------------ TLS, unlinked */
+
+/* What the TLS entry points answer when the TLS layer was not compiled in.
+
+   A build compiles tyrt_tls.c only when the program's reachable code calls one
+   of these (internal/codegen/prune.go decides, and internal/driver links OpenSSL
+   for exactly those programs), so that a program which never uses TLS needs
+   neither the headers nor the library. What that decision cannot see is
+   reflection: the generated C carries the body of every method, including the
+   ones whose dispatch slots the pruner emptied, and those bodies still call
+   these symbols. Whether such a program links at all then depends on the C
+   compiler dropping functions nothing references -- clang and gcc -O1 and above
+   do, gcc -O0 does not, and there the link ends in `undefined reference to
+   ty_tls_kind`: a message naming a symbol the program's author never wrote, for
+   a call their program cannot make.
+
+   So each entry point has a weak definition here, in a file every build
+   compiles. A program that does link the TLS layer gets the strong definition
+   from tyrt_tls.c and never reaches these; a program that does not gets a
+   named failure the first time reflection actually calls one, which is the
+   behaviour the plan asks of an unlinked TLS layer, and is catchable rather
+   than fatal because a program reaching a method by name is running its own
+   code and may want to answer for it.
+
+   The message names the Teyru method (the key in internal/codegen/native_net.go,
+   which is the name a reader can search for) and the reason, and says nothing
+   about OpenSSL being absent from the machine: the library may be installed and
+   the program simply never needed it. */
+static void tls_absent(const char *sym) __attribute__((noreturn));
+static void tls_absent(const char *sym) {
+  char msg[128];
+  snprintf(msg, sizeof msg, "%s: this program was not linked against OpenSSL", sym);
+  ty_throw(ty_make_ex(TY_UNSUP, msg));
+}
+
+__attribute__((weak)) int32_t ty_tls_client_context(tystr *ca_pem) {
+  (void)ca_pem;
+  tls_absent("Net.tlsClientContext0");
+}
+__attribute__((weak)) int32_t ty_tls_server_context(tystr *cert_pem, tystr *key_pem) {
+  (void)cert_pem;
+  (void)key_pem;
+  tls_absent("Net.tlsServerContext0");
+}
+__attribute__((weak)) int32_t ty_tls_context_free(int32_t ctx) {
+  (void)ctx;
+  tls_absent("Net.tlsFreeContext0");
+}
+__attribute__((weak)) int32_t ty_tls_connect(int32_t ctx, int32_t fd, tystr *host) {
+  (void)ctx;
+  (void)fd;
+  (void)host;
+  tls_absent("Net.tlsConnect0");
+}
+__attribute__((weak)) int32_t ty_tls_accept(int32_t ctx, int32_t fd) {
+  (void)ctx;
+  (void)fd;
+  tls_absent("Net.tlsAccept0");
+}
+__attribute__((weak)) int32_t ty_tls_read(int32_t session, tyarr *buf, int32_t off, int32_t len) {
+  (void)session;
+  (void)buf;
+  (void)off;
+  (void)len;
+  tls_absent("Net.tlsRead0");
+}
+__attribute__((weak)) int32_t ty_tls_write_all(int32_t session, tyarr *buf, int32_t off, int32_t len) {
+  (void)session;
+  (void)buf;
+  (void)off;
+  (void)len;
+  tls_absent("Net.tlsWrite0");
+}
+__attribute__((weak)) int32_t ty_tls_write_str(int32_t session, tystr *s) {
+  (void)session;
+  (void)s;
+  tls_absent("Net.tlsWriteStr0");
+}
+__attribute__((weak)) int32_t ty_tls_close(int32_t session) {
+  (void)session;
+  tls_absent("Net.tlsClose0");
+}
+__attribute__((weak)) tystr *ty_tls_detail_text(void) { tls_absent("Net.tlsDetail0"); }
+__attribute__((weak)) int32_t ty_tls_kind(int32_t code) {
+  (void)code;
+  tls_absent("Net.tlsKind0");
+}
