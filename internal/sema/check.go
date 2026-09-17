@@ -2860,11 +2860,21 @@ func (c *Checker) recvBind(recv *ast.ClassType, m *ast.Method) map[*ast.TypeVar]
 	if m.Owner == nil || len(m.Owner.TypeParams) == 0 || recv == nil {
 		return bind
 	}
+	var args []ast.Type
 	if sup := c.asSuper(recv, m.Owner); sup != nil {
-		return bindings(m.Owner, sup.Args)
+		args = sup.Args
+	} else if recv.Class == m.Owner {
+		args = recv.Args
 	}
-	if recv.Class == m.Owner {
-		return bindings(m.Owner, recv.Args)
+	// A type name receiver (`Comparator.nullsFirst(..)`) is spelled with the
+	// class's own type variables as its arguments, and binding a variable to
+	// itself says nothing while it stops the argument list from settling it:
+	// the parameters below then ask whether String is a subtype of a bare T.
+	for tv, t := range bindings(m.Owner, args) {
+		if self, isVar := t.(*ast.TypeVarType); isVar && self.Var == tv {
+			continue
+		}
+		bind[tv] = t
 	}
 	return bind
 }
@@ -3162,7 +3172,7 @@ func (c *Checker) inferTypeArg(param, arg ast.Type, bind map[*ast.TypeVar]ast.Ty
 				// `Comparator.naturalOrder()`'s T as `Comparator<String>` does,
 				// and taking the bound is what keeps T a String instead of a
 				// wildcard that every later use has to see through.
-				if w, isWild := arg.(*ast.WildcardType); isWild && w.Bound != nil {
+				if w, isWild := arg.(*ast.WildcardType); isWild && w.Bound != nil && !mentionsType(w.Bound, p.Var) {
 					bind[p.Var] = c.subst(w.Bound, bind)
 					return bind[p.Var]
 				}
@@ -3426,11 +3436,7 @@ func (ctx *methodCtx) checkCall(v *ast.Call, want ast.Type) {
 		// its T is String (JLS 18.5.2 reads the same constraint off the whole
 		// expression). A receiver whose type does not share a type variable
 		// with the result is unaffected: nothing matches and nothing binds.
-		var recvWant ast.Type
-		if _, isCall := v.Recv.(*ast.Call); isCall {
-			recvWant = want
-		}
-		ctx.checkExpr(v.Recv, recvWant)
+		ctx.checkExpr(v.Recv, nil)
 		rt = v.Recv.GetType()
 	}
 	for _, a := range v.Args {
@@ -3439,7 +3445,8 @@ func (ctx *methodCtx) checkCall(v *ast.Call, want ast.Type) {
 		// what settles a type variable only the parameter can determine, as in
 		// `collect(Collectors.toList())`.
 		_, nested := a.(*ast.Call)
-		if a.GetType() == nil && !isLambdaLike(a) && !nested {
+		_ = nested
+		if a.GetType() == nil && !isLambdaLike(a) {
 			ctx.checkExpr(a, nil)
 		}
 	}
