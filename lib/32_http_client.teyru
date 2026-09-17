@@ -157,8 +157,12 @@ class HttpClientRequest {
     for (int i = 0 : i < headerNames.size() : i++) {
       b.append(headerNames.get(i)).append(": ").append(headerValues.get(i)).append("\r\n")
     }
+    /* The length is the body's, in bytes: it is the count the server reads the
+       body with, and `body.length()` is a count of characters, which is the
+       same number only while every character is ASCII. The server half of this
+       library asks the same question the same way (HttpResponse.bodyLength). */
     if (body.length() > 0 && header("Content-Length").length() == 0) {
-      b.append("Content-Length: ").append(body.length()).append("\r\n")
+      b.append("Content-Length: ").append(body.getBytes().length).append("\r\n")
     }
     if (header("Connection").length() == 0) {
       b.append("Connection: keep-alive\r\n")
@@ -225,7 +229,9 @@ class HttpClientResponse {
   }
 
   public String toString() {
-    return "HTTP " + status + " " + body.length() + " bytes"
+    // the count the word names is the body's bytes, which is bodyBytes and not
+    // the character count `body.length()` is
+    return "HTTP " + status + " " + bodyBytes.length + " bytes"
   }
 }
 
@@ -342,7 +348,16 @@ class ClientResponseParser {
   private static HttpClientResponse ofRaw(String raw) {
     int headEnd = raw.indexOf("\r\n\r\n")
     String head = headEnd < 0 ? raw : raw.substring(0, headEnd)
-    String body = headEnd < 0 ? "" : raw.substring(headEnd + 4)
+    /* The body is bytes from here on, and where it starts is a byte offset: the
+       head is ASCII and the delimiter is four bytes of it, so the text up to the
+       end of the delimiter re-encodes to as many bytes as it has characters --
+       and a byte count is what the framing below counts in. */
+    byte[] all = raw.getBytes()
+    int bodyStart = headEnd < 0 ? all.length : raw.substring(0, headEnd + 4).getBytes().length
+    byte[] body = new byte[all.length - bodyStart]
+    for (int i = 0 : i < body.length : i++) {
+      body[i] = all[bodyStart + i]
+    }
     String[] lines = head.split("\r\n")
     HttpClientResponse res = new HttpClientResponse()
     res.status = statusOf(lines[0])
@@ -368,38 +383,58 @@ class ClientResponseParser {
       return res
     }
     if (chunked) {
-      res.body = unchunk(body)
-      res.bodyBytes = res.body.getBytes()
+      res.bodyBytes = unchunkBytes(body)
+      res.body = new String(res.bodyBytes)
       return res
     }
-    if (length >= 0 && length <= body.length()) {
-      res.body = body.substring(0, length)
-      res.bodyBytes = res.body.getBytes()
+    if (length >= 0 && length <= body.length) {
+      res.bodyBytes = new byte[length]
+      for (int i = 0 : i < length : i++) {
+        res.bodyBytes[i] = body[i]
+      }
+      res.body = new String(res.bodyBytes)
       return res
     }
-    res.body = body
-    res.bodyBytes = res.body.getBytes()
+    res.bodyBytes = body
+    res.body = new String(body)
     return res
   }
 
-  // unchunk decodes a chunked body that is already in hand.
+  /* unchunk decodes a chunked body that is already in hand, and it is the text
+     of the bytes the framing gives: a chunk's size is a count of bytes, so a
+     chunk's data is a byte range and not a range of characters. */
   public static String unchunk(String raw) {
-    StringBuilder b = new StringBuilder()
+    return new String(unchunkBytes(raw.getBytes()))
+  }
+
+  static byte[] unchunkBytes(byte[] raw) {
+    ByteArrayOutputStream b = new ByteArrayOutputStream()
     int at = 0
-    while (at < raw.length()) {
-      int eol = raw.indexOf("\r\n", at)
+    while (at < raw.length) {
+      int eol = indexOfCrLf(raw, at)
       if (eol < 0) {
         break
       }
-      int n = Integer.parseInt(raw.substring(at, eol).trim(), 16)
+      int n = Integer.parseInt(new String(raw, at, eol - at).trim(), 16)
       if (n == 0) {
         break
       }
       int from = eol + 2
-      b.append(raw.substring(from, from + n))
+      b.write(raw, from, n)
       at = from + n + 2
     }
-    return b.toString()
+    return b.toByteArray()
+  }
+
+  // indexOfCrLf is the CRLF at or after `from`, or -1: String.indexOf for the
+  // bytes a chunked body's framing is written in.
+  private static int indexOfCrLf(byte[] b, int from) {
+    for (int i = from : i + 1 < b.length : i++) {
+      if (b[i] == 13 && b[i + 1] == 10) {
+        return i
+      }
+    }
+    return -1
   }
 
   public static int statusOf(String statusLine) {
