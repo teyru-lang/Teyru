@@ -537,15 +537,63 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   同一次暴露兩個還沒解的空隙：
   - **`tests/run.sh` 沒有地方可以指名目標**：它只喊 `teyru build -O1 -o <輸出> <來源>`，也沒有任何
     環境變數可介入，所以交叉目標目前只能靠替換編譯器那個名字（一個包裝腳本）達成——可行，但這是
-    沒有文件的路徑。
+    沒有文件的路徑。**（已補：`TEYRU_TARGET`，見後面兩條。）**
   - **`--cc` 補不上目標表裡沒有編譯器的目標**：`darwin/amd64` 與 `darwin/arm64` 的 `cc` 是空的，
     `resolveTarget` 在 `Compile` 讀 `opts.CC` 之前就拒絕，所以即使裝了 `zig cc -target <arch>-macos`
-    也不能用 `teyru build` 編給 macOS。
+    也不能用 `teyru build` 編給 macOS。**（已補：`resolveTarget` 現在看的是這次真的要用的那支編譯器，
+    見後面兩條。）**
   `darwin/amd64` 與 `darwin/arm64` 上**沒有任何一行程式被執行過**：繞過目標表、把 `teyru emit` 的 C
   交給 `zig cc -target <arch>-macos`，**不碰 TLS 的 188 支全部編譯並連結成功**（Mach-O 執行檔），碰
   得到 TLS 的 34 支編不過（`tyrt_tls.c` include `openssl/err.h`，macOS 沒有那個標頭），而且這批連
   結不帶 `-flto`（zig 回 `LTO requires using LLD`，那是編譯器自己對沒有 LTO 的工具鏈的退回路徑）。
   這個「模擬器上跑過」與「只編過」的差別，在 README 的平台表與 docs 的 index 上必須分得清楚。
+
+- **TLS 的可達性由程式自己的呼叫圖決定，反射中繼資料不再把 OpenSSL 拖進每一個會反射的程式（W9.1）**：
+  `link.TLS` 一直是「產生的 C 裡有沒有活的 `ty_tls_*`」，而那個可達性分析（`internal/codegen/prune.go`）
+  把**反射中繼資料**當成一般的參考跟著走：程式只要用到反射（`Class.forName`、`Method.invoke`、註解
+  掃描——也就是整個 web 框架與 Gson 那一層），`reflect.go` 的 `attach` 就會在啟動碼裡把每個類別的成員
+  表接上去，成員表指名每個方法的 invoker，invoker 的函式體再呼叫方法本身，於是**每一個 TLS 方法體都
+  是活的**。實測（本機 linux/amd64、clang）：`web.teyru`（兩個路由、從不呼叫 `ssl()`）在基線上 `ldd`
+  有 `libssl.so.3` 與 `libcrypto.so.3`；`t101_gson` 用 `--target windows/amd64` 被 `checkTLS` 以
+  「mingw-w64 ships no OpenSSL」拒絕。
+  修法是把「這一行只有反射會走」變成**產生器寫下、掃描讀懂**的記號：`reflect.go` 的 `attach`（把成員表
+  接到類別上的啟動陳述）與 `forNameTable`（`Class.forName` 搜尋的類別表）在行尾寫
+  `/* reflection-only */`（常數 `reflectOnly`），`scanLine` 把這些行的參考另外記進 `cdef.refl`。可達性
+  因此跑兩次：`reach(false)` 是原本那一次，仍然跟隨每個參考——vtable 剪裁要的就是這個，反射的
+  `Method.invoke` 是從成員表走到 invoker、再從接收者的 vtable 分派出去，**讀到卻沒填的槽是跳到
+  NULL**；`reach(true)` 不跟隨記號行的參考，回答「程式自己的程式碼到得了哪裡」，`reachesTLS` 讀的是
+  後者。**編出來的 C 與基線逐位元組相同**（只多了那些註解；`emit` 對 `web.teyru`、`t146_reflect`、
+  `t163_https_roundtrip`、`t101_gson`、`t221_http_limits` 逐一比對過），所以剪裁的判斷沒有變，變的只有
+  連結決策；第二次 fixpoint 在 13.6 萬行的程式上量到 0.03 s（`teyru emit` 0.48 → 0.51 s）。反射真的在
+  執行期叫到 TLS 方法時，得到的是 `tyrt_net.c` weak stub 的**指名**失敗
+  （`Net.tlsClientContext0: this program was not linked against OpenSSL`，可攔截），不是跳到 NULL。
+  **驗收的三個重播**（皆本機）：①把 OpenSSL 標頭藏起來的 `cc` 包裝（掃 `*.c` 有沒有
+  `#include <openssl/`，有就照編譯器回 `fatal error: 'openssl/err.h' file not found`）——基線的
+  `web.teyru` 在 `tyrt_tls.c` 上失敗，修後建置成功、`ldd` 沒有 libssl、`/ok` 與 `/echo` 都回 200；
+  ②`t101_gson` 用 `--target windows/amd64` 建出 PE32+（`objdump -p` 的 imports 只有 KERNEL32／
+  WS2_32／msvcrt），並在 Wine 下跑出與 `.expected` 相同的輸出；③`t163_https_roundtrip`、
+  `t191_tls_keepalive`、`t207_http_server_certificate` 前後都連 `libssl` 且輸出逐行相同。
+  測試：`tests/programs/t241_reflect_tls_unlinked`（只用反射；基線印 `invoked=1` 且連 libssl，修後不連
+  libssl、印出上面那行指名失敗）與 `link_test.go` 的 `TestTLSReachability`（windows/amd64：反射的程式
+  可建、直接呼叫 `Tls.clientContext` 的程式被指名拒絕）。LLVM 後端不受影響，而且它本來就不需要這個
+  修正：它的連結決策是對自己的 IR 做字串搜尋（`LinkForIR`），而它的 IR 只帶可達的程式碼——同一支
+  `sock.teyru`，C 的文字裡有 12 處 `ty_tls_`（未可達的方法體照樣寫出來）、IR 裡 0 處（3,915 行對
+  81,830 行），且它對用到註解的程式是具名拒絕（`TY-INT-0100`）。實測呼叫 TLS 的程式在兩個建置上
+  一模一樣（都連 `libssl`、都印 `ctx=1`）。
+
+- **平台矩陣那條的兩個空隙已補（`TEYRU_TARGET` 與 `--cc`）**：
+  - `tests/run.sh` 讀 `TEYRU_TARGET=<os>/<arch>`：每一次 build 都經過一個 `build` 函式帶著 `--target`
+    （放在一處，後加的 build 不會忘記），`.skip` 也改以**目標平台**判讀（跨目標的程式跑在目標平台上，
+    能不能跑是那個平台的事）。編譯器倉庫的 `go test` driver 讀同一個變數、同一種語意，
+    `tests/README.md` 把規則寫在兩個 driver 的共同契約裡。
+  - `--cc` 現在填得上目標表裡沒有編譯器的目標：`resolveTarget(name, cc)` 檢查的是**這次真的要用的那支
+    編譯器**（`--cc` 優先），所以 `teyru build --target darwin/arm64 --cc <zig cc -target aarch64-macos
+    的包裝>` 真的會編給 macOS（zig 對 `-flto` 回 `LTO requires using LLD`，編譯器自己退回不帶 LTO 的
+    第二次嘗試，那條路徑本來就有）；沒有 `--cc` 時仍然具名拒絕，句子多了「and neither this table nor
+    --cc names one」。**macOS 仍然只到「編譯並連結」**：這裡沒有 macOS，沒有任何一行程式在它上面跑過，
+    而上面那條的 macOS 數字是舊規則下、繞過目標表量的：現在碰得到 TLS 的程式是**在讀檔之前就被
+    `checkTLS` 具名拒絕**（`TLS is not available for darwin/arm64: macOS ships SecureTransport…`），
+    不會走到 C 編譯器，所以那一格要以新的方式重量。
 
 ## 11. 送出前檢查清單
 
