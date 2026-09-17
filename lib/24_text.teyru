@@ -386,9 +386,11 @@ final class NumberDigits {
    which is the only difference that matters -- the defaults are the ROOT
    locale's, and every part can be set by hand.
 
-   Two of the Java fields are not chars here: the per-mill sign and infinity are
-   multi-byte in UTF-8 and a Teyru char is a byte, so those two are Strings, and
-   the currency symbol is a String in Java already. */
+   Two of the symbols Java keeps as chars are Strings here: the per-mill sign
+   and infinity. Every symbol this class hands out is a String -- the currency
+   and international-currency symbols and the NaN spelling are Strings in Java
+   too -- and the two that differ are read as text at each use, so there is one
+   shape to the surface rather than a char with a String beside it. */
 class DecimalFormatSymbols {
   private char zeroDigit = '0'
   private char groupingSeparator = ','
@@ -2016,11 +2018,11 @@ class SimpleDateFormat extends DateFormat {
         count = count + 1
       }
       if (!isAsciiLetter(c) || !isPatternLetter(c)) {
-        // the run is appended as text and not byte by byte: a literal that is
-        // not ASCII -- the narrow no-break space of the CLDR time patterns, a
-        // currency sign -- is several bytes, and each of them is already a
-        // byte of the string. Appending them one char at a time would encode
-        // every one of them again.
+        // the run is appended as the text it is and not one code unit at a
+        // time: a literal that is not ASCII -- the narrow no-break space of the
+        // CLDR time patterns, a currency sign -- may be held as a surrogate
+        // pair, and substring hands the two halves over together instead of
+        // relying on the builder to pair them up again.
         out.append(pattern.substring(i, i + count))
         i = i + count
         continue
@@ -3277,11 +3279,14 @@ class ChoiceFormat extends NumberFormat {
       String segment = bar < 0 ? newPattern.substring(start) : newPattern.substring(start, bar)
       int sep = separatorAt(segment)
       if (sep >= 0) {
-        // the segment is "limit#format" or "limit<format"; the separator is one
-        // byte for '#' and '<', three for the "<=" spelling, whose character is
-        // U+2264 and so three bytes of UTF-8
-        boolean strict = segment.charAt(sep) != '#'
-        int after = strict && segment.charAt(sep) == '<' ? sep + 1 : (strict ? sep + 3 : sep + 1)
+        /* The segment is "limit#format" or "limit<format", and the third
+           spelling Java accepts -- U+2264, the "<=" sign -- is another way of
+           writing "#" rather than a "<": the limit is the one written, and "<"
+           is the only spelling that means strictly above. The separator is one
+           character whatever it is spelled with and one code unit is one
+           character here, so the format text starts at the index after it. */
+        boolean strict = segment.charAt(sep) == '<'
+        int after = sep + 1
         String limitText = segment.substring(0, sep).trim()
         double value = parseLimit(limitText)
         // "<" means "strictly above", so the entry starts at the next double
