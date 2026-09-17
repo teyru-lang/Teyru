@@ -517,6 +517,16 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   會逼出 frame pointer 並可能擋掉內聯，改用區域變數的位址或 `__builtin_stack_address` 可能更省；
   以及 D4 的備選（純保護頁＋訊號）每次呼叫零成本，但那樣就得從訊號處理器 longjmp 才能丟出可攔截的
   `StackOverflowError`，而計畫明文禁止。
+- **裝箱的識別性不靠逃逸分析，而是結構上不成立（`internal/codegen/escape.go`）**：計畫 W6.1 要求
+  逃逸分析不得把身分會被 `==` 觀察到的箱子放到堆疊上，也不得複製它。今天之所以成立，不是因為分析
+  保證了它，而是因為兩件事：自動裝箱產生的是**呼叫包裝類別自己的 `valueOf`**（快取就在那裡，不是
+  每個使用現場自己配置），而 `findStackLocals`／`promotable` 只考慮**顯式 `new T(...)`**，並明確
+  拒絕任何 `Special` 非空的類別——每個包裝類別都是 `Special = "box"`，`String` 亦然。所以可觀察的
+  識別性由 `valueOf` 與快取那條路徑決定，而不是由一個會猜錯的分析決定。把這條契約釘住的是
+  `t242_box_identity_across_call`：參考被帶出到另一個方法之後才比較（快取的 127、非快取的
+  1000、`Boolean`、`Character`、以及經由陣列往返），期望值是 javac 21 的輸出——任何把箱子複製一份、
+  讓每次使用各自新建、或弄壞快取的改動都會讓它變紅。**尚未實作的**是「分析證明箱子不逃逸因而
+  可以在堆疊上」這個優化本身：它不存在，而上面兩條結構性事實讓它不需要存在。
 - **執行期的兩個診斷開關（`tyrt.c` 的 `ty_gc_init`）**：`TEYRU_GC_STRESS=N` 讓**每 N 次配置**
   強制收集一次（把 `ty_gc_threshold` 設成 -1，內聯快速路徑因此把每一次配置都交給
   `ty_alloc_slow` 計數；N=1 就是每次配置都收集）；`TEYRU_GCTRACE=1` 讓每次收集在 stderr 印一行
