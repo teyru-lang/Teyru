@@ -314,7 +314,10 @@ class MockServer {
     if (body.length() > 0) {
       req.body = body
       req.addHeader("Content-Type", contentType.length() > 0 ? contentType : "application/json")
-      req.addHeader("Content-Length", "" + body.length())
+      /* The count a real client would put there is the body's byte count, and a
+         handler that reads the header has to see the number it would see on the
+         wire. */
+      req.addHeader("Content-Length", "" + body.getBytes().length)
     }
     return server.handle(req)
   }
