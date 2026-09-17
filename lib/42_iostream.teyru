@@ -19,22 +19,24 @@ package teyru
  * That is written down here rather than left to be discovered by failing to
  * compile.
  *
- * A Teyru string is UTF-8 bytes: String.length() and String.charAt() are
- * byte-oriented and Net.stringFrom turns bytes into a string without decoding
- * anything. That one fact decides the shape of this file. A byte and a character
- * are the same thing, which is why the array-backed stream is both an
- * InputStream and a Reader, and why the two data streams are Readers as well;
- * and it is why the one place that has to be Java-exact about text -- modified
- * UTF-8 in writeUTF and readUTF -- walks the UTF-8 form a byte at a time (see
- * ModifiedUtf8).
+ * A string is text and a stream is bytes, and where a byte is wanted this file
+ * asks for one: Net.stringFrom decodes the bytes of a read into a string and
+ * getBytes encodes the string back, so read() over a String answers the
+ * character String.charAt answers and read() over a stream answers the byte the
+ * stream holds. The two sources of a Reader here are those two things and they
+ * do not answer alike above U+007F, which is the one place in this file where
+ * the difference is visible. What is Java-exact about text -- modified UTF-8 in
+ * writeUTF and readUTF -- is written over the bytes, one encoded sequence at a
+ * time (see ModifiedUtf8).
  *
  * What is not here, and is not pretended to be: ObjectInputStream and
  * serialization, streams over a file (lib/16_file.teyru owns the disk),
  * character-set machinery (there is one encoding and it is the string's),
  * Java's FilterInputStream/FilterOutputStream/PushbackReader family, the
  * deprecated DataInputStream.readLine, and the Writer methods that take a
- * char[] (a char[] here is bytes, and every caller that has one has a String or
- * a byte[] instead). BufferedReader keeps Java's name and Java's readLine
+ * char[] (a char[] is UTF-16 code units, so each of them would have to encode,
+ * and every caller that has one has a String or a byte[] instead).
+ * BufferedReader keeps Java's name and Java's readLine
  * contract but not a buffer of its own: the sources it wraps already read in
  * blocks -- a socket in 8 KiB, a file in one readBytes0 -- so a second buffer
  * would be a copy of the data and not a saving, and skip/mark/read(char[])
@@ -181,9 +183,11 @@ final class LineScanner {
  *
  * It extends the prelude's InputStream so it can be handed to anything that
  * takes one -- DataInputStream first of all -- and it implements this file's
- * Reader as well, because one byte is one character here: that is what makes it
- * a source a BufferedReader can read lines from, and it is the same reading
- * String.charAt and String.length give.
+ * Reader as well, where one byte is one character: that is what makes it a
+ * source a BufferedReader can read lines from, and it is the reading Latin-1
+ * gives. A stream of bytes is not decoded into characters by being read as one,
+ * so a reader over this answers one byte per character and not one code point
+ * per character.
  *
  * mark/reset are implemented rather than omitted. They are two ints, Java's
  * contract is that markSupported() answers true, and a parser that has to try a
@@ -306,10 +310,10 @@ class ByteArrayInputStream extends InputStream implements Reader {
 
 /* java.io.ByteArrayOutputStream: the writer half, a byte[] that grows.
  *
- * It implements both of this file's output shapes, because one byte is one
- * character: an OutputStream for the data streams to write into, and a Writer so
- * that PrintWriter has a text sink that is in this library and not in the
- * caller's program.
+ * It implements both of this file's output shapes: an OutputStream for the data
+ * streams to write into, and a Writer, which encodes the text it is handed with
+ * write(String), so that PrintWriter has a text sink that is in this library and
+ * not in the caller's program.
  *
  * toByteArray() copies, as Java's does. Handing out the internal array would be
  * faster and would break the first program that wrote to the stream after
@@ -375,8 +379,8 @@ class ByteArrayOutputStream extends Object implements OutputStream, Writer {
     write(b, 0, b.length)
   }
 
-  /* The Writer half: the string's own bytes, which is the identity and not a
-     conversion -- a Teyru string IS UTF-8 bytes. */
+  /* The Writer half: the string's UTF-8, which is what a Writer writes and the
+     one encoding this library has. */
   public void write(String s) {
     byte[] b = s.getBytes()
     write(b, 0, b.length)
@@ -404,7 +408,8 @@ class ByteArrayOutputStream extends Object implements OutputStream, Writer {
   }
 
   /* Java's toString() decodes the bytes with the default charset, which is UTF-8
-     and, here, is the bytes themselves. */
+     here as it is there; a byte that is not valid UTF-8 becomes U+FFFD, as it
+     does in String(byte[]). */
   public String toString() {
     return Net.stringFrom(buf, 0, count)
   }
@@ -430,12 +435,13 @@ class ByteArrayOutputStream extends Object implements OutputStream, Writer {
  * still round-trip against itself, which is why the test for it is a hex dump of
  * the bytes on both sides and an expectation taken from javac.
  *
- * The reverse direction has one answer this dialect cannot give. Java keeps a
- * lone surrogate as a surrogate; a Teyru string is UTF-8, where a lone surrogate
- * has no spelling at all, so it becomes U+FFFD -- the same substitution
- * lib/10_json.teyru makes when it escapes one. Text that is not valid UTF-8 at
- * all reads as the bytes it is made of, which is the convention String.charAt
- * already keeps.
+ * A lone surrogate is the one place this and Java agree about nothing. Java
+ * writes the three-byte form of the surrogate itself, because its writeUTF is
+ * defined over UTF-16 code units; here what reaches this class is the string's
+ * bytes, and a lone surrogate is the one `?` the byte boundary writes for a
+ * character that cannot be encoded. A string holding half a pair therefore comes
+ * back as `?` and not as the half it was, which is written down here because a
+ * round trip through a data stream is where a program would rely on it.
  *
  * The length check is Java's, message included: the count in front of the bytes
  * is an unsigned short, and a string that does not fit it is an exception rather
@@ -492,12 +498,11 @@ final class ModifiedUtf8 {
   /* Java's message, which names the string and not only the length: its
      tooLongMsg puts the first and last eight characters of the value in the
      text, so a program that reads this exception out of a log knows which
-     field overflowed without a debugger. The ends are eight BYTES here and
-     eight UTF-16 code units there, which is the same eight characters for the
-     ASCII text this message is normally read over. A string short enough that
-     the two ends would overlap cannot reach this call at all: every byte of a
-     string is at most three encoded bytes, so more than 65535 of them is more
-     than 21,845 characters. */
+     field overflowed without a debugger. Eight characters is eight code units
+     here as it is there, so the two ends are the same ends. A string short
+     enough that they would overlap cannot reach this call at all: the most a
+     code unit costs in modified UTF-8 is three bytes, so more than 65535 of
+     them is more than 21,845 characters. */
   private static String tooLong(String s, int bytes) {
     int length = s.length()
     return "encoded string (" + s.substring(0, 8) + "..." + s.substring(length - 8, length) +
@@ -639,9 +644,11 @@ final class ModifiedUtf8 {
  * bits arrived.
  *
  * writeBytes and writeChars, Java's two String writers that are defined on
- * UTF-16 code units, are not here. writeChars has no UTF-16 to write and
- * writeBytes would silently drop the high bits of a character that is more than
- * one byte here; writeUTF is the String writer this dialect can do exactly.
+ * UTF-16 code units, are not here. writeChars would be this file's DataOutput
+ * loop over the units -- a second spelling of what writeUTF does with the
+ * length in front -- and writeBytes drops the high eight bits of every unit,
+ * which is a loss this library has no reason to hand a caller silently;
+ * writeUTF is the String writer this dialect can do exactly.
  *
  * The wrapped stream is this file's OutputStream. Anything that can write bytes
  * -- a ByteArrayOutputStream, a caller's own adapter over a socket or a file --
@@ -753,8 +760,10 @@ class DataOutputStream extends Object implements OutputStream {
  * It extends the prelude's InputStream so it can be put over anything that is
  * one -- a ByteArrayInputStream, a socket's SocketInputStream -- and it
  * implements this file's Reader for the same reason ByteArrayInputStream does:
- * a byte is a character here, so a data stream can be the source of a
- * BufferedReader.
+ * a byte is a character when a byte stream is read as one, so a data stream can
+ * be the source of a BufferedReader. Its characters are that stream's bytes and
+ * not decoded text, which is the difference between it and a reader over a
+ * String.
  *
  * There is no read(byte[],int,int) here. The prelude's InputStream declares
  * read() and readln() and nothing else, so a buffer read would be a loop of
@@ -944,10 +953,11 @@ class BufferedReader extends Object implements Reader {
     }
   }
 
-  /* One character, as 0..255, or -1 at the end. A Teyru char is one byte of a
-     UTF-8 string, so reading a line from a String is the same walk as reading
-     one from a buffer, and neither of them decides anything about multi-byte
-     characters -- which is what String.charAt does too. */
+  /* One character as an int, or -1 at the end, which is Reader's contract and
+     Java's StringReader: a String is a source of characters here, and what a
+     character is is decided by String.charAt. The stream under this class is
+     the other half of the pair and answers differently -- a byte at a time,
+     0..255 -- because that is what a stream of bytes is. */
   public int read() {
     requireOpen()
     int held = scanner.take()
@@ -960,7 +970,7 @@ class BufferedReader extends Object implements Reader {
       }
       int v = source.charAt(at)
       at = at + 1
-      return v & 255
+      return v
     }
     return in.read()
   }
@@ -997,9 +1007,10 @@ class BufferedReader extends Object implements Reader {
  * OutputStreamWriter with the default charset. The two behave differently and
  * the difference is observable: text printed into a Writer reaches it at once,
  * text printed into an OutputStream is held until a flush, a close or an
- * autoFlush. Both halves are here, with the charset conversion left out because
- * a Teyru string's bytes are already UTF-8 and the buffer left in because a
- * program that prints a prompt and then reads a line depends on it.
+ * autoFlush. Both halves are here: the Writer half writes the text it is given,
+ * and the OutputStream half encodes it with getBytes, which is the one charset
+ * this library has. The buffer is kept because a program that prints a prompt
+ * and then reads a line depends on it.
  *
  * autoFlush is Java's: it flushes on println, printf and format and not on
  * print, which is the detail that decides whether a prompt with no newline

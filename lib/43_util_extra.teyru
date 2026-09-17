@@ -83,11 +83,16 @@ class Scanner extends Object implements AutoCloseable {
     this.input = source
   }
 
-  /* \p{javaWhitespace} for the bytes this reads: the six ASCII whitespace
-     characters and the four control separators Character.isWhitespace also
-     counts. A character above them is not whitespace here, and that is the
-     honest answer for a byte-oriented string: a Teyru char is one byte of
-     UTF-8, so this is a test on bytes and never a Unicode property lookup. */
+  /* \p{javaWhitespace}, narrowed to the ten characters of it that are ASCII:
+     the six whitespace characters and the four control separators. Java's
+     delimiter is the whole of Character.isWhitespace, so the two disagree
+     above U+007F -- U+00A0, U+2007 and U+202F are not whitespace there while
+     U+1680, U+2000..U+200A, U+2028, U+2029, U+205F and U+3000 are -- and this
+     side of the boundary is what the class was built for: a scanner over a
+     line of fields. The narrowing is a decision about which characters
+     separate fields and not a consequence of how a string is stored; the
+     character that reaches it is a code unit, which is what String.charAt
+     answers. */
   private static boolean isWhitespace(int c) {
     if (c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13) {
       return true
@@ -102,7 +107,7 @@ class Scanner extends Object implements AutoCloseable {
   }
 
   private void skipDelimiters() {
-    while (pos < input.length() && isWhitespace(input.charAt(pos) & 255)) {
+    while (pos < input.length() && isWhitespace(input.charAt(pos))) {
       pos = pos + 1
     }
   }
@@ -116,7 +121,7 @@ class Scanner extends Object implements AutoCloseable {
       return null
     }
     int start = pos
-    while (pos < input.length() && !isWhitespace(input.charAt(pos) & 255)) {
+    while (pos < input.length() && !isWhitespace(input.charAt(pos))) {
       pos = pos + 1
     }
     return input.substring(start, pos)
@@ -220,9 +225,10 @@ class Scanner extends Object implements AutoCloseable {
   /* The rest of the current line, terminator and all consumed; the separators
      are LF, CRLF and a lone CR, as java.io's readers and this library's
      LineScanner read them. U+2028, U+2029 and U+0085 are line separators to
-     Java's Scanner and are not treated as ones here: in a UTF-8 string they are
-     two-byte sequences, and a byte-oriented reader that split on them would be
-     splitting on bytes that also occur inside other characters. */
+     Java's Scanner and are not treated as ones here: this reader splits on the
+     three terminators java.io uses and on nothing else, which is the same
+     narrowing the delimiter set above makes and is recorded here as a
+     difference rather than left to be discovered. */
   public String nextLine() {
     requireOpen()
     if (pos >= input.length()) {
@@ -230,7 +236,7 @@ class Scanner extends Object implements AutoCloseable {
     }
     int start = pos
     while (pos < input.length()) {
-      int c = input.charAt(pos) & 255
+      int c = input.charAt(pos)
       if (c == 10) {
         String line = input.substring(start, pos)
         pos = pos + 1
@@ -239,7 +245,7 @@ class Scanner extends Object implements AutoCloseable {
       if (c == 13) {
         String line = input.substring(start, pos)
         pos = pos + 1
-        if (pos < input.length() && (input.charAt(pos) & 255) == 10) {
+        if (pos < input.length() && input.charAt(pos) == 10) {
           pos = pos + 1
         }
         return line

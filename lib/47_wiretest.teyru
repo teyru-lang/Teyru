@@ -221,17 +221,20 @@ class RawClient {
     }
     // no length and no chunks: the body ends when the connection does. A
     // handler that answers like this is one the client cannot tell from a
-    // server that is still thinking, which is why nothing writes one.
-    StringBuilder b = new StringBuilder()
+    // server that is still thinking, which is why nothing writes one. The bytes
+    // are read as bytes for the same reason the chunked branch above reads them
+    // that way: a body that went through a String and back is a body the
+    // decoder had an opinion about, and an opinion is not a read.
+    ByteArrayOutputStream b = new ByteArrayOutputStream()
     while (true) {
       int c = in.read()
       if (c < 0) {
         break
       }
-      b.append((char) c)
+      b.write(c)
     }
-    res.body = b.toString()
-    res.bodyBytes = res.body.getBytes()
+    res.bodyBytes = b.toByteArray()
+    res.body = Net.stringFrom(res.bodyBytes, 0, res.bodyBytes.length)
     return res
   }
 

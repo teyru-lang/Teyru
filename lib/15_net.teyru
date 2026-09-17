@@ -266,10 +266,11 @@ final class Net {
     throw new IllegalStateException("Net.isUnknownHost0 is implemented in C")
   }
   // The way back from bytes to text. String.getBytes is the way out and is
-  // already in the prelude, so only this direction needs anything here. Nothing
-  // is decoded: one byte is one character, which is the identity for ASCII and
-  // for the UTF-8 that rides on top of it, and it is the same convention
-  // String.charAt and String.length already keep.
+  // already in the prelude, so only this direction needs anything here. The
+  // bytes are decoded as UTF-8 and anything ill-formed becomes U+FFFD, exactly
+  // as String(byte[]) does: a network read can stop in the middle of a sequence,
+  // and a string holding the halves of one would be a string whose length and
+  // whose bytes disagree.
   public static String stringFrom(byte[] b, int off, int len) {
     throw new IllegalStateException("Net.stringFrom is implemented in C")
   }

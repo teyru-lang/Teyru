@@ -517,12 +517,18 @@ class WebSocketConnection {
   // closeBody is what a close frame carries: the two bytes of the code, and the
   // reason when there is room for it. A close frame is a control frame, so the
   // whole of it is 125 bytes and a reason that would not fit is cut rather than
-  // sent as a frame no peer may read.
+  // sent as a frame no peer may read. The room is 123 BYTES and not 123
+  // characters -- that is the bound the JDK's own WebSocket holds a caller to
+  // (WebSocketImpl.isLegalReason encodes the reason and checks the byte count)
+  // -- and a cut leaves a whole character behind: the reason is text, RFC 6455
+  // requires it to be valid UTF-8, and half a character would be answered with
+  // a 1007 that says the frame was broken instead of the one that says why the
+  // connection is ending.
   public static byte[] closeBody(int code, String reason) {
     byte[] text = reason == null ? new byte[0] : reason.getBytes()
     int extra = text.length
     if (extra > WebSocketLimits.MAX_CONTROL_BYTES - 2) {
-      extra = WebSocketLimits.MAX_CONTROL_BYTES - 2
+      extra = textLimit(text, WebSocketLimits.MAX_CONTROL_BYTES - 2)
     }
     byte[] body = new byte[2 + extra]
     body[0] = (byte) ((code >> 8) & 0xff)
@@ -531,6 +537,21 @@ class WebSocketConnection {
       body[2 + i] = text[i]
     }
     return body
+  }
+
+  // textLimit is the most of a byte array that can be taken without cutting a
+  // character in half: the largest count at or below `limit` that ends where a
+  // sequence ends. The bytes come from getBytes, so what is here is a prefix of
+  // well-formed UTF-8, and the only sequence that can straddle the limit is the
+  // one whose last byte is at limit - 1.
+  private static int textLimit(byte[] text, int limit) {
+    int start = limit - 1
+    while (start > 0 && (text[start] & 0xC0) == 0x80) {
+      start = start - 1
+    }
+    int first = text[start] & 0xff
+    int length = first < 0x80 ? 1 : (first < 0xE0 ? 2 : (first < 0xF0 ? 3 : 4))
+    return start + length <= limit ? limit : start
   }
 }
 

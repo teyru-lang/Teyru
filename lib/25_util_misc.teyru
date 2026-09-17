@@ -1141,10 +1141,9 @@ class Properties extends HashMap<Object, Object> {
         }
       }
       if (c != '\n' && c != '\r') {
-        /* One byte of the source, not the char: a Teyru string is UTF-8, so
-           append(c) would re-encode a byte of a multi-byte character and the
-           text would be encoded twice over. Appending the one-byte substring
-           copies the byte as it is. */
+        /* The code unit at i - 1, taken as the substring it is; appending the
+           char would be the same single unit, and taking it by range is what
+           keeps this a copy of the source text rather than a rebuild of it. */
         line.append(text.substring(i - 1, i))
         /* Toggled, not set: a line ending in two backslashes ends the logical
            line, and a line ending in one continues it. */
