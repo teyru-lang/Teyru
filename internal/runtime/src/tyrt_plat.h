@@ -139,6 +139,28 @@ int typlat_thread_begin(typlat_thread *t, void *(*fn)(void *), void *arg);
    as such. */
 void typlat_thread_stack_bounds(char **low, char **high);
 
+/* --------------------------------------------------------- fatal faults */
+
+/* The last thing standing between a thread that has run out of stack and a
+   silent death: a handler for the fault the machine raises, installed once for
+   the process before any thread exists. `on_fault` is handed the address the
+   fault was at and answers 1 when it has dealt with it, 0 when the fault is not
+   the one this runtime reports -- and then the fault is taken again with the
+   default action, so the program dies the way it would have without a handler
+   and a debugger or a core file sees the real fault rather than a handler that
+   swallowed it.
+
+   The handler runs on the alternate signal stack, which is the point of it:
+   the fault this exists to report is one the thread's own stack caused, and a
+   handler entered on that stack has no room to run at all. */
+void typlat_fault_handler_install(int (*on_fault)(void *addr));
+
+/* Give the calling thread an alternate signal stack. Per thread, because the
+   alternate stack is: a handler for one thread's fault runs on that thread's
+   alternate stack, and there is no way to share one. Called from thread start,
+   so a spawned thread that overflows is reported like the main one. */
+void typlat_fault_altstack_install(void);
+
 /* ---------------------------------------------------------------- sockets */
 
 /* Platform startup, once, before the program runs. Called by ty_init, which

@@ -195,7 +195,7 @@ void ty_uncaught(void *e) __attribute__((noreturn));
 /* Preallocated exception classes (filled by generated code at startup). */
 extern tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT,
     *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE,
-    *TY_ILLMON;
+    *TY_ILLMON, *TY_SOE;
 
 /* The exceptions java.lang.reflect throws by name. A program that never
    reflects never names one, and the generated startup leaves the pointer NULL
@@ -211,6 +211,66 @@ void *ty_cce(tyclass *from, tyclass *to);
 void *ty_negarr(void);
 void *ty_arraystore(void);
 void *ty_assertfail(const char *msg);
+
+/* ---- the stack limit --------------------------------------------------
+
+   Java answers a recursion that went too deep with a StackOverflowError the
+   program can catch, and the machine this runtime runs on answers it with a
+   fault that ends the process. Which of the two a Teyru program gets is this
+   section's business, and it takes two mechanisms, because neither covers the
+   other:
+
+   - every generated function body begins with ty_stack_check, which compares
+     its own frame address against the limit below and throws when it is past
+     it. That is the answer a program catches, and it is exact for as long as
+     the frames that recurse are frames the compiler emitted a check for.
+   - a thread that runs out of stack without passing a check -- a call from the
+     generated code into C, a frame larger than the margin -- faults, and
+     ty_stack_fault turns a fault inside the stack's own guard region into a
+     named message and an abort. It is a backstop and not a recovery: there is
+     nothing to longjmp to from a handler entered because the stack ran out.
+
+   ty_stack_limit is per thread and holds the lowest address a frame may have.
+   It is a plain thread-local rather than a field of tythread so that the check
+   needs no thread state: zero is the whole of "no limit read yet", and every
+   address a frame can have is above it. */
+extern _Thread_local char *ty_stack_limit;
+
+/* The backstop's half of the second mechanism: whether a fault at `addr` is
+   that thread's stack running into its guard region. 0 for any other fault,
+   which the platform layer then lets die the way it would have without a
+   handler. Runs inside a signal handler: no allocation, no lock. */
+int ty_stack_fault(void *addr);
+
+/* Throw the calling thread's preallocated StackOverflowError. Never returns,
+   allocates nothing, and does not recurse: the frame it is called from has at
+   most the margin left, so anything that needed a frame of its own would be
+   asking the same question. */
+void ty_stack_overflow(void) __attribute__((noreturn));
+
+/* Build this thread's preallocated StackOverflowError, and keep it a root for
+   as long as the thread is in the registry.
+
+   The generated startup calls this once, right after it installs the class
+   handles, and every thread start calls it for the thread it is starting.
+   Nothing on the throw path may allocate, so the object cannot be made when it
+   is first wanted. */
+void ty_stack_overflow_reserve(void);
+
+/* The prologue check every generated function body begins with, inlined into
+   it: the address of the frame that is about to run, against the limit. It is
+   always_inline because a compiler that did not inline it at -O0 would take
+   the address of a frame of its own, one frame below the caller's -- which is
+   conservative (the check would answer early, never late) but would make the
+   depth a program can reach depend on the optimisation level.
+
+   The comparison is on uintptr_t and not on the pointers: ty_stack_limit is
+   NULL until a thread has read its bounds, and `frame < NULL` is undefined
+   where `(uintptr_t)frame < (uintptr_t)NULL` is false, which is the answer that
+   is wanted. */
+static inline __attribute__((always_inline)) void ty_stack_check(void) {
+  if ((uintptr_t)__builtin_frame_address(0) < (uintptr_t)ty_stack_limit) ty_stack_overflow();
+}
 
 /* ---- allocation / GC -------------------------------------------------- */
 
@@ -294,6 +354,13 @@ struct tythread {
   int64_t id;             /* what Thread.getId() reports */
   void *obj;              /* the Teyru Thread object, NULL before one is bound */
   tystr *name;            /* the thread's name, for an uncaught exception */
+  /* This thread's preallocated StackOverflowError, NULL until the thread
+     reserves one (ty_stack_overflow_reserve). The throw path may not allocate,
+     so it is made at thread start and reused; it is a root for as long as the
+     thread is in the registry, which is what keeps a collection from sweeping
+     the one object the thread cannot re-make under itself (ty_gc_locked marks
+     it with the thread's shadow stack). */
+  void *soe;
   int32_t state;          /* one of TY_TH_* below */
   /* How many stop points this thread is inside. Stopping is not nested -- no
      path in the runtime blocks inside another blocking call -- and the depth is

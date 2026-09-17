@@ -23,6 +23,7 @@ func (e *Emitter) emitSynthetic(cl *ast.Class, m *ast.Method) {
 	e.indent = 0
 	fmt.Fprintf(e.code, "static %s {\n", e.signature(m))
 	e.indent++
+	e.stackCheck()
 	if nativeKey(m) == forNameKey {
 		// Class.forName searches the program's classes. The table cannot live at
 		// file scope -- see forNameTable -- so it is written here, in the body

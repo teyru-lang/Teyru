@@ -410,7 +410,7 @@ func (e *llvmEmitter) run() {
 		e.p.Builtins.NPE, e.p.Builtins.AIOOBE, e.p.Builtins.SIOOBE, e.p.Builtins.Arith, e.p.Builtins.CCE,
 		e.p.Builtins.NegArr, e.p.Builtins.Assertion, e.p.Builtins.IllArg,
 		e.p.Builtins.IllState, e.p.Builtins.NoSuchElem, e.p.Builtins.Unsup,
-		e.p.Builtins.IllMon, e.p.Builtins.ArrayStore,
+		e.p.Builtins.IllMon, e.p.Builtins.ArrayStore, e.p.Builtins.SOE,
 	} {
 		if cl != nil {
 			e.instantiate(cl)
@@ -1015,6 +1015,37 @@ func (e *llvmEmitter) staticGlobal(cl *ast.Class, f *ast.Field) string {
 
 // ---------------------------------------------------------------- method bodies
 
+// stackCheck writes the first instruction sequence of a generated function: the
+// address of the frame this function is about to run, against the thread's
+// stack limit, with a StackOverflowError thrown when it is past it. It is what
+// the C back end's ty_stack_check is, in IR, and it has to be the same check
+// for the same reason: a recursion that went too deep is a Java error the
+// program can catch, not a fault that ends the process.
+//
+// The instructions go into the body rather than into the prologue because the
+// stack slots do: fb.head is written before fb.body, so what is emitted here
+// lands after the allocas and the entry block still holds them. An alloca
+// outside the entry block is an alloca mem2reg will not promote, which would
+// turn every local in the function into a memory access.
+func (e *llvmEmitter) stackCheck(f *fb) {
+	e.decl("llvm.frameaddress.p0", "ptr", []string{"i32"}, "")
+	e.decl("ty_stack_overflow", "void", nil, " noreturn")
+	e.declGlobal("ty_stack_limit", "thread_local ", "ptr", ", align 8")
+	fp := f.reg()
+	f.ins(fmt.Sprintf("%s = call ptr @llvm.frameaddress.p0(i32 0)", fp))
+	limit := f.reg()
+	f.ins(fmt.Sprintf("%s = load ptr, ptr @ty_stack_limit", limit))
+	over := f.reg()
+	f.ins(fmt.Sprintf("%s = icmp ult ptr %s, %s", over, fp, limit))
+	throw := f.nextLabel("so")
+	rest := f.nextLabel("so")
+	f.cbr(over, throw, rest)
+	f.label(throw)
+	f.ins("call void @ty_stack_overflow()")
+	f.unreachable()
+	f.label(rest)
+}
+
 // emitMethodBody writes one method: its declaration if it is implemented
 // outside the module, and its body otherwise.
 func (e *llvmEmitter) emitMethodBody(m *ast.Method) {
@@ -1042,6 +1073,7 @@ func (e *llvmEmitter) emitMethodBody(m *ast.Method) {
 	}
 	fmt.Fprintf(&e.defs, "define internal %s @%s(%s) {\n", ret, e.methodSymbol(m), joinParams(params, names))
 	f.entry()
+	e.stackCheck(f)
 	if m.Lambda != nil {
 		f.lam = m.Lambda
 		f.bodyClass = e.enclosureOf(m.Lambda)
@@ -1552,6 +1584,10 @@ func (e *llvmEmitter) entry() {
 	f.def("define i32 @main(i32 %argc, ptr %argv) {")
 	f.entry()
 	f.ins("call void @ty_init()")
+	// main's own check, like every other generated function's: it can never
+	// answer for the frame it is in, and being the same shape as the rest is
+	// worth more than the instructions it would save to leave it out.
+	e.stackCheck(f)
 	// The collector reads a static reference through the address of the global
 	// that holds it, so every reference-typed static is registered by address.
 	for _, cl := range e.classOrder {
@@ -1574,6 +1610,7 @@ func (e *llvmEmitter) entry() {
 	}{
 		{"TY_NPE", e.p.Builtins.NPE}, {"TY_AIOOBE", e.p.Builtins.AIOOBE},
 		{"TY_SIOOBE", e.p.Builtins.SIOOBE},
+		{"TY_SOE", e.p.Builtins.SOE},
 		{"TY_ARITH", e.p.Builtins.Arith}, {"TY_CCE", e.p.Builtins.CCE},
 		{"TY_NEGARR", e.p.Builtins.NegArr}, {"TY_ASSERT", e.p.Builtins.Assertion},
 		{"TY_ILLARG", e.p.Builtins.IllArg}, {"TY_ILLSTATE", e.p.Builtins.IllState},
@@ -1582,6 +1619,11 @@ func (e *llvmEmitter) entry() {
 	} {
 		e.installGlobal(f, mn.global, mn.cl)
 	}
+	// The thread's StackOverflowError, before any generated function runs: the
+	// frame that throws it has the margin left and nothing else, so the object
+	// it throws has to exist already.
+	e.decl("ty_stack_overflow_reserve", "void", nil, "")
+	f.ins("call void @ty_stack_overflow_reserve()")
 	var kinds []ast.PrimKind
 	for k := range e.boxUsed {
 		kinds = append(kinds, k)

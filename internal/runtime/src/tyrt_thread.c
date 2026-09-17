@@ -297,12 +297,70 @@ static tythread *registry_find(int64_t id) {
   return NULL;
 }
 
+/* ------------------------------------------------------------- the stack limit */
+
+/* How much of the stack a generated function may still be past ty_stack_limit
+   without the runtime being in trouble. The check that stops a program runs at
+   function entry, so between two checks a frame of any size can appear; and
+   what has to fit below the limit is everything the runtime does after the
+   check answers: the throw, the longjmp, and -- when nothing catches it -- the
+   uncaught handler's toString of the error and the write of the line it makes,
+   all of which are C frames the check knows nothing about. 256 KB is far more
+   than those need, and it is small next to the 8 MB a thread is given by
+   default, so a program that recurses legitimately still gets nearly all of its
+   stack.
+
+   The alternative is a margin tuned down until an uncaught overflow crashes,
+   which measures the one path that must not crash. */
+#define TY_STACK_MARGIN (256 * 1024)
+
+/* How far below the lowest address of a thread's stack a fault may be and still
+   be that stack running off its end. The address a stack that ran out faults at
+   is in the guard region the operating system keeps below the stack -- one page
+   on Linux, and measured there (glibc, x86-64, both compilers): a recursion
+   whose frame was 64 KB and one whose frame was 4 MB both faulted within 17 KB
+   below the lowest address pthread_getattr_np reports, which is the page the
+   kernel refused to map plus what the compiler's own stack probes touched on
+   the way. 64 KB is that with room to spare, and it is small enough that an
+   unrelated wild pointer is not reported as a stack overflow. */
+#define TY_STACK_GUARD_REACH (64 * 1024)
+
+/* Read the calling thread's stack bounds, derive the limit its frames are
+   checked against, and give it the alternate signal stack the backstop's
+   handler runs on. Called once per thread, before the thread runs any generated
+   code. */
+static void stack_limit_init(void) {
+  char *low = NULL, *high = NULL;
+  typlat_thread_stack_bounds(&low, &high);
+  ty_self->stack_base = low;
+  ty_self->stack_top = high;
+  /* A thread whose bounds cannot be read has no limit to check against, and the
+     collector cannot scan it either: it is the same failure, and the only
+     answer to it is to run without the check rather than to guess an address. */
+  ty_stack_limit = low ? low + TY_STACK_MARGIN : NULL;
+  typlat_fault_altstack_install();
+}
+
+int ty_stack_fault(void *addr) {
+  char *base = ty_self ? ty_self->stack_base : NULL;
+  if (!addr || !base) return 0;
+  char *a = (char *)addr;
+  if (a >= base || (uintptr_t)(base - a) > TY_STACK_GUARD_REACH) return 0;
+  /* write and not fprintf: this runs in a signal handler, on the alternate
+     stack, and a handle on stdio it cannot take would turn a report into a
+     deadlock. It is a constant string, so there is nothing to format. */
+  static const char msg[] = "stack overflow in native code\n";
+  ssize_t ignored = write(2, msg, sizeof msg - 1);
+  (void)ignored;
+  abort();
+}
+
 void ty_thread_init(void) {
   main_thread.tid = typlat_thread_self();
   /* The main thread's stack bounds are what ty_gc_init used to read for the one
      thread there was; they are now part of the thread's state, because a
      collection scans a different stack for every thread. */
-  typlat_thread_stack_bounds(&main_thread.stack_base, &main_thread.stack_top);
+  stack_limit_init();
   registry_add(&main_thread);
 }
 
@@ -351,8 +409,12 @@ void *ty_thread_start(void *(*fn)(void *), void *arg) {
      that the collector can scan the whole of it, and stop once, so that a
      collection already in progress does not start tracing while this thread is
      still setting itself up. */
-  typlat_thread_stack_bounds(&t->stack_base, &t->stack_top);
+  stack_limit_init();
   ty_safepoint();
+  /* The thread's preallocated StackOverflowError, after the stop: making one
+     allocates, and this thread must be out of the way of a collection that is
+     already running before it touches the heap. */
+  ty_stack_overflow_reserve();
 
   /* An exception that leaves run() is this thread's business, not the
      process's: Java prints the line and ends the thread, and the rest of the

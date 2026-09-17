@@ -27,6 +27,15 @@ tyclass *TY_OBJECT = NULL;
 tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT;
 tyclass *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE;
 tyclass *TY_ILLMON;
+/* StackOverflowError, which the runtime throws from a prologue check rather
+   than from a call site: it is installed by the generated startup like the rest
+   of them. */
+tyclass *TY_SOE = NULL;
+
+/* The lowest address a frame of this thread may have, and the whole of "no
+   limit read yet". See the section of tyrt.h for what checks it and why a check
+   below it throws rather than faults. */
+_Thread_local char *ty_stack_limit = NULL;
 /* java.lang.reflect's own exceptions. A program that never reflects never
    names one and the generated startup leaves it NULL. */
 tyclass *TY_CNF, *TY_NSFE, *TY_NSME, *TY_ILLACCESS, *TY_INVOCATION,
@@ -110,6 +119,24 @@ static size_t nroots_static = 0, caproots_static = 0;
 int64_t ty_gc_threshold = 4 << 20;
 static int64_t live_bytes = 0;
 static int gc_disabled = 0;
+
+/* The two diagnostics switches, read once from the environment by ty_gc_init.
+
+   TEYRU_GC_STRESS=N makes every Nth allocation collect, so that a program which
+   would reach its budget only after a great deal of work is exercised through
+   collections anyway; it is the setting the thread and collection tests are run
+   under. N is a count of allocations, not of bytes, because "every 100
+   allocations" is what a test can state about a shape it controls.
+
+   TEYRU_GCTRACE=1 prints one line per collection: what asked for it, how long
+   the world was stopped for, and the heap's size before and after with the live
+   set in between.
+
+   Both are off by default, and with both off every use of them below is one test
+   of a static zero. */
+static int64_t gc_stress_every = 0; /* 0: the byte budget, as always */
+static int64_t gc_stress_count = 0;
+static int gc_trace = 0;
 
 /* The slabs one collection walks: the shared list above, plus every registered
    thread's private slab (tyrt_thread.c). It is rebuilt at the start of each
@@ -429,14 +456,35 @@ static void scan_stack(char *lo, char *hi) {
   }
 }
 
-void ty_gc_locked(void) {
+/* The heap's size in bytes: every chunk's watermark, the shared ones and the
+   private slab of every registered thread. Read with the world stopped, which
+   is the only time the watermarks are exact and the set cannot change, and from
+   the chunk lists rather than from gc_slabs -- the sweep releases chunks that
+   gc_slabs still names, and reading a released chunk's watermark is reading
+   freed memory. Only TEYRU_GCTRACE calls this. */
+static size_t heap_used(void) {
+  size_t n = 0;
+  for (tychunk *c = chunks; c; c = c->next) n += c->used;
+  for (tythread *t = ty_thread_list(); t; t = t->next) {
+    if (t->chunk) n += ((tychunk *)t->chunk)->used;
+  }
+  return n;
+}
+
+/* One collection, with `trigger` naming what asked for it: the budget, the
+   stress switch, or a program calling System.gc. The name is read only by
+   TEYRU_GCTRACE. */
+static void gc_collect(const char *trigger) {
   if (gc_disabled) return;
+  int64_t started = gc_trace ? typlat_monotonic_ns() : 0;
+  size_t before = 0;
   /* This thread's own slab, before anything reads a watermark. */
   ty_heap_sync();
   /* Everything else stops here. A thread that is mid-allocation cannot be: it
      would be holding the heap lock, which is held right now by this thread. */
   ty_gc_stop_world();
   collect_slabs();
+  if (gc_trace) before = heap_used();
   build_block_starts();
   mark_sp = 0;
   /* Counted by mark_value, the one place that sees every live object exactly
@@ -446,6 +494,11 @@ void ty_gc_locked(void) {
   for (tythread *t = ty_thread_list(); t; t = t->next) {
     if (t->state == TY_TH_DONE) continue; /* its stack is going away with it */
     for (int64_t i = 0; i < t->sp; i++) mark_value(t->roots[i]);
+    /* The thread's preallocated StackOverflowError. It is reachable from
+       nowhere else -- the thread holds the only reference, in a struct the
+       collector does not scan -- and a collection that swept it would leave the
+       thread's next overflow throwing a freed object. */
+    mark_value(t->soe);
     if (t == ty_self) continue;
     if (!t->park_sp) continue; /* it has not stopped yet: ty_gc_stop_world would not have returned */
     char *hi = t->stack_top ? t->stack_top : t->park_sp + 0x10000;
@@ -525,14 +578,32 @@ void ty_gc_locked(void) {
      due to be collected again until the new threshold is reached. The threads
      are stopped, so their counters are this thread's to reset. */
   for (tythread *t = ty_thread_list(); t; t = t->next) t->alloc_since = 0;
-  ty_gc_threshold = live_bytes * 2;
-  if (ty_gc_threshold < (4 << 20)) ty_gc_threshold = 4 << 20;
+  if (gc_stress_every) {
+    /* Under the stress switch the budget is not the trigger: -1 keeps the fast
+       path handing every allocation to ty_alloc_slow, which counts them. */
+    ty_gc_threshold = -1;
+  } else {
+    ty_gc_threshold = live_bytes * 2;
+    if (ty_gc_threshold < (4 << 20)) ty_gc_threshold = 4 << 20;
+  }
+  size_t after = gc_trace ? heap_used() : 0;
+  int64_t stopped_for = gc_trace ? typlat_monotonic_ns() - started : 0;
   ty_gc_resume_world();
+  if (gc_trace) {
+    /* After the world is running again: printing inside the stop would charge
+       every other thread for the time it takes to write the line, and the pause
+       the line reports would then include the writing of it. */
+    fprintf(stderr, "teyru gc: trigger=%s pause=%.3fms heap=%llukB->%llukB live=%llukB\n",
+            trigger, (double)stopped_for / 1e6, (unsigned long long)(before / 1024),
+            (unsigned long long)(after / 1024), (unsigned long long)(live_bytes / 1024));
+  }
 }
+
+void ty_gc_locked(void) { gc_collect("budget"); }
 
 void ty_gc(void) {
   ty_heap_lock();
-  ty_gc_locked();
+  gc_collect("explicit");
   ty_heap_unlock();
 }
 
@@ -716,7 +787,22 @@ void *ty_alloc_slow(size_t total) {
      fast path tests both -- so a collection comes first, and then the thread's
      own slab is tried again: it is still this thread's memory, and a collection
      neither moves it nor takes it away. */
-  if (me->alloc_since > ty_gc_threshold) ty_gc_locked();
+  if (gc_stress_every) {
+    /* TEYRU_GC_STRESS: every Nth allocation collects, whatever the byte budget
+       says. The count is of entries into this function, which under the switch
+       is every allocation: the budget is -1, so the inlined fast path hands
+       each one over instead of bumping its slab. Every allocation therefore
+       also takes the heap lock and stops at a safepoint, which is the point --
+       a stress run is meant to exercise the paths a well-behaved program walks
+       rarely, not to be quick. The counter is one for the whole process and is
+       only ever read by this switch. */
+    if (++gc_stress_count >= gc_stress_every) {
+      gc_stress_count = 0;
+      gc_collect("stress");
+    }
+  } else if (me->alloc_since > ty_gc_threshold) {
+    gc_collect("budget");
+  }
   char *p = me->bump;
   if (!(p + total > me->bump_end)) {
     me->bump = p + total;
@@ -811,6 +897,29 @@ int64_t ty_d2l(double d) {
 
 void ty_gc_init(void) {
   for (int i = 0; i < TY_NCLASS; i++) freelist[i] = NULL;
+  /* The two diagnostics switches, read once, here, before the program runs:
+     what they set is read on the allocation slow path and inside a collection,
+     and neither of those is a place to call getenv. */
+  const char *stress = getenv("TEYRU_GC_STRESS");
+  if (stress && *stress) {
+    char *end = NULL;
+    long n = strtol(stress, &end, 10);
+    if (end != stress && *end == '\0' && n > 0) {
+      gc_stress_every = (int64_t)n;
+      /* Every allocation has to reach ty_alloc_slow for the count to be a count
+         of allocations, and the budget is what sends it there: -1 is below any
+         allocation size the fast path has accumulated. */
+      ty_gc_threshold = -1;
+    } else {
+      /* Silently ignoring this would leave a run that was meant to be a stress
+         run measuring ordinary behaviour, and a report that said "under
+         TEYRU_GC_STRESS" while nothing was stressed. Say so, and carry on
+         without it. */
+      fprintf(stderr, "teyru: TEYRU_GC_STRESS=%s is not a number of allocations; the switch is off\n", stress);
+    }
+  }
+  const char *trace = getenv("TEYRU_GCTRACE");
+  gc_trace = trace && *trace && strcmp(trace, "0") != 0;
 }
 
 void *ty_alloc_arr(int64_t len, size_t elemsize) {
@@ -838,6 +947,18 @@ void *ty_alloc_arr(int64_t len, size_t elemsize) {
    toString a program had overridden. */
 static void print_uncaught(void *p, const char *where, int wherelen) {
   tyobj *e = (tyobj *)p;
+  /* The check goes off for the report, and this is not an optimization: the
+     toString below is generated code, and it begins with the same prologue
+     check every generated function does. Reporting a StackOverflowError from
+     below the limit therefore threw another one from inside the reporting,
+     which reported another one, until the stack really did run out and the
+     process died of a fault -- with nothing printed, which is the worst of the
+     three possible outcomes. Nothing after this point recurses into the
+     program's own code, and the thread ends when the report is done either way
+     (exit here, the end of the thread's start function there), so there is
+     nothing the check would have protected. What is left of the margin is what
+     the report runs in, and it is far more than a toString needs. */
+  ty_stack_limit = NULL;
   tystr *s = ((tystr *(*)(void *))e->cls->vtable[0])(e);
   char *msg = s ? s->data : (char *)"?";
   fprintf(stderr, "Exception in thread \"%.*s\" %.*s\n", wherelen, where,
@@ -906,6 +1027,40 @@ void *ty_negarr(void) {
 void *ty_assertfail(const char *msg) {
   ty_throw(ty_make_ex(TY_ASSERT, msg ? msg : "assertion failed"));
   return NULL;
+}
+
+/* StackOverflowError is the one exception the runtime cannot build where it is
+   thrown. Every other one is made from a frame with the whole stack still
+   under it, and ty_make_ex may allocate; this one is thrown by a function whose
+   own frame is already past the limit, and an allocation there would be a call
+   into the allocator from the last 256 KB of a stack, with the collector, the
+   heap lock and a safepoint behind it. So the object is made at thread start,
+   kept in the thread's state, and marked by the collector as a root for as long
+   as the thread is in the registry (ty_gc_locked) -- which is what the
+   alternative, a plain malloc outside the heap, would have had to give up:
+   AGENTS.md requires a traced object to come from ty_alloc.
+
+   The message stays NULL, as Java's is for this error: throwable's toString
+   prints the class name alone when there is no message, and a StackOverflowError
+   built with an empty string would print "teyru.StackOverflowError: ". */
+void ty_stack_overflow_reserve(void) {
+  tythread *me = ty_self;
+  if (!me || me->soe || !TY_SOE) return;
+  tyobj *o = (tyobj *)ty_alloc(sizeof(tyobj) + 2 * sizeof(void *));
+  o->cls = TY_SOE;
+  ((void **)((char *)o + sizeof(tyobj)))[0] = NULL; /* the message */
+  ((void **)((char *)o + sizeof(tyobj)))[1] = NULL; /* the cause */
+  me->soe = o;
+}
+
+void ty_stack_overflow(void) {
+  tythread *me = ty_self;
+  /* A program the compiler built always has one: the generated startup reserves
+     it before main runs and every thread start reserves its own. The failure is
+     named rather than worked around, because the alternative -- allocating one
+     here -- is the thing this whole path exists to not do. */
+  if (!me || !me->soe) ty_unimplemented("stack overflow before the runtime reserved StackOverflowError");
+  ty_throw(me->soe);
 }
 
 /* iface_reaches reports whether k, or any interface it implements, is c.
@@ -3474,6 +3629,12 @@ void ty_init(void) {
      rather than at the first use because a program's startup is the one point
      every program passes through, before any thread is running. */
   typlat_init();
+  /* The backstop: the handler for a fault the prologue check did not catch, and
+     the alternate stack its own handler needs to run on when the fault was the
+     stack. Installed here, before any thread exists, so that the process-wide
+     half of it is installed exactly once and by a thread nothing else can race
+     with. */
+  typlat_fault_handler_install(ty_stack_fault);
   /* The main thread takes its place in the registry here, with the stack bounds
      the collector scans it by. Nothing has allocated yet: the first allocation
      is what takes the main thread's slab, exactly as it takes every other
