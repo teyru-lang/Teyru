@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/teyru-lang/Teyru/internal/ast"
+	"github.com/teyru-lang/Teyru/internal/util"
 )
 
 func sortStrings(s []string) { sort.Strings(s) }
@@ -484,7 +485,7 @@ func (c *Checker) constEval(e ast.Expr) constValue {
 			return constValue{}
 		}
 		if v.Op == "+" && a.kind == ast.LitString && b.kind == ast.LitString {
-			return constValue{s: a.s + b.s, kind: ast.LitString, ok: true}
+			return constValue{s: util.StrConcat(a.s, b.s), kind: ast.LitString, ok: true}
 		}
 		if a.kind == ast.LitDouble || a.kind == ast.LitFloat || b.kind == ast.LitDouble || b.kind == ast.LitFloat {
 			af, bf := a.f, b.f

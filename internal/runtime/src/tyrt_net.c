@@ -738,7 +738,9 @@ tystr *ty_file_temp_dir(tystr *prefix) {
   typlat_temp_root(base, sizeof base);
   char pfx[TY_PREFIX_MAX];
   size_t k = 0;
-  if (prefix && TY_STR_DATA(prefix)) {
+  /* The bytes of a string are its own tail, so there is no second null to test
+     here -- only the string itself. */
+  if (prefix) {
     for (int64_t i = 0; i < prefix->blen && k + 1 < sizeof pfx; i++) {
       char c = TY_STR_DATA(prefix)[i];
       /* A slash in the prefix would turn the template into a different
