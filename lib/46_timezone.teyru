@@ -157,11 +157,23 @@ package teyru
      (the footer of Europe/Dublin is IST-1GMT0,M10.5.0,M3.5.0/1) and marks the
      winter type isdst=1. The JVM's copy of the database flattens that: it
      answers isDaylightSavings false for a January instant and calls the winter
-     the standard offset. This library follows the file, so Dublin's winter is
-     DST here, its standard offset is IST (+01:00) all year, and glibc's
-     localtime agrees with this library rather than with the JVM. The offsets
-     themselves are the same either way; only the flag and the standard offset
-     differ.
+     the standard offset. This library follows the file -- the flag is the octet
+     the type carries and the standard offset is the offset of the file's most
+     recent type that is not DST -- so on that file Dublin's winter is DST here,
+     its standard offset is IST (+01:00) all year, and glibc's localtime agrees
+     with this library rather than with the JVM. The offsets themselves are the
+     same either way; only the flag and the standard offset differ.
+
+     What decides is the file and not the zone, because tzdata is built in two
+     layouts and they disagree about this one flag. Debian and Ubuntu build it
+     from the *rearguard* layout, where Ireland is GMT standard with IST as the
+     isdst type: there this library answers `std` for a January instant, because
+     that is what those files say, and a program that compares its answer against
+     a machine running the vanguard layout will see the two disagree. Both answers
+     are the host's file read correctly, which is why the tests pin the layouts
+     and not the zone: tests/programs/t190_timezone_tzif.teyru writes Ireland in
+     both layouts as files it owns, and tests/programs/t189_timezone_lookup.teyru
+     asserts the offsets and designations, which the two layouts agree on.
 
    * Abbreviations. The JVM has no API that answers a tzfile's designation:
      DateTimeFormatter's "z" and ZoneId.getDisplayName answer CLDR's name for the
@@ -185,9 +197,8 @@ package teyru
    a boundary and the toString of a zoned date are all Java's answers, and the
    zones were chosen so that the host's files and the JVM's data agree on them.
    tests/programs/t189_timezone_lookup.teyru is the policy side: the id list, the
-   refusals, TZDIR and TZ, and the abbreviations and DST flags that are the
-   *file's* answers rather than a JVM's (the negative-DST case above is asserted
-   there, against the file). tests/programs/t190_timezone_tzif.teyru writes the files it
+   refusals, TZDIR and TZ, and the abbreviations that are the *file's* answers
+   rather than a JVM's. tests/programs/t190_timezone_tzif.teyru writes the files it
    reads, so that the format's own corners are held still -- a version 1 file, a
    version 2 file whose two blocks disagree, an empty footer, a footer with a DST
    half and no rules, a file with leap-second records, one with the indicator
