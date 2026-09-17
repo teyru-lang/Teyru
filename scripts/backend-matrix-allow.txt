@@ -1,0 +1,59 @@
+# The divergences the back-end matrix is allowed to find, and why.
+#
+#   <program> <work item> <reason>
+#
+# scripts/backend-matrix.sh reads this file: a program listed here that the
+# matrix finds diverging between its cells does not fail the run, and a listed
+# program that has *stopped* diverging fails it, so an entry cannot outlive the
+# divergence it describes. The mechanism is the one tests/known-failures.txt
+# uses for a failing case; what is different is what is being excused: this file
+# is about the two back ends disagreeing with each other, which the suite's own
+# drivers cannot see, because they build one compiler with one back end.
+#
+# A divergence is listed only when it has been read, given a work item, and
+# given a reason -- the same rule as the other two account files. "It is only the
+# LLVM back end" is not a reason; *which* rule of the language one of them gets
+# wrong is.
+
+# --- the compound assignment whose target is boxed: neither back end lowers the
+#     unboxing and the boxing around the operation, so both hand the operator
+#     the wrapper reference. They fail differently, which is why this is three
+#     entries and not one: the C back end does not compile the bitwise and shift
+#     forms and walks the reference by one element for `+=`/`-=` (the program
+#     segfaults, and a null target segfaults instead of throwing); the LLVM back
+#     end emits `and ptr` for the bitwise forms, which does not verify, and runs
+#     the shift forms in int width, so `1L <<= 33` answers 2 where the JDK says
+#     8589934592. The read of where each shape goes is in the three cases'
+#     headers; W8's shared lowering is what removes them.
+t246_probe_boxed_compound W8 the C back end does not unbox/rebox a boxed compound-assignment target: `(*p) += 1` on a C_teyru_Long* corrupts the reference and segfaults, `(*p) /= 2` is not C
+t247_probe_boxed_bitwise W8 the LLVM back end emits `and ptr` for a boxed `&=` (the module does not verify) and the C back end emits `(*p) &= 3` on a C_teyru_Integer*, which no C compiler accepts
+t248_probe_boxed_shift W8 the LLVM back end masks a boxed `Long` shift count with 31 and shifts in 32 bits (`1L <<= 33` answers 2, the JDK says 8589934592); the C back end does not compile it
+
+# --- the evaluation order of a string-concatenation chain (W8, the string
+#     concatenation family). The C back end folds `a + b + c + ...` into one C
+#     expression, and C leaves the order in which that expression's operands are
+#     evaluated unspecified, where Java fixes it left to right (JLS 15.7) -- so
+#     the same generated C answers differently under the two C compilers
+#     whenever an operand has a side effect (a method call, `++`). gcc evaluates
+#     the chain right to left and clang left to right. Minimal reproduction, with
+#     javac 21 as the arbiter:
+#
+#       static int n = 0
+#       static String f(int k) { n = n + 1  return "" + k + "(" + n + ")" }
+#       System.out.println(f(1) + f(2) + f(3))      // JDK and clang: 1(1)2(2)3(3)
+#                                                   // gcc -O0 and -O2: 1(3)2(2)3(1)
+#       int a = 1
+#       System.out.println("" + a++ + a++ + a++)    // JDK and clang: 123, gcc: 321
+#
+#     The five programs below are the ones the completed part of the matrix run
+#     found with this signature (the clang and LLVM cells agree with .expected,
+#     both gcc cells differ). t116 and t117 were attributed with the reproduction
+#     above; t114, t144 and t145 have the same signature and were not attributed
+#     individually. A case for this cannot go in tests/programs today: it passes
+#     with clang and fails with gcc, and tests/known-failures.txt has no way to
+#     say one without the other -- which is what this matrix is for.
+t114_stream W8 both gcc cells answer differently from clang and the LLVM back end (concatenation chain order); not attributed to a single line
+t116_text W8 both gcc cells answer differently from clang and the LLVM back end: the concatenation chain's operands are evaluated right to left (DecimalFormat.parse's ParsePosition side effects)
+t117_util_misc W8 both gcc cells answer differently from clang and the LLVM back end: the concatenation chain's operands are evaluated right to left (StringTokenizer hasMoreElements/nextElement/countTokens side effects)
+t144_lombok_parity W8 both gcc cells answer differently from clang and the LLVM back end (concatenation chain order); not attributed to a single line
+t145_teyru_star_import W8 both gcc cells answer differently from clang and the LLVM back end (concatenation chain order); not attributed to a single line

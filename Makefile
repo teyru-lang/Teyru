@@ -8,7 +8,7 @@ BIN     ?= teyru
 OPT     ?= -O2
 PREFIX  ?= /usr/local
 
-.PHONY: all build test test-go test-programs submodule bench fmt vet lint notices check ci jdk-diff progen hooks clean install examples
+.PHONY: all build test test-go test-programs submodule bench backend-matrix fmt vet lint notices check ci jdk-diff progen hooks clean install examples
 
 all: build
 
@@ -106,6 +106,19 @@ progen: build
 ## bench: compile and time the benchmark programs
 bench: build
 	./scripts/bench.sh
+
+## backend-matrix: every program, in every cell of the back-end matrix
+#
+# { C back end + clang, C back end + gcc, LLVM back end } x { -O0, -O2 }, each
+# cell compared with the suite's expectation and with the other cells. This is
+# W8's matrix: the divergences it finds between the cells are what says whether
+# the two back ends can be made to share one lowering. It builds its own
+# compiler from this tree (BIN= names one to use instead), JOBS= sets how many
+# programs are built at a time, and OUT= keeps the record somewhere you can
+# look at it. A divergence is accounted for in
+# scripts/backend-matrix-allow.txt; anything not listed there fails the target.
+backend-matrix:
+	./scripts/backend-matrix.sh
 
 ## notices: check THIRD-PARTY-NOTICES.md against the tree
 #
