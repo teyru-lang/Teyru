@@ -9,6 +9,7 @@ import (
 
 	"github.com/teyru-lang/Teyru/internal/ast"
 	"github.com/teyru-lang/Teyru/internal/java"
+	"github.com/teyru-lang/Teyru/internal/mod"
 	"github.com/teyru-lang/Teyru/internal/source"
 )
 
@@ -51,7 +52,7 @@ func EmitJava(paths []string, opts Options) (*Result, error) {
 				}
 				return nil
 			}
-			if strings.HasSuffix(name, ".teyru") {
+			if mod.IsSource(name) {
 				files = append(files, path)
 			}
 			return nil
@@ -61,7 +62,7 @@ func EmitJava(paths []string, opts Options) (*Result, error) {
 		}
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no .teyru source files found")
+		return nil, fmt.Errorf("no %s or %s source files found", mod.SourceExt, mod.JavaExt)
 	}
 	program := make([]*ast.File, 0, len(files))
 	for _, f := range files {

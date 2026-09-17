@@ -82,6 +82,17 @@ ci: lint
 	  echo "== TEYRU_JDK is not set: the JDK differential did not run"; \
 	fi
 
+## java-compat: compile and run the unmodified-Java corpus
+#
+# tests/java-compat holds Java programs that javac compiles and that this
+# compiler must compile as they stand, with the JDK's own output as the
+# expectation. It is the subset the documentation's "Java source compiles
+# unchanged" names. The release workflow calls this target (make ci runs the
+# same cases again through `go test`, as TestJavaCompat), and it needs no JDK:
+# the expectations are committed beside the programs.
+java-compat: build submodule
+	TEYRU=./$(BIN) sh tests/run.sh java-compat
+
 ## jdk-diff: compile every translatable program with the JDK and compare
 #
 # The reference implementation is OpenJDK 21, and the comparison is stdout and

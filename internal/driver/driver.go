@@ -111,7 +111,8 @@ func Compile(paths []string, opts Options) (*Result, error) {
 		}
 		if st.IsDir() {
 			// A directory stands for the package tree rooted at it: every
-			// .teyru file underneath belongs to the build, which is what makes
+			// source file underneath belongs to the build -- .teyru, and the
+			// .java a Java program is written with -- which is what makes
 			// `teyru build ./...` and a layout of one directory per package
 			// work without listing files by hand. WalkDir is lexical, so the
 			// file order does not depend on the filesystem.
@@ -133,7 +134,7 @@ func Compile(paths []string, opts Options) (*Result, error) {
 					}
 					return nil
 				}
-				if strings.HasSuffix(name, ".teyru") {
+				if mod.IsSource(name) {
 					files = append(files, path)
 				}
 				return nil
@@ -146,7 +147,7 @@ func Compile(paths []string, opts Options) (*Result, error) {
 		files = append(files, p)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no .teyru source files found")
+		return nil, fmt.Errorf("no %s or %s source files found", mod.SourceExt, mod.JavaExt)
 	}
 
 	astFiles := parsePrelude(diags)

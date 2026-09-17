@@ -60,6 +60,12 @@ type Checker struct {
 	nextID  int
 	varID   int
 	tvID    int
+	// subPath is the stack of subtype comparisons in progress, innermost last.
+	// isSubtype reads it to recognise a cyclic type structure; see the comment
+	// there. It is a stack rather than a cache: the same pair may be compared
+	// again on a path that left it, and only a pair that is still being decided
+	// is an assumption.
+	subPath []subPair
 	anonN   map[*ast.Class]int
 	// localN numbers local classes so that two of the same name get distinct
 	// symbol names.

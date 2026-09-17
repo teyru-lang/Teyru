@@ -103,6 +103,15 @@ interface Comparator<T> {
     }
   }
 
+  /* The key-extractor overload, which is the one a chain is usually written
+     with: `comparing(Person::name).thenComparing(Person::age)` does not resolve
+     without it, and it is the JDK's own spelling of the same call. The second
+     key is only looked at where the first two are equal, because that is what
+     the comparator it builds does. */
+  default <U extends Comparable<? super U>> Comparator<T> thenComparing(Function<? super T, ? extends U> key) {
+    return thenComparing(Comparator.comparing(key))
+  }
+
   static <T> Comparator<T> nullsFirst(Comparator<? super T> c) {
     return (a, b) -> {
       if (a == null) {

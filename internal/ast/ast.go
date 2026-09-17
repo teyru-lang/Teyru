@@ -361,6 +361,12 @@ type (
 		Arrow bool
 		// resolved
 		Kind SwitchKind
+		// Exhaustive is set for a pattern switch whose patterns cover every
+		// value of the selector (JLS 14.11.2). Constant labels are not counted,
+		// so an enum switch with every constant and no default is not
+		// exhaustive: javac requires the return after it, and so does this
+		// checker.
+		Exhaustive bool
 	}
 	Yield struct {
 		Pos source.Pos

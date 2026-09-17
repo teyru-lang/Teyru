@@ -136,15 +136,16 @@ func (l *lexer) run() {
 			matched := false
 			for _, op := range operators {
 				if strings.HasPrefix(l.src[l.pos:], op) {
-					if op == ";" {
-						l.errf(start, "TY-SYN-0001", "';' is not Teyru syntax; end statements with a newline")
-						l.pos++
-						l.nl = true
-						matched = true
-						break
-					}
 					l.pos += len(op)
 					l.emit(Token{Kind: Op, Text: op, Off: start, End: l.pos})
+					if op == ";" {
+						// A semicolon ends a statement the way a newline does
+						// (decision D6): the parser reads the ';' as the
+						// terminator, and the next token carries the NL flag so
+						// that everything which looks only at line breaks sees
+						// the statement end as well.
+						l.nl = true
+					}
 					matched = true
 					break
 				}

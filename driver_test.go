@@ -387,6 +387,114 @@ func TestDiagnostics(t *testing.T) {
 	}
 }
 
+// TestJavaCompat compiles and runs every program in tests/java-compat and
+// compares its output with the JDK's.
+//
+// The cases are unmodified Java: `NAME.java` beside `NAME.expected`, which is
+// what OpenJDK 21 printed when it ran the same file. This is the subset the
+// documentation's "Java source compiles unchanged" names, and every case is
+// Java that javac accepts -- a case that only this compiler accepts does not
+// belong here, and neither does one whose difference is a known divergence.
+// tests/known-failures.txt and the `.skip` files apply to these cases exactly
+// as they do to tests/programs.
+func TestJavaCompat(t *testing.T) {
+	haveCC(t)
+	known := readKnownFailures(t)
+	dir := "tests/java-compat"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireSuite(t, dir, entries)
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".java") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".java")
+		if skip, why := skips(t, dir, name); skip {
+			t.Run(name, func(t *testing.T) { t.Skipf("not this platform: %s", why) })
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			work := t.TempDir()
+			check(t, known, name, func() error { return runJavaCompatCase(work, dir, name, e.Name()) })
+		})
+	}
+}
+
+// runJavaCompatCase is one case of TestJavaCompat, as an error rather than a
+// failure, so that the known-failure policy sees the outcome first.
+func runJavaCompatCase(work, dir, name, file string) error {
+	want, err := os.ReadFile(filepath.Join(dir, name+".expected"))
+	if err != nil {
+		return fmt.Errorf("missing expectation file: %v", err)
+	}
+	res, err := driver.Compile([]string{filepath.Join(dir, file)},
+		driver.Options{Out: filepath.Join(work, name), Opt: "-O1", Target: os.Getenv("TEYRU_TARGET")})
+	if err != nil {
+		return fmt.Errorf("compile failed: %v\n%s", err, res.Diags)
+	}
+	got, errOut, code, err := runProgram(res.Exe, programArgs(dir, name))
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("exit status %d, and the JDK's run of it ended 0\nstderr:\n%s", code, errOut)
+	}
+	if got != string(want) {
+		return fmt.Errorf("output mismatch with the JDK's\n--- want ---\n%s\n--- got ---\n%s", want, got)
+	}
+	return nil
+}
+
+// TestJavaSourceExtension checks that a `.java` file is a source of this
+// compiler in both ways a build can be given one: named directly, and found by
+// walking a directory (which is how `teyru build ./...` reads a package).
+//
+// The program is written in Java rather than in Teyru to the letter, semicolons
+// included, because that is the input the extension exists for: `.java` and
+// `.teyru` are two spellings of one language (decision D6), and a change that
+// makes the compiler read the extension but not the statement terminator, or
+// the other way round, is caught here.
+func TestJavaSourceExtension(t *testing.T) {
+	haveCC(t)
+	dir := t.TempDir()
+	const src = `class Hello {
+  public static void main(String[] args) {
+    System.out.println("hi from java");
+  }
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "Hello.java"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"named", filepath.Join(dir, "Hello.java")},
+		{"walked", dir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "hello")
+			res, err := driver.Compile([]string{tc.path}, driver.Options{Out: out, Opt: "-O0"})
+			if err != nil {
+				t.Fatalf("compile failed: %v\n%s", err, res.Diags)
+			}
+			got, errOut, code, err := runProgram(res.Exe, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code != 0 {
+				t.Fatalf("exit status %d\nstderr:\n%s", code, errOut)
+			}
+			if want := "hi from java\n"; got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // TestNoJava checks that the produced binary has no JVM dependency.
 func TestNoJava(t *testing.T) {
 	dir := t.TempDir()
@@ -471,7 +579,7 @@ func TestNative(t *testing.T) {
 func requireSuite(t *testing.T, dir string, entries []os.DirEntry) {
 	t.Helper()
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".teyru") {
+		if strings.HasSuffix(e.Name(), ".teyru") || strings.HasSuffix(e.Name(), ".java") {
 			return
 		}
 	}
