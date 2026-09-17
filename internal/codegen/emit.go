@@ -1196,7 +1196,7 @@ func (e *Emitter) emitCtorBody(cl *ast.Class, m *ast.Method) {
 		// nothing to chain to
 	default:
 		if sup := e.findSuperCtor(cl); sup != nil {
-			e.line("%s(%s);\n", e.cfunc(sup), e.args("this", nil, sup))
+			e.line("%s;\n", e.callTo(e.args(seqOperand{text: "this"}, nil, sup), e.cfunc(sup)+"(", ")"))
 		}
 	}
 	// captured locals arrive as parameters trailing the declared ones, which is

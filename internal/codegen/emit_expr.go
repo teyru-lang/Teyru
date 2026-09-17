@@ -3,6 +3,7 @@ package codegen
 import (
 	"crypto/sha256"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -292,6 +293,324 @@ func (e *Emitter) unboxAccessor(cl *ast.Class, k ast.PrimKind) *ast.Method {
 }
 
 // ---------------------------------------------------------------- expressions
+
+// ------------------------------------------------------- evaluation order
+//
+// Java evaluates the operands of an expression left to right: the left operand
+// of a binary operator is fully evaluated before any part of the right one
+// (JLS 15.7.1), a method call's target before its arguments and the arguments
+// in the order they are written (JLS 15.12.4.1, 15.12.4.2), an array's
+// reference before its index (JLS 15.10.3), and the parts of an assignment's
+// target before the value stored into it (JLS 15.26.1).
+//
+// C promises none of that. The order in which an operator's operands, a call's
+// arguments and the two sides of an assignment are evaluated is unspecified
+// (C11 6.5p3), and gcc and clang choose differently for the same generated
+// code. tests/programs/t43_generics_bounds.teyru has the two-line version:
+//
+//	System.out.println(st.isEmpty() + " then " + st.pop() + " " + st.isEmpty())
+//
+// over a stack holding one element. clang evaluates the concatenation chain
+// left to right and prints `false then one true`, which is what the JDK prints
+// and what the .expected file says; gcc evaluates part of it right to left and
+// prints `true then one false`. The answer depended on which C compiler built
+// the program, at -O0 as much as at -O2.
+//
+// The repair is the one Java's own rules describe, and it is already the
+// technique this file uses where the order was noticed before: evaluate the
+// operands that have to be evaluated early into temporaries of their own, in
+// Java's order, and combine the temporaries. boundCheck, refElemStore,
+// lvalueTemp and virtCallTemp all do exactly that; sequence is the same
+// technique applied where it was missing.
+
+// seqOperand is one operand of an expression the emitter is building: the node,
+// which says whether evaluating it can have a side effect, and the C text it
+// renders to.
+type seqOperand struct {
+	x    ast.Expr
+	text string
+	// effect marks an operand that stands for more than its node says: a
+	// gathered variable-arity argument list is one argument of the C call and an
+	// array built out of several Java arguments, so it holds a side effect the
+	// node behind it -- which is none -- does not describe.
+	effect bool
+}
+
+// receiver is the operand of a call's target. Java evaluates it before the
+// arguments (JLS 15.12.4.1), so it is the first operand of the argument list;
+// x is nil when the target has already been bound to a temporary.
+func receiver(x ast.Expr, text string) seqOperand {
+	return seqOperand{x: x, text: text}
+}
+
+// withReceiver puts a call's receiver in front of its arguments, cast the way
+// the callee's prototype declares it, and nothing when there is no receiver.
+func withReceiver(recv seqOperand, cast string) []seqOperand {
+	if recv.text == "" {
+		return nil
+	}
+	return []seqOperand{receiver(recv.x, cast+recv.text)}
+}
+
+// isNilExpr reports whether x holds no expression, including the typed nil
+// pointer an absent subexpression is stored as: the front end leaves
+// `(*ast.Ident)(nil)` in an ast.Expr for a call with no receiver, and neither
+// `x == nil` nor a type switch's `case nil` sees it -- the switch matches it as
+// an Ident whose every field is zero.
+func isNilExpr(x ast.Expr) bool {
+	if x == nil {
+		return true
+	}
+	v := reflect.ValueOf(x)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
+// operandEffects reports whether an operand can have a side effect.
+func (e *Emitter) operandEffects(op seqOperand) bool {
+	return op.effect || e.hasEffects(op.x)
+}
+
+// callTo renders a call as `open` + the arguments + `close`, with the operands
+// evaluated in Java's order.
+func (e *Emitter) callTo(ops []seqOperand, open, close string) string {
+	return e.sequence(ops, func(a []string) string {
+		return open + strings.Join(a, ", ") + close
+	})
+}
+
+// sequence renders an expression whose operands Java evaluates left to right,
+// as C does not. combine is handed the operand texts -- the temporaries in the
+// slots that needed one -- and returns the finished expression.
+//
+// The operands are bound as a prefix: every operand up to and including the
+// last one that can have a side effect is evaluated into a temporary of its own
+// type, in Java's order, unless C cannot reorder it anyway -- a literal, `this`,
+// or a local no sibling operand writes. What is left unbound is then evaluated
+// after all of them, in any order C likes, and that is safe because no operand
+// after the last side effect has one: nothing left in the expression can write
+// anything, so the order the rest are read in cannot matter.
+//
+// The last operand with a side effect is bound too when something after it is
+// not a value C cannot reorder. `c[i++] + f(9) + " i=" + i` is why: the `i` at
+// the end reads what the `i++` at the front wrote, and leaving the two in one
+// expression let gcc read `i` before incrementing it.
+//
+// Nothing is bound when nothing has to be, which is almost every expression in
+// the output: `(x + y)` stays `(x + y)`.
+func (e *Emitter) sequence(ops []seqOperand, combine func(args []string) string) string {
+	last := -1
+	for i, op := range ops {
+		if e.operandEffects(op) {
+			last = i
+		}
+	}
+	args := make([]string, len(ops))
+	for i, op := range ops {
+		args[i] = op.text
+	}
+	if last < 0 {
+		return combine(args)
+	}
+	written := assignedLocals(ops)
+	var bind []int
+	for i := range last {
+		if args[i] != "" && !operandStable(ops[i].x, written) {
+			bind = append(bind, i)
+		}
+	}
+	if args[last] != "" {
+		for _, op := range ops[last+1:] {
+			if !operandStable(op.x, written) {
+				bind = append(bind, last)
+				break
+			}
+		}
+	}
+	if len(bind) == 0 {
+		return combine(args)
+	}
+	var b strings.Builder
+	b.WriteString("({ ")
+	for _, i := range bind {
+		n := e.tmpName()
+		fmt.Fprintf(&b, "__typeof__(%s) %s = (%s); ", args[i], n, args[i])
+		args[i] = n
+	}
+	b.WriteString(combine(args))
+	b.WriteString("; })")
+	return b.String()
+}
+
+// hasEffects reports whether evaluating x can write memory or otherwise be
+// observed: a call, an allocation, an assignment, an update, a closure being
+// created.
+//
+// A read is not one, even though it can complete abruptly (a null receiver, an
+// index out of range): what this decides is whether an operand's *own* side
+// effect has to land in Java's order, and counting reads as effects would bind
+// nearly every operand and bury the output in temporaries. A read that a sibling
+// operand writes is what operandStable is for.
+//
+// A node this does not recognise counts as a side effect, so a construct added
+// later is bound rather than left silently unsequenced.
+func (e *Emitter) hasEffects(x ast.Expr) bool {
+	if isNilExpr(x) {
+		return false
+	}
+	switch v := x.(type) {
+	case *ast.Literal, *ast.ClassLit:
+		return false
+	case *ast.This:
+		// a qualified `Outer.this` reads the enclosing instance out of a field
+		return v.Qual != ""
+	case *ast.SuperExpr:
+		return false
+	case *ast.Ident:
+		f, ok := v.Ref.(*ast.Field)
+		return ok && e.staticReadRunsClinit(f)
+	case *ast.Select:
+		if f, ok := v.Ref.(*ast.Field); ok && e.staticReadRunsClinit(f) {
+			return true
+		}
+		// an array's `length` is a field of the array object, and reading it
+		// tests the receiver for null the way any other field read does
+		return e.hasEffects(v.X)
+	case *ast.Index:
+		return e.hasEffects(v.X) || e.hasEffects(v.Index)
+	case *ast.Unary:
+		return v.Op == "++" || v.Op == "--" || e.hasEffects(v.X)
+	case *ast.Binary:
+		// `&&` and `||` are the two operators C sequences for itself; their
+		// operands are still consulted because either can carry the effect
+		return e.hasEffects(v.X) || e.hasEffects(v.Y)
+	case *ast.Cond:
+		return e.hasEffects(v.C) || e.hasEffects(v.X) || e.hasEffects(v.Y)
+	case *ast.Cast:
+		return e.hasEffects(v.X)
+	case *ast.Conv:
+		return e.hasEffects(v.X)
+	case *ast.InstanceOf:
+		return e.hasEffects(v.X)
+	}
+	// Assign, Call, New, NewArray, ArrayInit, SwitchExpr, Lambda, MethodRef and
+	// anything unlisted: an assignment updates a variable, a call and an
+	// allocation are observable, and a closure or a class literal is an object
+	// built on the spot.
+	return true
+}
+
+// staticReadRunsClinit reports whether reading a field runs its class's static
+// initializer first. A `static final` constant is inlined at every use site and
+// reads nothing, so it never does; any other static read is wrapped in the
+// class's initialization test (clinitCall), and that initializer can do
+// anything a static initializer can.
+func (e *Emitter) staticReadRunsClinit(f *ast.Field) bool {
+	return f != nil && f.Mods.Has(ast.ModStatic) && f.ConstVal == nil && f.Owner != nil &&
+		needsClinit(f.Owner, map[*ast.Class]bool{})
+}
+
+// operandStable reports whether C may evaluate an operand whenever it likes and
+// get the same value: a literal, `this`, or a local or parameter that no sibling
+// operand writes. Everything else -- a field, an array element, a boxing
+// conversion (a call to the wrapper's valueOf) -- reads something a store
+// elsewhere in the same expression can change, so it is evaluated where Java
+// evaluates it.
+func operandStable(x ast.Expr, written map[*ast.Var]bool) bool {
+	if isNilExpr(x) {
+		return true
+	}
+	switch v := x.(type) {
+	case *ast.Literal, *ast.SuperExpr:
+		return true
+	case *ast.This:
+		return v.Qual == ""
+	case *ast.Ident:
+		// a captured local lives in the closure object's field, so a callee
+		// that is handed the closure can write it
+		vr, ok := v.Ref.(*ast.Var)
+		return ok && vr != nil && vr.Field == nil && !written[vr]
+	case *ast.Conv:
+		return operandStable(v.X, written)
+	}
+	return false
+}
+
+// assignedLocals collects the locals and parameters the operands themselves
+// assign to. Only an assignment or an update can write one -- a call cannot name
+// a local of this frame -- so this is a scan of the operands' own trees that
+// stops at a lambda body, which runs when it is called rather than here.
+func assignedLocals(ops []seqOperand) map[*ast.Var]bool {
+	var out map[*ast.Var]bool
+	var walk func(ast.Expr)
+	mark := func(x ast.Expr) {
+		id, ok := x.(*ast.Ident)
+		if !ok {
+			return
+		}
+		if vr, ok := id.Ref.(*ast.Var); ok && vr != nil {
+			if out == nil {
+				out = map[*ast.Var]bool{}
+			}
+			out[vr] = true
+		}
+	}
+	walk = func(x ast.Expr) {
+		if isNilExpr(x) {
+			return
+		}
+		switch v := x.(type) {
+		case *ast.Assign:
+			mark(v.X)
+			walk(v.Y)
+		case *ast.Unary:
+			if v.Op == "++" || v.Op == "--" {
+				mark(v.X)
+			}
+			walk(v.X)
+		case *ast.Binary:
+			walk(v.X)
+			walk(v.Y)
+		case *ast.Cond:
+			walk(v.C)
+			walk(v.X)
+			walk(v.Y)
+		case *ast.Cast:
+			walk(v.X)
+		case *ast.Conv:
+			walk(v.X)
+		case *ast.InstanceOf:
+			walk(v.X)
+		case *ast.Index:
+			walk(v.X)
+			walk(v.Index)
+		case *ast.Select:
+			walk(v.X)
+		case *ast.Call:
+			walk(v.Recv)
+			for _, a := range v.Args {
+				walk(a)
+			}
+		case *ast.New:
+			walk(v.Outer)
+			for _, a := range v.Args {
+				walk(a)
+			}
+		case *ast.NewArray:
+			for _, d := range v.Dims {
+				walk(d)
+			}
+			walk(v.Init)
+		case *ast.ArrayInit:
+			for _, el := range v.Elems {
+				walk(el)
+			}
+		}
+	}
+	for _, op := range ops {
+		walk(op.x)
+	}
+	return out
+}
 
 func (e *Emitter) expr(x ast.Expr) string {
 	if x == nil {
@@ -766,6 +1085,24 @@ func (e *Emitter) fieldStore(f *ast.Field, recv string) string {
 		" if (!" + n + ") ty_npe(); &" + n + "->f_" + mangle(f.Name) + "; }))"
 }
 
+// fieldAssign renders `recv.f = val` in Java's order: the receiver, then the
+// value, then the null test, then the store. The result is the stored value, so
+// the assignment can still be used as an expression.
+//
+// fieldStore cannot be used for this on its own: its null test is part of the
+// address, which leaves the test and the value unsequenced. Java tests the
+// receiver only when the store happens (JLS 15.26.1), which is why
+// `h.f = g()` with a null h calls g() and then throws.
+func (e *Emitter) fieldAssign(recv ast.Expr, f *ast.Field, t, val string) string {
+	p := e.tmpName()
+	v := e.tmpName()
+	ct := cname(f.Owner)
+	return "({ " + ct + "* " + p + " = (" + ct + "*)" + e.expr(recv) + "; " +
+		t + " " + v + " = (" + t + ")(" + val + ");" +
+		" if (!" + p + ") ty_npe(); " +
+		p + "->f_" + mangle(f.Name) + " = " + v + "; " + v + "; })"
+}
+
 // fieldAccess renders a field read through a receiver expression.
 func (e *Emitter) fieldAccess(f *ast.Field, recv string) string {
 	if f.Owner == nil {
@@ -1195,7 +1532,7 @@ func (e *Emitter) lvalueTemp(x ast.Expr) (string, string) {
 // replaces the reference the target held; writing the operation through the
 // reference, which is what C's `*p op= y` would do, is pointer arithmetic on
 // the box. The shape is boxedUpdate's, which does the same for `++` and `--`.
-func (e *Emitter) assignBoxed(v *ast.Assign, lv string, k ast.PrimKind) string {
+func (e *Emitter) assignBoxed(v *ast.Assign, lv, read string, k ast.PrimKind) string {
 	xt := v.X.GetType()
 	own := &ast.PrimType{Kind: k}
 	if tp, ok := v.TargetPrim.(*ast.PrimType); ok {
@@ -1213,7 +1550,7 @@ func (e *Emitter) assignBoxed(v *ast.Assign, lv string, k ast.PrimKind) string {
 	n := e.tmpName()
 	value := e.compoundOp(v, n, ot)
 	back := e.wrapperCall(e.wrapperStatic(k, "valueOf"), "("+e.ctype(own)+")("+value+")")
-	return "({ " + e.ctype(own) + " " + n + " = " + e.unboxCall(lv, xt, own) + "; " +
+	return "({ " + e.ctype(own) + " " + n + " = " + e.unboxCall(read, xt, own) + "; " +
 		lv + " = " + back + "; })"
 }
 
@@ -1437,11 +1774,38 @@ func (e *Emitter) flatSpine(v, b *ast.Binary) bool {
 // operands in their original order and each rendered as the nested spelling
 // rendered it. Only the left spine is flattened: a run on the right, as in
 // `a - (b - c)`, keeps its parentheses because its grouping differs.
+//
+// The chain is one C expression, so its operands may be evaluated in any order
+// unless something says otherwise, and sequence says so. The two short-circuit
+// operators are the exception: C sequences those for itself, and binding an
+// operand of one would evaluate an operand the language only evaluates if the
+// ones before it were true.
 func (e *Emitter) flatChain(v *ast.Binary) string {
-	if b, ok := v.X.(*ast.Binary); ok && e.flatSpine(v, b) {
-		return e.flatChain(b) + " " + v.Op + " " + e.flatRight(v.Y, v)
+	ops := e.flatOperands(v, nil)
+	if v.Op == "&&" || v.Op == "||" {
+		return strings.Join(texts(ops), " "+v.Op+" ")
 	}
-	return e.flatOperand(v.X, v) + " " + v.Op + " " + e.flatRight(v.Y, v)
+	return e.sequence(ops, func(a []string) string { return strings.Join(a, " "+v.Op+" ") })
+}
+
+// texts is the operands' C text, in order, for a caller that has no use for
+// sequence.
+func texts(ops []seqOperand) []string {
+	out := make([]string, len(ops))
+	for i, op := range ops {
+		out[i] = op.text
+	}
+	return out
+}
+
+// flatOperands collects the operands of a flattened chain, left to right.
+func (e *Emitter) flatOperands(v *ast.Binary, out []seqOperand) []seqOperand {
+	if b, ok := v.X.(*ast.Binary); ok && e.flatSpine(v, b) {
+		out = e.flatOperands(b, out)
+	} else {
+		out = append(out, seqOperand{x: v.X, text: e.flatOperand(v.X, v)})
+	}
+	return append(out, seqOperand{x: v.Y, text: e.flatRight(v.Y, v)})
 }
 
 // flatOperand renders one operand of a chain: a short-circuit operator tests
@@ -1513,8 +1877,10 @@ func (e *Emitter) binary(v *ast.Binary) string {
 		if ast.IsPrim(v.OpType, ast.Byte) || ast.IsPrim(v.OpType, ast.Short) || ast.IsPrim(v.OpType, ast.Char) {
 			ut = "uint32_t"
 		}
-		return "(" + e.ctype(v.GetType()) + ")((" + ut + ")(" + e.expr(v.X) + ") >> " +
-			shiftCount(e.operand(v.Y, v.OpType), v.OpType) + ")"
+		return e.sequence(pair(v.X, e.expr(v.X), v.Y, shiftCount(e.operand(v.Y, v.OpType), v.OpType)),
+			func(a []string) string {
+				return "(" + e.ctype(v.GetType()) + ")((" + ut + ")(" + a[0] + ") >> " + a[1] + ")"
+			})
 	}
 	if e.flattenable(v) {
 		return "(" + e.flatChain(v) + ")"
@@ -1524,6 +1890,9 @@ func (e *Emitter) binary(v *ast.Binary) string {
 	case "==", "!=":
 		return e.equality(v, lt, rt)
 	case "&&":
+		// C sequences the two sides of `&&` and `||` itself -- the left one is
+		// fully evaluated before the right one is evaluated at all -- so these
+		// are the two binary operators that need nothing done to them.
 		return "(" + e.cond(v.X) + " && " + e.cond(v.Y) + ")"
 	case "||":
 		return "(" + e.cond(v.X) + " || " + e.cond(v.Y) + ")"
@@ -1550,7 +1919,15 @@ func (e *Emitter) binary(v *ast.Binary) string {
 			x = "(int64_t)" + x
 		}
 	}
-	return "(" + x + " " + v.Op + " " + y + ")"
+	return e.sequence(pair(v.X, x, v.Y, y), func(a []string) string {
+		return "(" + a[0] + " " + v.Op + " " + a[1] + ")"
+	})
+}
+
+// pair presents a binary expression's two operands to sequence, in the order
+// Java evaluates them.
+func pair(x ast.Expr, xText string, y ast.Expr, yText string) []seqOperand {
+	return []seqOperand{{x: x, text: xText}, {x: y, text: yText}}
 }
 
 func (e *Emitter) isStringType(t ast.Type) bool {
@@ -1573,9 +1950,10 @@ func (e *Emitter) operand(x ast.Expr, op ast.Type) string {
 func (e *Emitter) equality(v *ast.Binary, lt, rt ast.Type) string {
 	ls, lsOk := lt.(*ast.PrimType)
 	rs, rsOk := rt.(*ast.PrimType)
+	cmp := func(a []string) string { return "(" + a[0] + " " + v.Op + " " + a[1] + ")" }
 	switch {
 	case lsOk && rsOk:
-		return "(" + e.expr(v.X) + " " + v.Op + " " + e.expr(v.Y) + ")"
+		return e.sequence(pair(v.X, e.expr(v.X), v.Y, e.expr(v.Y)), cmp)
 	case lsOk != rsOk:
 		// boxed/unboxed comparison
 		x, y := e.expr(v.X), e.expr(v.Y)
@@ -1584,13 +1962,13 @@ func (e *Emitter) equality(v *ast.Binary, lt, rt ast.Type) string {
 		} else {
 			x = e.unboxCall(x, lt, rs)
 		}
-		return "(" + x + " " + v.Op + " " + y + ")"
+		return e.sequence(pair(v.X, x, v.Y, y), cmp)
 	}
 	// `==` on two String references is a reference comparison, as in Java: two
 	// strings built separately are equal only under equals(). Literals are
 	// interned per program by strLit, so `a == "abc"` is still true, and so is a
 	// comparison against a concatenation of literals folded at compile time.
-	return "(" + e.expr(v.X) + " " + v.Op + " " + e.expr(v.Y) + ")"
+	return e.sequence(pair(v.X, e.expr(v.X), v.Y, e.expr(v.Y)), cmp)
 }
 
 // divExpr uses a runtime helper for integral division, which throws on a zero
@@ -1598,24 +1976,28 @@ func (e *Emitter) equality(v *ast.Binary, lt, rt ast.Type) string {
 // NaN instead.
 func (e *Emitter) divExpr(v *ast.Binary) string {
 	x, y := e.operand(v.X, v.OpType), e.operand(v.Y, v.OpType)
-	switch {
-	case ast.IsPrim(v.OpType, ast.Long):
-		return "ty_div_long(" + x + ", " + y + ")"
-	case isFloating(v.OpType):
-		return "((" + x + ") / (" + y + "))"
-	}
-	return "ty_div_int(" + x + ", " + y + ")"
+	return e.sequence(pair(v.X, x, v.Y, y), func(a []string) string {
+		switch {
+		case ast.IsPrim(v.OpType, ast.Long):
+			return "ty_div_long(" + a[0] + ", " + a[1] + ")"
+		case isFloating(v.OpType):
+			return "((" + a[0] + ") / (" + a[1] + "))"
+		}
+		return "ty_div_int(" + a[0] + ", " + a[1] + ")"
+	})
 }
 
 func (e *Emitter) remExpr(v *ast.Binary) string {
 	x, y := e.operand(v.X, v.OpType), e.operand(v.Y, v.OpType)
-	switch {
-	case ast.IsPrim(v.OpType, ast.Long):
-		return "ty_rem_long(" + x + ", " + y + ")"
-	case isFloating(v.OpType):
-		return "fmod(" + x + ", " + y + ")"
-	}
-	return "ty_rem_int(" + x + ", " + y + ")"
+	return e.sequence(pair(v.X, x, v.Y, y), func(a []string) string {
+		switch {
+		case ast.IsPrim(v.OpType, ast.Long):
+			return "ty_rem_long(" + a[0] + ", " + a[1] + ")"
+		case isFloating(v.OpType):
+			return "fmod(" + a[0] + ", " + a[1] + ")"
+		}
+		return "ty_rem_int(" + a[0] + ", " + a[1] + ")"
+	})
 }
 
 // isFloating reports whether a type is float or double.
@@ -1625,14 +2007,27 @@ func isFloating(t ast.Type) bool {
 
 // concat renders Java string concatenation.
 func (e *Emitter) concat(v *ast.Binary) string {
-	return e.concatFrom(e.stringOperand(v.X), v.Y)
+	return e.concatParts([]seqOperand{e.stringPart(v.X)}, v.Y)
 }
 
-// concatFrom builds the concatenation of an already-rendered left operand with
-// the string parts of x. It is used when the left operand is a value read
-// through a bound temporary rather than an expression of its own.
-func (e *Emitter) concatFrom(first string, x ast.Expr) string {
-	parts := []string{first}
+// concatFrom builds the concatenation of an already-rendered left operand, the
+// value of a compound assignment's target, with the string parts of x.
+func (e *Emitter) concatFrom(first ast.Expr, firstText string, x ast.Expr) string {
+	return e.concatParts([]seqOperand{{x: first, text: firstText}}, x)
+}
+
+// concatParts builds the concatenation of an already-rendered left operand with
+// the string parts of x, with the operands evaluated in the order Java
+// evaluates them.
+//
+// Java's `+` on strings is left-associative and its operands are evaluated left
+// to right, so `a + b + c + d` evaluates a, b, c, d in that order -- and each
+// operand may call a method or update a variable. C leaves the order of the
+// arguments of the ty_str_concat calls the chain turns into unspecified, which
+// is what made t43 answer differently under the two C compilers; sequence is
+// what puts the operands back in the order the source wrote them.
+func (e *Emitter) concatParts(head []seqOperand, x ast.Expr) string {
+	parts := head
 	var collect func(ast.Expr)
 	collect = func(y ast.Expr) {
 		if b, ok := y.(*ast.Binary); ok && b.Op == "+" && e.isStringType(b.GetType()) {
@@ -1640,14 +2035,29 @@ func (e *Emitter) concatFrom(first string, x ast.Expr) string {
 			collect(b.Y)
 			return
 		}
-		parts = append(parts, e.stringOperand(y))
+		parts = append(parts, e.stringPart(y))
 	}
 	collect(x)
-	out := parts[0]
-	for _, p := range parts[1:] {
-		out = "ty_str_concat(" + out + ", " + p + ")"
-	}
-	return out
+	return e.sequence(parts, func(a []string) string {
+		out := a[0]
+		for _, p := range a[1:] {
+			out = "ty_str_concat(" + out + ", " + p + ")"
+		}
+		return out
+	})
+}
+
+// stringPart is one operand of a concatenation, as the string it contributes.
+//
+// An operand that is neither a String nor a primitive is rendered by calling
+// toString on it, and that call reads whatever state the object holds -- which
+// is a side effect in everything but name: `list.remove("a") + " " + list`
+// printed the list as it was *before* the remove under gcc. A String is
+// immutable and a primitive is a value, so those two really are read once.
+func (e *Emitter) stringPart(x ast.Expr) seqOperand {
+	t := x.GetType()
+	_, prim := t.(*ast.PrimType)
+	return seqOperand{x: x, text: e.stringOperand(x), effect: !prim && !e.isStringType(t)}
 }
 
 func (e *Emitter) stringOperand(x ast.Expr) string {
@@ -1697,39 +2107,70 @@ func (e *Emitter) assign(v *ast.Assign) string {
 		if selem := e.refElemClass(ix.GetType()); selem != "" {
 			return e.refElemStore(ix, selem, e.coerce(e.expr(v.Y), v.Y.GetType(), v.X.GetType()))
 		}
+		return e.elemStore(ix, e.coerce(e.expr(v.Y), v.Y.GetType(), v.X.GetType()))
+	}
+	// A store into a field reached through an expression, `recv.f = value`, has
+	// the two sides of an assignment to order: Java evaluates the receiver first
+	// (JLS 15.26.1 evaluates the left-hand operand to produce a variable, which
+	// for a field access is just the receiver expression -- the null test comes
+	// later, which is why `h.f = g()` with a null h calls g() before it throws),
+	// and C orders the two sides however it likes.
+	if sel, ok := v.X.(*ast.Select); ok && v.Op == "=" && pre == "" && e.hasEffects(v.Y) {
+		if f, ok := sel.Ref.(*ast.Field); ok && f != nil && f.Owner != nil && !f.Mods.Has(ast.ModStatic) {
+			return e.fieldAssign(sel.X, f,
+				e.ctype(v.X.GetType()), e.coerce(e.expr(v.Y), v.Y.GetType(), v.X.GetType()))
+		}
 	}
 	if v.Op == "=" {
 		lv := e.lvalue(v.X)
 		if pre != "" {
-			return "(" + pre + e.assignInner(v, lv) + ")"
+			return "(" + pre + e.assignInner(v, lv, lv) + ")"
 		}
-		return e.assignInner(v, lv)
+		return e.assignInner(v, lv, lv)
 	}
 	// a compound assignment reads the target as well as writing it, so the
-	// target is bound once and both uses go through the temporary
+	// target is bound once and both uses go through the temporary.
+	//
+	// The value that read produces is bound too when the right-hand operand has
+	// a side effect, because Java reads it before it evaluates that operand
+	// (JLS 15.26.2) and the operand is allowed to write the target: `y += (y =
+	// 5)` is 8 when y was 3, and both C compilers answered 10 while the read and
+	// the write sat in one unsequenced expression. A boxed target is left alone
+	// here -- assignBoxed binds the read itself, for the same reason.
 	decl, ref := e.lvalueTemp(v.X)
-	expr := "({ " + decl + e.assignInner(v, ref) + "; })"
+	read := ref
+	if _, boxed := e.boxKindOf(v.X.GetType()); !boxed && e.hasEffects(v.Y) {
+		n := e.tmpName()
+		decl += e.ctype(v.X.GetType()) + " " + n + " = " + ref + "; "
+		read = n
+	}
+	expr := "({ " + decl + e.assignInner(v, ref, read) + "; })"
 	if pre != "" {
 		return "(" + pre + expr + ")"
 	}
 	return expr
 }
 
-func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
+// assignInner renders the operation of an assignment. lv is the store's target
+// and read is the target's current value, which is lv itself unless the caller
+// bound it to a temporary first.
+func (e *Emitter) assignInner(v *ast.Assign, lv, read string) string {
 	if v.Op == "=" {
 		return "(" + lv + " = " + e.coerce(e.expr(v.Y), v.Y.GetType(), v.X.GetType()) + ")"
 	}
 	if v.Op == "+=" && e.isStringType(v.X.GetType()) {
 		// string += is concatenation; the left operand is the value the target
-		// holds before the store
-		return "(" + lv + " = (tystr*)" + e.concatFrom("(tystr*)"+lv, v.Y) + ")"
+		// holds before the store. The target is presented as an operand of the
+		// concatenation so that a target a sibling operand writes -- `s += (s =
+		// "x")` -- is read before that operand runs, as JLS 15.26.2 says.
+		return "(" + lv + " = (tystr*)" + e.concatFrom(v.X, "(tystr*)"+read, v.Y) + ")"
 	}
 	// A compound assignment whose target is boxed: the target is unboxed, the
 	// operation runs in its own type and the result is boxed again (JLS 15.26.2
 	// with 5.1.8 and 5.1.7). Every operator has that shape, which is why it is
 	// one dispatch rather than one per operator.
 	if k, ok := e.boxKindOf(v.X.GetType()); ok {
-		return e.assignBoxed(v, lv, k)
+		return e.assignBoxed(v, lv, read, k)
 	}
 	op := v.Op[:len(v.Op)-1]
 	// a compound shift masks its count exactly like the binary form, at the
@@ -1744,7 +2185,10 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 			if ast.IsPrim(st, ast.Long) {
 				ut = "uint64_t"
 			}
-			return "(" + lv + " = (" + e.ctype(v.X.GetType()) + ")((" + ut + ")" + lv + " >> " + count + "))"
+			return "(" + lv + " = (" + e.ctype(v.X.GetType()) + ")((" + ut + ")" + read + " >> " + count + "))"
+		}
+		if read != lv {
+			return "(" + lv + " = (" + read + " " + op + " " + count + "))"
 		}
 		return "(" + lv + " " + op + "= " + count + ")"
 	}
@@ -1752,9 +2196,9 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 		xt := v.X.GetType()
 		if isFloating(v.OpType) {
 			// floating point division and remainder never throw
-			call := "((" + lv + ") " + op + " (" + e.expr(v.Y) + "))"
+			call := "((" + read + ") " + op + " (" + e.expr(v.Y) + "))"
 			if op == "%" {
-				call = "fmod(" + lv + ", " + e.expr(v.Y) + ")"
+				call = "fmod(" + read + ", " + e.expr(v.Y) + ")"
 			}
 			// the result is converted back to the target (JLS 15.26.2), and for
 			// an integral target that is the narrowing conversion a cast does --
@@ -1772,7 +2216,7 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 				fn = "ty_div_long"
 			}
 		}
-		return "(" + lv + " = (" + e.ctype(xt) + ")" + fn + "(" + lv + ", " + e.expr(v.Y) + "))"
+		return "(" + lv + " = (" + e.ctype(xt) + ")" + fn + "(" + read + ", " + e.expr(v.Y) + "))"
 	}
 	// The result of the operation is converted back to the target's type, and
 	// when the operation happens in a floating-point type and the target is
@@ -1780,9 +2224,15 @@ func (e *Emitter) assignInner(v *ast.Assign, lv string) string {
 	// conversion a cast performs (JLS 15.26.2), while C's `x op= y` converts it
 	// with a plain cast, which is undefined for a value that does not fit. The
 	// statement C already emitted is kept wherever no clamping is needed.
-	call := "(" + lv + " " + op + " " + e.operand(v.Y, v.OpType) + ")"
+	call := "(" + read + " " + op + " " + e.operand(v.Y, v.OpType) + ")"
 	if conv := e.narrowTarget(v.OpType, v.X.GetType(), call); conv != call {
 		return "(" + lv + " = " + conv + ")"
+	}
+	if read != lv {
+		// the target's value is in a temporary, so the operation is spelled out
+		// rather than left to the compound form, which would read the target a
+		// second time -- after the right-hand operand has written it
+		return "(" + lv + " = (" + read + " " + op + " " + e.operand(v.Y, v.OpType) + "))"
 	}
 	return "(" + lv + " " + op + "= " + e.operand(v.Y, v.OpType) + ")"
 }
@@ -1804,6 +2254,26 @@ func (e *Emitter) refElemStore(ix *ast.Index, selem, val string) string {
 	return "({ tyarr* " + n + " = (tyarr*)" + e.expr(ix.X) + "; int64_t " + k + " = (int64_t)(" +
 		e.expr(ix.Index) + "); " + t + " " + v + " = (" + t + ")(" + val + ");" +
 		" ty_array_store_ref(" + n + ", " + selem + ", " + k + ", (void*)" + v + "); " + v + "; })"
+}
+
+// elemStore is refElemStore for an array whose slots hold a value rather than a
+// reference, so the store is a plain subscript and no store check applies.
+//
+// It replaces a bare `(*(a[i])) = value`, whose two sides C may evaluate in
+// either order: that put the null and bounds tests before the value, so
+// `a[9] = f()` threw ArrayIndexOutOfBoundsException without calling f() under
+// gcc -- where the JDK calls f() first and throws afterwards (JLS 15.26.1: the
+// array reference, then the index, then the value, and only then the tests).
+func (e *Emitter) elemStore(ix *ast.Index, val string) string {
+	n := e.tmpName()
+	k := e.tmpName()
+	v := e.tmpName()
+	slot := e.elemSlot(ix.GetType())
+	return "({ tyarr* " + n + " = (tyarr*)" + e.expr(ix.X) + "; int64_t " + k + " = (int64_t)(" +
+		e.expr(ix.Index) + "); " + slot + " " + v + " = (" + slot + ")(" + val + ");" +
+		" if (!" + n + ") ty_npe();" +
+		" if (" + k + " < 0 || " + k + " >= " + n + "->len) ty_aioobe(" + k + ", " + n + "->len);" +
+		" ((" + slot + "*)" + n + "->data)[" + k + "] = " + v + "; " + v + "; })"
 }
 
 // ---------------------------------------------------------------- calls
@@ -1830,20 +2300,24 @@ func (e *Emitter) callExpr(v *ast.Call) string {
 				case "hashCode":
 					return "ty_object_hash((void*)" + e.expr(v.Recv) + ")"
 				case "equals":
-					a := e.tmpRef(e.expr(v.Recv))
 					var other string
+					var otherExp ast.Expr
 					if len(v.Args) > 0 {
 						other = e.expr(v.Args[0])
+						otherExp = v.Args[0]
 					} else {
 						other = "NULL"
 					}
-					return "((void*)" + a + " == (void*)" + other + ")"
+					return e.sequence(
+						[]seqOperand{{x: v.Recv, text: e.expr(v.Recv)}, {x: otherExp, text: other}},
+						func(a []string) string { return "((void*)" + a[0] + " == (void*)" + a[1] + ")" })
 				}
 			}
 		}
 		return "0"
 	}
 	recv := ""
+	recvExp := ast.Expr(nil)
 	if !m.IsStatic() {
 		switch {
 		case v.Recv == nil:
@@ -1858,29 +2332,30 @@ func (e *Emitter) callExpr(v *ast.Call) string {
 			recv = "((void*)" + e.thisExpr() + ")"
 		default:
 			recv = e.expr(v.Recv)
+			recvExp = v.Recv
 		}
 	}
 	if _, ok := nativeTable[nativeKey(m)]; ok && e.nativeIsFinal(m) {
 		return e.nativeCall(m, recv, v.Args)
 	}
 	name := e.cfunc(m)
-	a := e.argsFor(recv, v.Args, m, v)
+	a := e.argsFor(receiver(recvExp, recv), v.Args, m, v)
 	if m.External {
-		return m.Native + "(" + a + ")"
+		return e.callTo(a, m.Native+"(", ")")
 	}
 	if m.IsStatic() && !v.Super && v.Recv != nil {
 		// touching a static member initializes its class first
-		return "(" + e.clinitCall(m.Owner) + name + "(" + a + "))"
+		return e.callTo(a, "("+e.clinitCall(m.Owner)+name+"(", "))")
 	}
 	if v.Static || m.IsStatic() || v.Super {
 		// super calls bind statically to the superclass implementation
-		return name + "(" + a + ")"
+		return e.callTo(a, name+"(", ")")
 	}
 	if v.Recv == nil {
 		if (m.Selector >= 0 || m.VIndex >= 0) && !directBind(m) {
 			return e.virtCall(m, cname(m.Owner)+"*", e.thisExpr(), v.Args, v)
 		}
-		return name + "(" + a + ")"
+		return e.callTo(a, name+"(", ")")
 	}
 	if (m.Selector >= 0 || m.VIndex >= 0) && !m.Mods.Has(ast.ModPrivate) {
 		if directBind(m) {
@@ -1888,7 +2363,7 @@ func (e *Emitter) callExpr(v *ast.Call) string {
 		}
 		return e.virtCallTemp(v.Recv, m, v.Args, v)
 	}
-	return name + "(" + a + ")"
+	return e.callTo(a, name+"(", ")")
 }
 
 // directBind reports whether a virtual call can be bound at compile time
@@ -1927,7 +2402,7 @@ func (e *Emitter) bindCall(m *ast.Method, recvT string, recv ast.Expr, args []as
 		recvT = "void*"
 	}
 	n := e.tmpName()
-	inner := e.cfunc(m) + "(" + e.argsFor(n, args, m, call) + ")"
+	inner := e.callTo(e.argsFor(seqOperand{text: n}, args, m, call), e.cfunc(m)+"(", ")")
 	if ret := e.ctype(m.Result); ret != "void" {
 		return "({ " + recvT + " " + n + " = (" + recvT + ")" + e.expr(recv) + "; " +
 			"((" + n + ") ? " + inner + " : (" + ret + ")((intptr_t)ty_npe())); })"
@@ -1990,15 +2465,12 @@ func (e *Emitter) indirect(m *ast.Method, fn, recvT, recv string, args []ast.Exp
 	// know whether a variable-arity argument list was written as the array
 	// itself or as its elements, and a heuristic cannot tell
 	// `printf("%s", x)` from `printf("%s", new Object[]{x})`.
-	a := e.argsFor(recv, args, m, call)
+	a := e.argsFor(seqOperand{text: recv}, args, m, call)
 	sig := "(( " + ret + "(*)(" + strings.Join(ps, ", ") + "))" + fn + ")"
-	if ret == "void" {
-		if a == "" {
-			return sig + "()"
-		}
-		return sig + "(" + a + ")"
+	if ret == "void" && len(a) == 0 {
+		return sig + "()"
 	}
-	return sig + "(" + a + ")"
+	return e.callTo(a, sig+"(", ")")
 }
 
 // ---------------------------------------------------------------- new
@@ -2016,18 +2488,18 @@ func (e *Emitter) newExpr(v *ast.New) string {
 	// a native constructor is implemented by a runtime helper
 	if v.Ctor != nil {
 		if nf, ok := nativeTable[nativeKey(v.Ctor)]; ok && nf.fn != "" {
-			args := make([]string, 0, len(v.Args))
+			ops := make([]seqOperand, 0, len(v.Args))
 			for i, a := range v.Args {
 				var want ast.Type
 				if i < len(v.Ctor.Params) {
 					want = v.Ctor.Params[i]
 				}
-				args = append(args, e.coerce(e.expr(a), a.GetType(), want))
+				ops = append(ops, seqOperand{x: a, text: e.coerce(e.expr(a), a.GetType(), want)})
 			}
-			if nf.recv != "" && len(args) > 0 {
-				args[0] = "(" + nf.recv + ")" + args[0]
+			if nf.recv != "" && len(ops) > 0 {
+				ops[0].text = "(" + nf.recv + ")" + ops[0].text
 			}
-			return "(" + e.ctype(ct) + ")" + nf.fn + "(" + strings.Join(args, ", ") + ")"
+			return e.callTo(ops, "("+e.ctype(ct)+")"+nf.fn+"(", ")")
 		}
 	}
 	if fn, ok := specialNew[cl.Name]; ok && len(v.Args) == 0 {
@@ -2045,7 +2517,7 @@ func (e *Emitter) newExpr(v *ast.New) string {
 		fmt.Fprintf(&b, " %s", strings.TrimSuffix(init, "\n"))
 	}
 	if v.Ctor != nil {
-		fmt.Fprintf(&b, " %s(%s);", e.cfunc(v.Ctor), e.argsWithCaptures(n, v, cl))
+		fmt.Fprintf(&b, " %s;", e.callTo(e.argsWithCaptures(n, v, cl), e.cfunc(v.Ctor)+"(", ")"))
 	}
 	fmt.Fprintf(&b, " %s; })", n)
 	return b.String()
@@ -2055,13 +2527,12 @@ func (e *Emitter) newExpr(v *ast.New) string {
 // declared inside a method captures the locals of it that its body uses -- an
 // anonymous class and a local class both -- and receives them as trailing
 // parameters after the ones it declares.
-func (e *Emitter) argsWithCaptures(n string, v *ast.New, cl *ast.Class) string {
-	a := e.args(n, v.Args, v.Ctor)
+func (e *Emitter) argsWithCaptures(n string, v *ast.New, cl *ast.Class) []seqOperand {
+	a := e.args(seqOperand{text: n}, v.Args, v.Ctor)
 	for _, cv := range e.prog.CapturedVars(cl) {
-		if a != "" {
-			a += ", "
-		}
-		a += e.coerce(e.localName(cv), cv.Type, cv.Type)
+		// a captured local is read out of this frame's variable, which no call
+		// and no assignment in the same expression can change
+		a = append(a, seqOperand{text: e.coerce(e.localName(cv), cv.Type, cv.Type)})
 	}
 	return a
 }
@@ -2145,11 +2616,37 @@ func (e *Emitter) newArray(v *ast.NewArray) string {
 // at all, because the empty brackets are part of the type rather than a level
 // to construct.
 func (e *Emitter) newArrayDims(elem ast.Type, dims []ast.Expr) string {
-	dim := "0"
-	if len(dims) > 0 {
-		dim = e.expr(dims[0])
-	}
 	if len(dims) <= 1 {
+		dim := "0"
+		if len(dims) == 1 {
+			dim = e.expr(dims[0])
+		}
+		return e.newArrayLevel(elem, []string{dim})
+	}
+	// Every dimension whose length was written is evaluated once, left to right,
+	// before anything is allocated (JLS 15.10.2). It used to be evaluated where
+	// the array it describes is allocated instead, which for a dimension after
+	// the first is inside the loop that fills the level above it: `new
+	// int[f()][g()]` ran g() once per element of the first dimension, and the
+	// JDK runs it once.
+	var head strings.Builder
+	lens := make([]string, len(dims))
+	for i, d := range dims {
+		n := e.tmpName()
+		fmt.Fprintf(&head, "int64_t %s = (int64_t)(%s); ", n, e.expr(d))
+		lens[i] = n
+	}
+	return "({ " + head.String() + e.newArrayLevel(elem, lens) + "; })"
+}
+
+// newArrayLevel builds the expression that allocates one dimension of an array,
+// given the lengths of the dimensions that were written, outermost first.
+func (e *Emitter) newArrayLevel(elem ast.Type, lens []string) string {
+	dim := "0"
+	if len(lens) > 0 {
+		dim = lens[0]
+	}
+	if len(lens) <= 1 {
 		es := e.elemSize(elem)
 		refs := "0"
 		if e.isRefElem(elem) {
@@ -2165,7 +2662,7 @@ func (e *Emitter) newArrayDims(elem ast.Type, dims []ast.Expr) string {
 	if at, ok := elem.(*ast.ArrayType); ok {
 		inner = at.Elem
 	}
-	alloc := e.newArrayDims(inner, dims[1:])
+	alloc := e.newArrayLevel(inner, lens[1:])
 	n := e.tmpName()
 	i := e.tmpName()
 	var b strings.Builder

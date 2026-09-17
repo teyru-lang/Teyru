@@ -626,15 +626,15 @@ func (e *Emitter) nativeCall(m *ast.Method, recv string, args []ast.Expr) string
 		// wrong -- so the call fails loudly where it is made instead.
 		return "({ ty_unimplemented(" + e.cstr(m.Owner.Full+"."+m.Name) + "); 0; })"
 	}
-	vals := make([]string, 0, len(args))
+	vals := make([]seqOperand, 0, len(args))
 	for i, a := range args {
 		var want ast.Type
 		if i < len(m.Params) {
 			want = m.Params[i]
 		}
-		vals = append(vals, e.coerce(e.expr(a), a.GetType(), want))
+		vals = append(vals, seqOperand{x: a, text: e.coerce(e.expr(a), a.GetType(), want)})
 	}
-	return e.nativeInlineCall(nf, m, recv, vals)
+	return e.nativeInlineCall(nf, m, seqOperand{text: recv}, vals)
 }
 
 // nativeInlineCall renders the call to a bound helper: the receiver, then the
@@ -644,26 +644,27 @@ func (e *Emitter) nativeCall(m *ast.Method, recv string, args []ast.Expr) string
 // forgotten by the other -- forgotten clsArg is a missing argument and a
 // mismatched prototype, which the C compiler reports as an error inside the
 // runtime's header.
-func (e *Emitter) nativeInlineCall(nf nativeFn, m *ast.Method, recv string, vals []string) string {
+func (e *Emitter) nativeInlineCall(nf nativeFn, m *ast.Method, recv seqOperand, vals []seqOperand) string {
 	var call string
 	if t := e.psTwin(m, nf); t != nil {
 		// The receiver comes first: which descriptor the text goes to is a
 		// property of the PrintStream object, not of the method.
-		body := t.name + "(" + strings.Join(append([]string{"(void*)" + recv}, vals...), ", ") + ")"
+		all := append(withReceiver(recv, "(void*)"), vals...)
+		body := e.callTo(all, t.name+"(", ")")
 		call = "({ extern " + t.proto + "; " + body + "; })"
 	} else if nf.clsArg != "" {
 		if cl := e.prog.LookupClass(nf.clsArg); cl != nil {
-			all := append([]string{}, vals...)
-			all = append(all, "(tyclass*)&cls_"+mangle(cl.Full))
-			call = nf.fn + "(" + strings.Join(all, ", ") + ")"
+			all := append([]seqOperand{}, vals...)
+			all = append(all, seqOperand{text: "(tyclass*)&cls_" + mangle(cl.Full)})
+			call = e.callTo(all, nf.fn+"(", ")")
 		} else {
 			call = "0"
 		}
 	} else if nf.selClass != "" {
 		if cl := e.prog.LookupClass(nf.selClass); cl != nil && e.selectorOf(cl, nf.selMethod) >= 0 {
-			all := append([]string{}, vals...)
-			all = append(all, fmt.Sprintf("(int32_t)%d", e.selectorOf(cl, nf.selMethod)))
-			call = nf.fn + "(" + strings.Join(all, ", ") + ")"
+			all := append([]seqOperand{}, vals...)
+			all = append(all, seqOperand{text: fmt.Sprintf("(int32_t)%d", e.selectorOf(cl, nf.selMethod))})
+			call = e.callTo(all, nf.fn+"(", ")")
 		} else {
 			// No such interface method in this program, so there is nothing to
 			// dispatch to. A helper called without its selector would read
@@ -675,21 +676,22 @@ func (e *Emitter) nativeInlineCall(nf nativeFn, m *ast.Method, recv string, vals
 		// getClass hands the runtime the tyclass of this program's Class, so
 		// that the object it returns is an instance of it.
 		cl := e.prog.LookupClass(nf.classHint)
-		all := append([]string{"(void*)" + recv}, vals...)
-		all = append(all, "(void*)&cls_"+mangle(cl.Full))
-		call = "({ extern " + classOfProto + "; ty_class_of_cls(" + strings.Join(all, ", ") + "); })"
+		all := withReceiver(recv, "(void*)")
+		all = append(all, vals...)
+		all = append(all, seqOperand{text: "(void*)&cls_" + mangle(cl.Full)})
+		call = "({ extern " + classOfProto + "; " + e.callTo(all, "ty_class_of_cls(", ")") + "; })"
 	} else {
-		var parts []string
+		var parts []seqOperand
 		if m.IsStatic() {
 			// for static natives the cast describes the first argument
 			if nf.recv != "" && len(vals) > 0 {
-				vals[0] = "(" + nf.recv + ")" + vals[0]
+				vals[0].text = "(" + nf.recv + ")" + vals[0].text
 			}
 		} else if nf.recv != "" {
-			parts = append(parts, "("+nf.recv+")"+recv)
+			parts = append(parts, withReceiver(recv, "("+nf.recv+")")...)
 		}
 		parts = append(parts, vals...)
-		call = nf.fn + "(" + strings.Join(parts, ", ") + ")"
+		call = e.callTo(parts, nf.fn+"(", ")")
 		if nf.proto != "" {
 			call = "({ extern " + nf.proto + "; " + call + "; })"
 		}

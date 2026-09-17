@@ -2,7 +2,6 @@ package codegen
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/teyru-lang/Teyru/internal/ast"
 )
@@ -140,16 +139,17 @@ func (e *Emitter) emitEnumInit(cl *ast.Class) {
 			ctor = enumCtor(cl, len(ec.Args))
 		}
 		if ctor != nil {
-			args := make([]string, 0, len(ec.Args)+1)
-			args = append(args, "("+cname(cls)+"*)"+g)
+			// the receiver is a fresh object this body just allocated, so it is
+			// the constant's own arguments that sequence here
+			ops := []seqOperand{{text: "(" + cname(cls) + "*)" + g}}
 			for i, a := range ec.Args {
 				var want ast.Type
 				if i < len(ctor.Params) {
 					want = ctor.Params[i]
 				}
-				args = append(args, e.coerce(e.expr(a), a.GetType(), want))
+				ops = append(ops, seqOperand{x: a, text: e.coerce(e.expr(a), a.GetType(), want)})
 			}
-			e.line("%s(%s);\n", e.cfunc(ctor), strings.Join(args, ", "))
+			e.line("%s;\n", e.callTo(ops, e.cfunc(ctor)+"(", ")"))
 		}
 	}
 	// reflection's table, filled once every constant exists: the address of a
