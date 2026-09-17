@@ -1,8 +1,10 @@
 # AGENTS.md — Teyru 專案工作規範
 
 > 適用對象：本儲存庫內所有人類貢獻者與 Coding Agents。
-> 版本 3.1（2026-09-14）。v1.0 是 Java/JVM 時期的規範，已於 v2.0 作廢；本版補齊
-> util 分離、禁止佔位、文件與測試的完整規範，並記下拆分之後的倉庫佈局。
+> 版本 3.2（2026-09-17）。v1.0 是 Java/JVM 時期的規範，已於 v2.0 作廢；3.1 補齊
+> util 分離、禁止佔位、文件與測試的完整規範，並記下拆分之後的倉庫佈局；3.2 加入
+> 三條規則（JDK 差分測試、網路程式碼的對抗測試、文件聲明要指得到測試）與文件站的
+> 手動部署步驟。
 
 ---
 
@@ -47,6 +49,9 @@
 3. 「支援某語言特性」的定義是：`tests/programs/` 有對應程式，且
    `go test ./...` 通過。只會剖析不算支援。
 4. 不確定的事情寫「未驗證」，不要寫成已完成。
+5. **文件裡的每一條能力聲明都要指得到測試。** 文件站上寫「支援 X」的地方要說得出是哪一個
+   `tests/programs/*.teyru`（或 `internal/**/*_test.go`）在驗它；指不出來的就刪掉，或改寫成
+   「尚未實作」／「未驗證」。第 3 條定義什麼算支援，這一條管文件怎麼寫，兩者是同一條規則的兩端。
 
 ---
 
@@ -129,6 +134,18 @@ source → lexer → parser → ast → sema → codegen
 - **診斷**：在 `driver_test.go` 的 `TestDiagnostics` 加入「應該被拒絕」的案例與期望
   錯誤碼。
 - **單元**：`internal/util` 等純函式要有 table-driven 測試。
+- **Java 語意的改動一定要附 JDK 差分測試。** 語意的參考實作是 OpenJDK 21，期望輸出由真的
+  JDK 跑出來、不許手寫。動到任何可觀察語意（數值轉換與窄化、字串與 Unicode 的索引、裝箱
+  的身分、集合的迭代順序、例外的類別名與訊息、格式化）就在 `tests/programs/` 或
+  `tests/java-compat/` 加一個兩邊都跑的程式，並在 PR 裡貼差分結果。理由不是形式：這個專案
+  有兩個後端，而「與 Java 相同」是可以查 JDK 驗證的一句話，沒有測試撐著它就只是宣稱。
+- **面向外部輸入的程式碼一定要附對抗測試。** `lib/15_net.teyru`、`lib/18_web.teyru`、
+  `lib/30_websocket.teyru`、`lib/32_http_client.teyru` 這類讀網路（以及 `lib/46_timezone.teyru`
+  這類讀主機檔案）的程式碼，每一個上限、逾時與長度檢查都要有測試盯著，而且測的是**不利的
+  形狀**：慢速客戶端（一條連線一次一個位元組）、宣告長度遠超上限
+  （`Content-Length: 1000000000`）、請求頭不結束、對端連上就不說話（逾時）、以及一個正常
+  情形當對照。**沒有測試的上限不算上限**——失敗模式不是自己的程式壞掉，是別人的程式把伺服器
+  帶走。
 - 修 bug 的順序固定：先寫一個會失敗的測試 → 修到通過 → 再提交。
 - 提交前至少跑：
 
@@ -181,8 +198,24 @@ source → lexer → parser → ast → sema → codegen
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
 
-文件站在 `teyru-lang/docs`，`README` 的英／日／簡中版本也在那裡（對應語言的頁面），
-四種語言的內容要一致：改了其中一份就要改其餘的結構。
+文件站在 `teyru-lang/docs`，`README` 的**英**與**簡中**版本也在那裡（對應語言的頁面）。
+網站有三個 locale：`zh-TW`（正本，不翻譯也不改寫）、`zh-CN` 與 `en`，內容要一致——
+改了其中一份就要改其餘兩份的結構（程式碼區塊、識別字與路徑照抄，只翻散文）。
+
+**文件站的部署是手動的，push 不會部署。** 2026-09-17 查過 Vercel 專案 `teyru-docs`
+（team `langyas-projects`）：它的 `link` 是空的，也就是**沒有接 Git**；每一筆 production
+部署的來源都是 `cli`、建立者是 owner 的帳號。所以改完文件要自己部署，否則線上站就落後於
+倉庫（實際發生過：線上站少了 `main` 上已有的三節內容）：
+
+```sh
+cd ../docs
+vercel link            # 第一次：選專案 teyru-docs
+vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
+```
+
+網域 `docs.teyru.dev` 在 Cloudflare 是一筆 **DNS-only** 的 CNAME 指到
+`cname.vercel-dns.com`（不要開代理，憑證由 Vercel 簽）。要改成 push 自動部署，得先由 owner
+把 Vercel 的 GitHub App 授權給 `teyru-lang` 組織；在那之前一律手動，清單上就有這一步。
 
 ---
 
@@ -431,5 +464,8 @@ source → lexer → parser → ast → sema → codegen
 - [ ] 沒有多行 TODO 或空殼實作；未實作路徑會明確失敗
 - [ ] 共用邏輯在 `internal/util`，沒有兩份實作
 - [ ] 執行期 C 在 `-Wall -Wextra` 下無警告
+- [ ] `make notices` 綠；動過 `internal/runtime/src` 或第三方宣告時已用
+      `scripts/check-notices.sh --write` 重新產生清單
 - [ ] 行為改變時，`teyru-lang/docs` 的對應頁面已同步（文件只有那一份）
+- [ ] 改了 `teyru-lang/docs` 就自己部署（`cd ../docs && vercel deploy --prod`，見 §9）
 - [ ] commit 訊息符合 §8，且沒有 AI 署名
