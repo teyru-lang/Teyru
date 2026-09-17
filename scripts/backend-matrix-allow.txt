@@ -14,32 +14,22 @@
 # given a reason -- the same rule as the other two account files. "It is only the
 # LLVM back end" is not a reason; *which* rule of the language one of them gets
 # wrong is.
-
-# --- the evaluation order of a string-concatenation chain (W8, the string
-#     concatenation family). The C back end folds `a + b + c + ...` into one C
+#
+# --- the evaluation order of a string-concatenation chain (W8) has no entries
+#     here any more. The C back end folded `a + b + c + ...` into one C
 #     expression, and C leaves the order in which that expression's operands are
 #     evaluated unspecified, where Java fixes it left to right (JLS 15.7) -- so
-#     the same generated C answers differently under the two C compilers
-#     whenever an operand has a side effect (a method call, `++`). gcc evaluates
-#     the chain right to left and clang left to right. Minimal reproduction, with
-#     javac 21 as the arbiter:
+#     the same generated C answered differently under the two C compilers
+#     whenever an operand had a side effect. t114_stream, t116_text,
+#     t117_util_misc, t144_lombok_parity and t145_teyru_star_import were the
+#     five programs a completed matrix run found with that signature, and the
+#     run could not name the rule for a case in tests/programs, because such a
+#     case passes under clang and fails under gcc and tests/known-failures.txt
+#     has no way to say one without the other.
 #
-#       static int n = 0
-#       static String f(int k) { n = n + 1  return "" + k + "(" + n + ")" }
-#       System.out.println(f(1) + f(2) + f(3))      // JDK and clang: 1(1)2(2)3(3)
-#                                                   // gcc -O0 and -O2: 1(3)2(2)3(1)
-#       int a = 1
-#       System.out.println("" + a++ + a++ + a++)    // JDK and clang: 123, gcc: 321
-#
-#     The five programs below are the ones the completed part of the matrix run
-#     found with this signature (the clang and LLVM cells agree with .expected,
-#     both gcc cells differ). t116 and t117 were attributed with the reproduction
-#     above; t114, t144 and t145 have the same signature and were not attributed
-#     individually. A case for this cannot go in tests/programs today: it passes
-#     with clang and fails with gcc, and tests/known-failures.txt has no way to
-#     say one without the other -- which is what this matrix is for.
-t114_stream W8 both gcc cells answer differently from clang and the LLVM back end (concatenation chain order); not attributed to a single line
-t116_text W8 both gcc cells answer differently from clang and the LLVM back end: the concatenation chain's operands are evaluated right to left (DecimalFormat.parse's ParsePosition side effects)
-t117_util_misc W8 both gcc cells answer differently from clang and the LLVM back end: the concatenation chain's operands are evaluated right to left (StringTokenizer hasMoreElements/nextElement/countTokens side effects)
-t144_lombok_parity W8 both gcc cells answer differently from clang and the LLVM back end (concatenation chain order); not attributed to a single line
-t145_teyru_star_import W8 both gcc cells answer differently from clang and the LLVM back end (concatenation chain order); not attributed to a single line
+#     The generator now binds the operands that have to be bound to temporaries
+#     in Java's order (`sequence`, internal/codegen/emit_expr.go), which is the
+#     rule AGENTS.md §10 records, and tests/programs/t260_eval_order.teyru is
+#     the case that could not be written before. All five programs agree with
+#     the suite in every cell; a divergence here again means the rule has been
+#     broken again, not that it is being excused.

@@ -461,7 +461,7 @@ func (e *Emitter) stackNew(vd *ast.VarDeclarator, nw *ast.New, ct, name string) 
 		e.line("%s.f_%s = (%s*)%s;\n", slot, mangle(cl.OuterField.Name), cname(cl.Outer), e.outerArg(nw, cl.Outer))
 	}
 	e.line("%s", e.clinitStmt(cl))
-	e.line("%s(%s);\n", e.cfunc(nw.Ctor), e.argsWithCaptures("&"+slot, nw, cl))
+	e.line("%s;\n", e.callTo(e.argsWithCaptures("&"+slot, nw, cl), e.cfunc(nw.Ctor)+"(", ")"))
 	e.line("%s %s = &%s;\n", ct, name, slot)
 }
 
@@ -474,7 +474,7 @@ func (e *Emitter) exprStmt(x ast.Expr) {
 			if v.Super {
 				recv = "((void*)this)"
 			}
-			e.line("%s(%s);\n", e.cfunc(v.Method), e.args(recv, v.Args, v.Method))
+			e.line("%s;\n", e.callTo(e.args(seqOperand{text: recv}, v.Args, v.Method), e.cfunc(v.Method)+"(", ")"))
 			return
 		}
 		e.line("%s;\n", e.callExpr(v))
@@ -490,31 +490,34 @@ func (e *Emitter) exprStmt(x ast.Expr) {
 }
 
 // args renders the C argument list of a call, inserting conversions.
-func (e *Emitter) args(recv string, list []ast.Expr, m *ast.Method) string {
+func (e *Emitter) args(recv seqOperand, list []ast.Expr, m *ast.Method) []seqOperand {
 	return e.argsFor(recv, list, m, nil)
 }
 
 // argsFor renders a call's argument list; call is used to consult the varargs
-// decision made during overload resolution and may be nil.
-func (e *Emitter) argsFor(recv string, list []ast.Expr, m *ast.Method, call *ast.Call) string {
+// decision made during overload resolution and may be nil. The receiver, when
+// there is one, is the first operand: Java evaluates a call's target before its
+// arguments (JLS 15.12.4.1), and the arguments in the order they are written
+// (JLS 15.12.4.2).
+func (e *Emitter) argsFor(recv seqOperand, list []ast.Expr, m *ast.Method, call *ast.Call) []seqOperand {
 	if call != nil && m != nil && m.Varargs && e.prog.VarargsDirect(call) {
-		var parts []string
-		if recv != "" && !m.IsStatic() {
-			parts = append(parts, "("+cname(m.Owner)+"*)"+recv)
+		var parts []seqOperand
+		if recv.text != "" && !m.IsStatic() {
+			parts = append(parts, receiver(recv.x, "("+cname(m.Owner)+"*)"+recv.text))
 		}
 		for i, a := range list {
 			var want ast.Type
 			if i < len(m.Params) {
 				want = m.Params[i]
 			}
-			parts = append(parts, e.coerce(e.expr(a), a.GetType(), want))
+			parts = append(parts, seqOperand{x: a, text: e.coerce(e.expr(a), a.GetType(), want)})
 		}
-		return strings.Join(parts, ", ")
+		return parts
 	}
-	var parts []string
-	if recv != "" && m != nil && !m.IsStatic() {
-		parts = append(parts, "("+cname(m.Owner)+"*)"+recv)
-	} else if recv != "" && m == nil {
+	var parts []seqOperand
+	if recv.text != "" && m != nil && !m.IsStatic() {
+		parts = append(parts, receiver(recv.x, "("+cname(m.Owner)+"*)"+recv.text))
+	} else if recv.text != "" && m == nil {
 		parts = append(parts, recv)
 	}
 	for i, a := range list {
@@ -542,32 +545,33 @@ func (e *Emitter) argsFor(recv string, list []ast.Expr, m *ast.Method, call *ast
 				want = m.Params[i]
 			}
 		}
-		parts = append(parts, e.coerce(e.expr(a), a.GetType(), want))
+		parts = append(parts, seqOperand{x: a, text: e.coerce(e.expr(a), a.GetType(), want)})
 	}
 	// varargs packing, unless overload resolution chose to pass the array itself
 	if m != nil && m.Varargs {
 		direct := call != nil && e.prog.VarargsDirect(call)
 		if !direct && call != nil {
-			e.packVarargs(&parts, list, m)
+			parts = e.packVarargs(parts, m)
 		} else if call == nil && len(list) != len(m.Params) {
-			e.packVarargs(&parts, list, m)
+			parts = e.packVarargs(parts, m)
 		}
 	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.Join(parts, ", ")
+	return parts
 }
 
-func (e *Emitter) packVarargs(parts *[]string, list []ast.Expr, m *ast.Method) {
+// packVarargs gathers the trailing arguments into the array the variable-arity
+// parameter is declared with. The array is built by one statement expression,
+// so the elements are stored in the order they were written; the operand it
+// becomes holds the side effects the elements have, which is what `effect` says.
+func (e *Emitter) packVarargs(parts []seqOperand, m *ast.Method) []seqOperand {
 	// the last parameter is an array; gather the remaining arguments into one
 	n := len(m.Params) - 1
 	off := boolToInt(!m.IsStatic())
-	head := []string{}
-	tail := *parts
-	if len(*parts) >= n+off {
-		head = (*parts)[:n+off]
-		tail = (*parts)[n+off:]
+	head := []seqOperand{}
+	tail := parts
+	if len(parts) >= n+off {
+		head = parts[:n+off]
+		tail = parts[n+off:]
 	}
 	elem := m.Params[len(m.Params)-1].(*ast.ArrayType).Elem
 	es := e.elemSize(elem)
@@ -578,13 +582,13 @@ func (e *Emitter) packVarargs(parts *[]string, list []ast.Expr, m *ast.Method) {
 	}
 	for i, t := range tail {
 		if e.isRef(elem) {
-			fmt.Fprintf(&b, " ((void**)_va->data)[%d] = (void*)%s;", i, t)
+			fmt.Fprintf(&b, " ((void**)_va->data)[%d] = (void*)%s;", i, t.text)
 		} else {
-			fmt.Fprintf(&b, " ((%s*)_va->data)[%d] = %s;", e.ctype(elem), i, t)
+			fmt.Fprintf(&b, " ((%s*)_va->data)[%d] = %s;", e.ctype(elem), i, t.text)
 		}
 	}
 	b.WriteString(" _va; })")
-	*parts = append(head, b.String())
+	return append(head, seqOperand{effect: true, text: b.String()})
 }
 
 func boolToInt(b bool) int {

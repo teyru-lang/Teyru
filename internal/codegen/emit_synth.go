@@ -45,13 +45,16 @@ func (e *Emitter) emitSynthetic(cl *ast.Class, m *ast.Method) {
 		return
 	}
 	if nf, ok := nativeTable[nativeKey(m)]; ok {
-		args := make([]string, 0, len(m.Params))
+		// A synthesized body has no AST for its arguments: they are the
+		// parameters it was handed, so there is nothing left to evaluate in any
+		// order and the operands carry no side effect.
+		args := make([]seqOperand, 0, len(m.Params))
 		for i := range m.Params {
-			args = append(args, fmt.Sprintf("a%d", i))
+			args = append(args, seqOperand{text: fmt.Sprintf("a%d", i)})
 		}
-		recv := ""
+		recv := seqOperand{}
 		if !m.IsStatic() {
-			recv = "this"
+			recv = seqOperand{text: "this"}
 		}
 		// nativeInlineCall is where the receiver cast, the appended class and
 		// the helper's own prototype are applied, so a synthesized native and a
