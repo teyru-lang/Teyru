@@ -8,7 +8,7 @@ BIN     ?= teyru
 OPT     ?= -O2
 PREFIX  ?= /usr/local
 
-.PHONY: all build test test-go test-programs submodule bench fmt vet lint check hooks clean install examples
+.PHONY: all build test test-go test-programs submodule bench fmt vet lint notices check hooks clean install examples
 
 all: build
 
@@ -58,6 +58,15 @@ examples: build
 bench: build
 	./scripts/bench.sh
 
+## notices: check THIRD-PARTY-NOTICES.md against the tree
+#
+# Fails when the notices and the repository disagree: the runtime file list, the
+# OpenSSL version floor, the Windows target's link flags, where the time zone
+# data comes from, the licence files, and the Unicode data files once they are
+# in the tree. `scripts/check-notices.sh --write` regenerates the file list.
+notices:
+	./scripts/check-notices.sh
+
 ## fmt: format Go sources
 fmt:
 	$(GO) fmt ./...
@@ -72,7 +81,7 @@ lint: vet
 	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 
 ## check: what to run before every commit (fast, no network)
-check: lint test
+check: lint notices test
 	@echo "check: ok"
 
 ## hooks: install the pre-commit hook that runs `make check`
