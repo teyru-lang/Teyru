@@ -1,0 +1,322 @@
+package teyru
+
+// The wire half of testing a server: a client that writes bytes and reads
+// answers.
+//
+// MockServer is the other half, and it is the one to reach for first: it asks a
+// route a question without a socket, which is what most tests of a route need.
+// This is for the questions that are *about* the wire -- a request that arrives
+// in two pieces, a header with no value, two requests on one connection, a
+// WebSocket frame split across two writes -- because those are answered by the
+// connection loop rather than by a route, and the only way to ask them is to be
+// a client.
+//
+// It lives in the standard library because a test program is one file: there is
+// nowhere else for two tests to share a class, and a helper that each test
+// writes again is a helper that each test gets subtly wrong. Nothing here is
+// reachable from a program that does not name it, so a program that ships does
+// not carry it.
+
+// RawResponse is what a RawClient read: the status line, the headers as they
+// arrived -- repeated headers and all, which is what Set-Cookie makes -- and the
+// body its framing said to read.
+class RawResponse {
+  public String statusLine = ""
+  public int status = 0
+  public String body = ""
+  // chunked is a fact about the wire the decoded body no longer shows: the
+  // body arrived as chunks rather than with a length.
+  public boolean chunked = false
+  private List<String> headerNames = new ArrayList<String>()
+  private List<String> headerValues = new ArrayList<String>()
+
+  public void addHeader(String name, String value) {
+    headerNames.add(name)
+    headerValues.add(value)
+  }
+
+  // header answers the first header of that name, or "". A test that cares
+  // about a header that may arrive twice -- Set-Cookie -- asks by index.
+  public String header(String name) {
+    for (int i = 0 : i < headerNames.size() : i++) {
+      if (headerNames.get(i).toLowerCase().equals(name.toLowerCase())) {
+        return headerValues.get(i)
+      }
+    }
+    return ""
+  }
+
+  public int headerCount() {
+    return headerNames.size()
+  }
+
+  public String headerName(int i) {
+    return headerNames.get(i)
+  }
+
+  public String headerValue(int i) {
+    return headerValues.get(i)
+  }
+
+}
+
+// RawClient is a client that speaks bytes over a socket. What it does not have
+// is the thing that would make it useless here: an opinion about what a request
+// is. send() writes what it is given, so half a request is a request a test can
+// write.
+class RawClient {
+  private Socket socket
+  private SocketInputStream in
+  private SocketOutputStream out
+
+  // Five seconds for every read, which is long enough that a slow machine does
+  // not fail a test and short enough that a server which never answers is a
+  // SocketTimeoutException the test reports rather than a suite that hangs. The
+  // deadline is what makes "the server must answer" a test rather than a hope.
+  public RawClient(int port) {
+    this(port, 5000)
+  }
+
+  public RawClient(int port, int timeoutMs) {
+    this.socket = new Socket("127.0.0.1", port)
+    this.socket.setSoTimeout(timeoutMs)
+    this.in = socket.getInputStream()
+    this.out = socket.getOutputStream()
+  }
+
+  // send puts bytes on the wire and flushes them. Every send is its own write,
+  // which is the point: a request split across two sends is a request the
+  // server reads in two pieces, and that is a thing a test means to do.
+  public RawClient send(String bytes) {
+    out.write(bytes)
+    out.flush()
+    return this
+  }
+
+  // sendBytes is send for a body that is not text.
+  public RawClient sendBytes(byte[] bytes) {
+    out.write(bytes)
+    out.flush()
+    return this
+  }
+
+  // disconnect closes this half of the connection while leaving the read half
+  // open: the client vanishes in the middle of what it was sending and the
+  // server sees an end of stream where the rest of a body should have been.
+  public RawClient disconnect() {
+    socket.shutdownOutput()
+    return this
+  }
+
+  public int readByte() {
+    return in.read()
+  }
+
+  // readFully is exactly len bytes off the stream, which is what a body framed
+  // by a length or by chunks is: a short read is not a short body, it is a
+  // connection that ended in the middle of one.
+  private byte[] readFully(int len) {
+    byte[] buf = new byte[len]
+    in.readFully(buf, 0, len)
+    return buf
+  }
+
+  // read reads one whole answer: the status line, the headers, and the body its
+  // framing names -- a length, chunks, or nothing at all, in which case the body
+  // ends when the connection does. An interim answer (1xx) is read as it stands
+  // and the real answer is the next read, which is what makes a 100-continue
+  // testable.
+  //
+  // A connection that ends before a status line answers null, which is "no
+  // answer", and is not the same thing as an answer that says so.
+  public RawResponse read() {
+    RawResponse res = readHead()
+    if (res == null) {
+      return null
+    }
+    int length = res.header("Content-Length").length() == 0 ? -1 : Integer.parseInt(res.header("Content-Length"))
+    // 1xx is an interim answer, and 204 and 304 have no body whatever their
+    // headers say; anything else is read by the framing the headers gave it.
+    if (res.status >= 100 && res.status < 200) {
+      return res
+    }
+    if (res.status == 204 || res.status == 304) {
+      return res
+    }
+    if (res.chunked) {
+      res.body = readChunks()
+      return res
+    }
+    if (length > 0) {
+      res.body = Net.stringFrom(readFully(length), 0, length)
+      return res
+    }
+    if (length == 0) {
+      return res
+    }
+    // no length and no chunks: the body ends when the connection does. A
+    // handler that answers like this is one the client cannot tell from a
+    // server that is still thinking, which is why nothing writes one.
+    StringBuilder b = new StringBuilder()
+    while (true) {
+      int c = in.read()
+      if (c < 0) {
+        break
+      }
+      b.append((char) c)
+    }
+    res.body = b.toString()
+    return res
+  }
+
+  // readChunks reads a chunked body and the trailers after it, which is what a
+  // client does with them: nothing, but it has to read them or the next answer
+  // on the connection is read from the middle of this one.
+  private String readChunks() {
+    StringBuilder b = new StringBuilder()
+    while (true) {
+      String size = in.readLine()
+      if (size == null) {
+        break
+      }
+      int semi = size.indexOf(';')
+      int n = Integer.parseInt((semi >= 0 ? size.substring(0, semi) : size).trim(), 16)
+      if (n == 0) {
+        // the trailer section ends at the blank line, and a body with no
+        // trailers has that one line: reading only one line here would leave
+        // the rest of the section in front of the next answer
+        while (true) {
+          String trailer = in.readLine()
+          if (trailer == null || trailer.isEmpty()) {
+            break
+          }
+        }
+        break
+      }
+      b.append(Net.stringFrom(readFully(n), 0, n))
+      in.readLine()
+    }
+    return b.toString()
+  }
+
+  // readHead reads a status line and the headers and stops there, which is what
+  // a client does with the answer to a HEAD: the headers are the answer, and the
+  // length they name is a length of a body that was not sent. A test that used
+  // read() for one would eat the first bytes of the next answer.
+  public RawResponse readHead() {
+    String statusLine = in.readLine()
+    if (statusLine == null) {
+      return null
+    }
+    RawResponse res = new RawResponse()
+    res.statusLine = statusLine
+    res.status = statusOf(statusLine)
+    while (true) {
+      String line = in.readLine()
+      if (line == null || line.isEmpty()) {
+        break
+      }
+      int colon = line.indexOf(':')
+      if (colon <= 0) {
+        continue
+      }
+      String name = line.substring(0, colon).trim()
+      String value = line.substring(colon + 1).trim()
+      res.addHeader(name, value)
+      if (name.toLowerCase().equals("transfer-encoding") && value.toLowerCase().indexOf("chunked") >= 0) {
+        res.chunked = true
+      }
+    }
+    return res
+  }
+
+  // readFrame reads one frame a server sent. A server's frames are never
+  // masked, so this is WebSocketFrame.read without the mask -- and it is here
+  // rather than in each test because reading a frame wrong is a way to make a
+  // frame test pass for the wrong reason.
+  public WebSocketFrame readFrame() {
+    int b0 = in.read()
+    if (b0 < 0) {
+      return null
+    }
+    int b1 = in.read()
+    if (b1 < 0) {
+      return null
+    }
+    WebSocketFrame f = new WebSocketFrame()
+    f.fin = (b0 & 0x80) != 0
+    f.opcode = b0 & 0x0f
+    long len = b1 & 0x7f
+    if (len == 126) {
+      len = ((long) in.read() << 8) | (long) in.read()
+    } else if (len == 127) {
+      len = 0
+      for (int i = 0 : i < 8 : i++) {
+        len = (len << 8) | (long) in.read()
+      }
+    }
+    f.payload = new byte[(int) len]
+    in.readFully(f.payload, 0, f.payload.length)
+    return f
+  }
+
+  // sendFrame writes one frame the way a client must: masked, with the four
+  // bytes of the key repeating over the payload. A test that means to send an
+  // unmasked frame -- which a server is right to refuse -- writes it by hand
+  // with sendBytes.
+  public RawClient sendFrame(int opcode, String text, boolean fin) {
+    return sendFrame(opcode, text.getBytes(), fin)
+  }
+
+  public RawClient sendFrame(int opcode, byte[] payload, boolean fin) {
+    out.write(maskedBytes(opcode, payload, fin))
+    out.flush()
+    return this
+  }
+
+  // maskedBytes is one client frame as bytes, without sending it, so that a
+  // test can send half of a frame and then the other half: sendFrame above is
+  // this and one write, and a frame that arrives in two pieces is a frame the
+  // server has to read in two pieces.
+  public static byte[] maskedBytes(int opcode, byte[] payload, boolean fin) {
+    byte[] mask = { 0x12, 0x34, 0x56, 0x78 }
+    int extra = payload.length <= WebSocketFrame.SHORT_MAX ? 0 : (payload.length <= 65535 ? 2 : 8)
+    byte[] frame = new byte[2 + extra + 4 + payload.length]
+    frame[0] = (byte) ((fin ? 0x80 : 0x00) | (opcode & 0x0f))
+    if (extra == 0) {
+      frame[1] = (byte) (0x80 | payload.length)
+    } else if (extra == 2) {
+      frame[1] = (byte) 0xfe
+      frame[2] = (byte) ((payload.length >> 8) & 0xff)
+      frame[3] = (byte) (payload.length & 0xff)
+    } else {
+      frame[1] = (byte) 0xff
+      long n = payload.length
+      for (int i = 0 : i < 8 : i++) {
+        frame[2 + i] = (byte) ((n >> ((7 - i) * 8)) & 0xff)
+      }
+    }
+    for (int i = 0 : i < 4 : i++) {
+      frame[2 + extra + i] = mask[i]
+    }
+    for (int i = 0 : i < payload.length : i++) {
+      frame[2 + extra + 4 + i] = (byte) (payload[i] ^ mask[i % 4])
+    }
+    return frame
+  }
+
+  public void close() {
+    socket.close()
+  }
+
+  // statusOf reads the code out of a status line. A line that is not one is an
+  // answer this client cannot read, and saying so here is better than a test
+  // comparing a zero to a status.
+  private static int statusOf(String statusLine) {
+    String[] parts = statusLine.split(" ")
+    if (parts.length < 2) {
+      return 0
+    }
+    return Integer.parseInt(parts[1])
+  }
+}

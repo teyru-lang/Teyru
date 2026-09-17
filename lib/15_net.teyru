@@ -825,7 +825,13 @@ class SocketInputStream extends InputStream {
       pos = pos + n
       return n
     }
-    return socket.read(b, off, len)
+    // The descriptor answers 0 at the end of the stream -- that is read0's
+    // contract, and what fill() checks for -- and this is the layer that speaks
+    // Java, where the end of a stream is -1. Passing the 0 on would be a read
+    // that made no progress to every caller that loops on `have < len`, and
+    // readFully below is one: it would ask again forever rather than throw.
+    int n = socket.read(b, off, len)
+    return n == 0 ? -1 : n
   }
 
   // read(byte[],int,int) until the array is full. The distinction this exists

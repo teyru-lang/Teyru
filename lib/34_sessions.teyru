@@ -164,6 +164,20 @@ class Sessions {
       existing.touch()
       return existing
     }
+    // A session this same request already started, which is the answer a second
+    // call in one request has to get. Without this the second call makes a
+    // second session: the request has no cookie naming the first one -- the
+    // client is not sent it until the answer is written -- so find() above
+    // cannot see it, and the first session is left in the store with nothing
+    // pointing at it. A handler that asks twice in a request is not unusual,
+    // and one entry per request in a store that is only swept when a default
+    // timeout is set is a leak that grows with the traffic.
+    if (req.pendingSession.length() > 0) {
+      HttpSession started = store.get(req.pendingSession)
+      if (started != null) {
+        return started
+      }
+    }
     HttpSession made = new HttpSession()
     made.id = Sessions.newId()
     made.creationTime = System.currentTimeMillis()
