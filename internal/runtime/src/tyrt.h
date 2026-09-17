@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <setjmp.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Every operating system call the runtime makes is behind this header: the
@@ -645,10 +646,23 @@ void ty_mon_notify_all(void *obj);
    same for a range of a byte[]. */
 tystr *ty_str_new(const char *data, int64_t len);
 tystr *ty_str_intern(const char *data);
+/* The two representations of a string's text meet here. A String is WTF-8
+   bytes; a StringBuilder's buffer is UTF-16 code units, because that is what
+   every index the builder takes counts. ty_str_of_units builds a string out of
+   units -- a high surrogate followed by its low one becomes the one four-byte
+   sequence they are -- and ty_str_units writes a string's units into a caller's
+   array, which must hold ty_str_len of them. */
+tystr *ty_str_of_units(const uint16_t *u, int64_t n);
+int64_t ty_str_units(tystr *s, uint16_t *out);
 tystr *ty_str_of_utf8(const char *data, int64_t len);
 tystr *ty_str_of_bytes(tyarr *b, int32_t off, int32_t len);
 tystr *ty_str_of_bytes_all(tyarr *b);
+/* The two lengths of a string: `ty_str_len` is the UTF-16 code unit count,
+   which is what `String.length()` answers and what every index in the Java API
+   counts, and `ty_str_blen` is the byte count, which is what the byte-oriented
+   boundary -- getBytes, a socket, a file -- means. They agree below 0x80. */
 int64_t ty_str_len(tystr *s);
+int64_t ty_str_blen(tystr *s);
 tystr *ty_str_concat(tystr *a, tystr *b);
 int32_t ty_str_eq(tystr *a, tystr *b);
 int32_t ty_str_cmp(tystr *a, tystr *b);
@@ -795,6 +809,13 @@ void ty_sync_enter(void *lock);
 void ty_sync_exit(void *lock);
 void ty_println_str(tystr *s);
 void ty_print_str(tystr *s);
+/* Writes a string to a stream the way the JDK's UTF-8 encoder would. The stored
+   bytes are already that encoding of everything a string can hold except a
+   surrogate with no partner, which UTF-8 has no encoding for and which the
+   encoder writes as one '?' -- the same rule getBytes follows, so a program
+   that prints and a program that encodes write the same bytes. Every text write
+   in the runtime goes through this. */
+void ty_str_write(FILE *f, tystr *s);
 void ty_print_int(int64_t v);
 void ty_println_int(int64_t v);
 void ty_print_double(double v);
@@ -1022,10 +1043,22 @@ _Static_assert(sizeof(tylongbox) == sizeof(tyobj) + 8, "a box is a header and a 
 _Static_assert(sizeof(tyfloatbox) == sizeof(tyobj) + 8, "a box is a header and a payload");
 _Static_assert(sizeof(tydoublebox) == sizeof(tyobj) + 8, "a box is a header and a payload");
 typedef struct { tyobj obj; int32_t ordinal; tystr *name; } tyEnumBase;
-typedef struct { tyobj obj; int64_t len, cap; char *buf; } tySB;
+/* A StringBuilder's buffer holds UTF-16 code units, not bytes: Java's builder
+   is a char[] and every index it takes or answers -- length, charAt, insert,
+   delete, substring, capacity -- is an index into that. The bytes a String is
+   stored as are the builder's business only at toString and at append(String),
+   which is where the two representations meet. `len` and `cap` are therefore
+   units; `buf` is malloc'd rather than collected, which is why StringBuffer
+   declares its three fields as `long` (lib/02_string.teyru) and the collector
+   never follows it. */
+typedef struct { tyobj obj; int64_t len, cap; uint16_t *buf; } tySB;
 
 void *ty_sb_new(void);
 void *ty_sb_init(void *sb, int64_t cap);
+/* Room for `extra` more code units in the builder's buffer. Internal: every
+   mutator in the two runtime files that grows a buffer calls it, so the
+   doubling rule lives in one place. */
+void ty_sb_reserve(void *sb, int64_t extra);
 void *ty_sb_append_str(void *sb, tystr *s);
 void *ty_sb_append_int(void *sb, int64_t v);
 void *ty_sb_append_long(void *sb, int64_t v);
@@ -1236,6 +1269,18 @@ int32_t ty_str_lastindexof(tystr *s, tystr *sub);
 int32_t ty_str_lastindexof_from(tystr *s, tystr *sub, int32_t from);
 int32_t ty_str_lastindexof_ch(tystr *s, int32_t c);
 int32_t ty_str_lastindexof_ch_from(tystr *s, int32_t c, int32_t from);
+int32_t ty_str_region_matches(tystr *s, int32_t ignore_case, int32_t toff,
+                              tystr *o, int32_t ooff, int32_t len);
+/* The code point family: the units a code point is made of, and the index
+   arithmetic that walks over them. A supplementary code point is two units and
+   lives in one four-byte sequence, so an index into the middle of one is a
+   position Java allows a caller to land on and most of these refuse. */
+int32_t ty_str_code_point_at(tystr *s, int32_t i);
+int32_t ty_str_code_point_before(tystr *s, int32_t i);
+int32_t ty_str_code_point_count(tystr *s, int32_t from, int32_t to);
+int32_t ty_str_offset_by_code_points(tystr *s, int32_t i, int32_t n);
+void ty_str_get_chars(tystr *s, int32_t from, int32_t to, tyarr *dst, int32_t at);
+tystr *ty_str_of_ints(tyarr *cp, int32_t off, int32_t count);
 tystr *ty_str_replace_str(tystr *s, tystr *a, tystr *b);
 tystr *ty_str_repeat(tystr *s, int32_t n);
 tystr *ty_str_strip(tystr *s);

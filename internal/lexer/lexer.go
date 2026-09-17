@@ -416,11 +416,41 @@ func (l *lexer) charLit() {
 	} else {
 		l.pos++
 	}
-	r, _ := utf8.DecodeRuneInString(sb.String())
-	if r > 0xFFFF {
+	r, ok := charUnit(sb.String())
+	if !ok {
 		l.errf(start, "TY-SYN-0008", "character literal does not fit in a char")
 	}
 	l.emit(Token{Kind: CharLit, Text: sb.String(), Int: uint64(r), Off: start, End: l.pos})
+}
+
+// charUnit answers the one code unit a character literal spells, and whether
+// the literal is a single unit at all.
+//
+// The bytes are WTF-8, the encoding a string literal's text is stored in, so a
+// lone surrogate is its three-byte form: Go's own UTF-8 decoder answers U+FFFD
+// for those, and '\uD83D' would become the replacement character instead of the
+// code unit Java writes. A four-byte sequence spells two units -- the pair
+// '\uD83D\uDE00' is one code point and two chars -- so it is not a char
+// literal, which is what javac says about it too.
+func charUnit(s string) (rune, bool) {
+	if s == "" {
+		return 0, false
+	}
+	switch b := s[0]; {
+	case b < 0x80:
+		return rune(b), len(s) == 1
+	case b&0xE0 == 0xC0:
+		if len(s) != 2 {
+			return 0, false
+		}
+		return rune(b&0x1F)<<6 | rune(s[1]&0x3F), true
+	case b&0xF0 == 0xE0:
+		if len(s) != 3 {
+			return 0, false
+		}
+		return rune(b&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), true
+	}
+	return 0, false
 }
 
 func (l *lexer) number() {
