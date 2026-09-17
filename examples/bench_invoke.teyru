@@ -5,9 +5,10 @@
 // and boxes the result, while a direct call is one indirect jump. The loops
 // are the same length, so the ratio is the cost of the machinery.
 //
-// It is not part of the table scripts/bench.sh prints -- a microbenchmark of
-// two loops says nothing about a whole program -- but it is the measurement
-// behind the claim that reflection did not slow anything down.
+// It prints two numbers rather than one, so the table in scripts/bench.sh times
+// it but ignores its output; the measurement behind the claim that reflection
+// did not slow anything down is the pair. The argument is the number of calls
+// in each loop.
 import java.lang.reflect.*
 
 class Adder {
@@ -24,6 +25,9 @@ class Adder {
 class BenchInvoke {
   public static void main(String[] args) throws Exception {
     int rounds = 20000000
+    if (args.length > 0) {
+      rounds = Integer.parseInt(args[0])
+    }
     Adder a = new Adder(7)
     Method add = Adder.class.getDeclaredMethod("add", int.class)
     Object[] box = new Object[1]

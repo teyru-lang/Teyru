@@ -1,4 +1,5 @@
-// Virtual dispatch and field access through an interface.
+// Virtual dispatch and field access through an interface. The argument is the
+// number of rounds over the 1000-element shape array.
 interface Shape {
   long area()
 }
@@ -23,12 +24,16 @@ class Square extends Rect {
 
 class BenchOop {
   public static void main(String[] args) {
+    int rounds = 2000
+    if (args.length > 0) {
+      rounds = Integer.parseInt(args[0])
+    }
     Shape[] shapes = new Shape[1000]
     for (int i = 0 : i < 1000 : i++) {
       shapes[i] = i % 2 == 0 ? new Rect(i, i + 1) : new Square(i)
     }
     long total = 0
-    for (int round = 0 : round < 2000 : round++) {
+    for (int round = 0 : round < rounds : round++) {
       for (int i = 0 : i < 1000 : i++) {
         total += shapes[i].area()
       }
