@@ -172,6 +172,30 @@ class String extends Object implements Comparable<String> {
     }
     return sb.toString()
   }
+  /* Java's other join, the one that takes a container rather than an array:
+     join(CharSequence, Iterable<? extends CharSequence>). Teyru has no
+     CharSequence for the element type to be a bound of, so this takes Strings,
+     which is what Java's call with a List<String> means. A null element is the
+     four characters "null", as it is in Java and in the varargs form above. */
+  public static String join(String delim, Iterable<String> elements) {
+    if (delim == null) {
+      throw new NullPointerException()
+    }
+    if (elements == null) {
+      throw new NullPointerException()
+    }
+    StringBuilder sb = new StringBuilder()
+    boolean first = true
+    Iterator<String> it = elements.iterator()
+    while (it.hasNext()) {
+      if (!first) {
+        sb.append(delim)
+      }
+      sb.append(it.next())
+      first = false
+    }
+    return sb.toString()
+  }
 }
 
 /* StringBuilder is the mutable byte buffer behind string building and
@@ -238,10 +262,12 @@ class StringBuilder extends Object {
   public native StringBuilder insert(int at, char[] chars)
   public native StringBuilder delete(int from, int to)
   public native StringBuilder deleteCharAt(int at)
-  public StringBuilder replace(int from, int to, String s) {
-    return replaceRaw(from, to, s == null ? "null" : s)
-  }
-  private native StringBuilder replaceRaw(int from, int to, String s)
+  /* replace is the one method here that does *not* take a null String for
+     "null": Java reads str.length() and throws NullPointerException, and the
+     bounds are checked first, so a bad range is the StringIndexOutOfBounds one
+     whatever the string is. The runtime does both, which is why this is native
+     rather than a wrapper like append and insert. */
+  public native StringBuilder replace(int from, int to, String s)
   public native StringBuilder reverse()
   public native char charAt(int at)
   public native void setCharAt(int at, char c)
@@ -317,10 +343,7 @@ class StringBuffer extends Object {
   public native StringBuffer insert(int at, char[] chars)
   public native StringBuffer delete(int from, int to)
   public native StringBuffer deleteCharAt(int at)
-  public StringBuffer replace(int from, int to, String s) {
-    return replaceRaw(from, to, s == null ? "null" : s)
-  }
-  private native StringBuffer replaceRaw(int from, int to, String s)
+  public native StringBuffer replace(int from, int to, String s)
   public native StringBuffer reverse()
   public native char charAt(int at)
   public native void setCharAt(int at, char c)

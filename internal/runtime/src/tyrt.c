@@ -1012,7 +1012,7 @@ void *ty_arith(const char *msg) {
 }
 void *ty_cce(tyclass *from, tyclass *to) {
   char buf[256];
-  snprintf(buf, sizeof buf, "class %s cannot be cast to class %s", ty_class_jname(from), ty_class_jname(to));
+  snprintf(buf, sizeof buf, "class %s cannot be cast to class %s", from ? from->name : "?", to ? to->name : "?");
   ty_throw(ty_make_ex(TY_CCE, buf));
   return NULL;
 }
@@ -1263,7 +1263,340 @@ tystr *ty_str_new(const char *data, int64_t len) {
 
 tystr *ty_str_intern(const char *data) { return ty_str_new(data, (int64_t)strlen(data)); }
 
+/* Finishes a string whose bytes a caller wrote into a block it got from
+   ty_str_new(NULL, n), which is how repeat and replace(String,String) assemble
+   a result out of pieces: it folds a high surrogate that ended up next to its
+   low one into the four-byte sequence the two units are -- the rule that makes
+   byte equality and UTF-16 equality one relation -- and fills in the measured
+   byte length, code unit count and ASCII bit.
+
+   The fold can only shorten a string, and the block was sized for the longest
+   it could have been, so the breadcrumb table still fits where the new byte
+   length puts it: the table starts at TY_STR_BC_OFF(blen), which only moves
+   left, and the space reserved for it was computed from the larger length.
+   The table is unbuilt here and stays unbuilt -- TY_SF_BC is the last thing
+   anything sets. */
+static void str_finish(tystr *s) {
+  char *d = TY_STR_DATA(s);
+  int64_t n = s->blen, i = 0, w = 0;
+  int64_t u = 0;
+  int ascii = 1;
+  while (i < n) {
+    int len = seq_len_in(d, n, i);
+    if (len == 4) {
+      u += 2;
+    } else if (len == 3) {
+      int32_t cp = seq_cp(d + i, 3);
+      if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= n && (unsigned char)d[i + 3] == 0xED) {
+        int32_t lo = seq_cp(d + i + 3, 3);
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+          seq_put(d + w, 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00));
+          w += 4;
+          u += 2;
+          i += 6;
+          continue;
+        }
+      }
+      ascii = 0;
+      u += 1;
+    } else {
+      if (len != 1) ascii = 0;
+      u += 1;
+    }
+    if (w != i) memmove(d + w, d + i, (size_t)len);
+    w += len;
+    i += len;
+  }
+  d[w] = 0;
+  s->blen = w;
+  s->ulen = (int32_t)u;
+  s->flags = ascii ? TY_SF_ASCII : 0;
+}
+
 /* ---- index conversion -------------------------------------------------- */
+
+/* Java indexes a string by UTF-16 code unit and the storage is WTF-8, so
+   charAt(i) has to find the sequence that holds unit i. The two ends of that
+   translation are the ASCII fast path -- where a unit index and a byte offset
+   are the same number -- and the breadcrumb table the header reserves room
+   for: entry k is the byte offset of code unit 64*k, so reaching unit i
+   decodes at most TY_BC_UNITS sequences instead of i. The table is built on
+   first use, because a string that is never indexed should not pay for the
+   walk, and it costs one entry per 64 units rather than one per unit. */
+
+/* Fills the table. Two threads can be here at once -- a literal in .data is
+   shared, and so is any string two threads reached -- and they compute the
+   same numbers, so the race is on publication and not on the answer: entries
+   go in with relaxed stores and the flag that says the table is ready goes in
+   last with a release, which is what a reader's acquire load pairs with. An
+   entry is written only when the walk reaches the unit it indexes, so a string
+   whose ulen over-claims -- which no path in this file leaves behind, and
+   str_finish is the one that could -- would leave zeroes there and answer a
+   wrong index rather than read past its own block. */
+static void str_build_bc(tystr *s) {
+  const char *d = TY_STR_DATA(s);
+  int32_t *bc = TY_STR_BC(s);
+  int64_t at = 0;
+  int32_t u = 0;
+  __atomic_store_n(&bc[0], 0, __ATOMIC_RELAXED);
+  while (at < s->blen) {
+    int n = seq_len_in(d, s->blen, at);
+    at += n;
+    u += n == 4 ? 2 : 1;
+    if ((u & (TY_BC_UNITS - 1)) == 0 && (u >> 6) < TY_STR_NBC(s))
+      __atomic_store_n(&bc[u >> 6], (int32_t)at, __ATOMIC_RELAXED);
+  }
+  __atomic_store_n(&s->flags, __atomic_load_n(&s->flags, __ATOMIC_RELAXED) | TY_SF_BC,
+                   __ATOMIC_RELEASE);
+}
+
+/* The byte offset of the sequence that holds code unit i1, and how many units
+   into that sequence i1 is -- 1 only when i1 names the low half of an astral
+   character, whose two units share one four-byte sequence. Callers have
+   checked i1 against ulen. */
+static int64_t str_byte_of(tystr *s, int64_t i1, int *into) {
+  const char *d = TY_STR_DATA(s);
+  int64_t at;
+  int32_t u;
+  *into = 0;
+  if (i1 <= 0) return 0;
+  if (TY_STR_ASCII(s)) return i1;
+  if (!(__atomic_load_n(&s->flags, __ATOMIC_ACQUIRE) & TY_SF_BC)) str_build_bc(s);
+  {
+    int64_t block = i1 >> 6;
+    at = __atomic_load_n(&TY_STR_BC(s)[block], __ATOMIC_RELAXED);
+    u = (int32_t)(block << 6);
+  }
+  for (;;) {
+    int n = seq_len_in(d, s->blen, at);
+    int w = n == 4 ? 2 : 1;
+    if (u + w > i1) {
+      *into = (int)(i1 - u);
+      return at;
+    }
+    at += n;
+    u += w;
+    if (at >= s->blen) { /* only a truncated sequence reaches this */
+      *into = 0;
+      return s->blen > 0 ? s->blen - 1 : 0;
+    }
+  }
+}
+
+/* The code unit at index i1. Callers have checked i1 against ulen. */
+static uint16_t str_unit_at(tystr *s, int64_t i1) {
+  int into;
+  int64_t at = str_byte_of(s, i1, &into);
+  const char *d = TY_STR_DATA(s);
+  int n = seq_len_in(d, s->blen, at);
+  if (n == 4) {
+    int32_t pair = seq_cp(d + at, 4) - 0x10000;
+    return (uint16_t)(into ? 0xDC00 + (pair & 0x3FF) : 0xD800 + (pair >> 10));
+  }
+  return (uint16_t)seq_cp(d + at, n);
+}
+
+/* A cursor over a string's code units. Sequential work -- searching, hashing,
+   comparing, the case conversions, the formatter -- walks with one of these:
+   it is one decode a unit and needs no index, where reaching a unit by number
+   has to find its sequence through the breadcrumb table first. */
+typedef struct {
+  tystr *s;
+  int64_t at; /* the sequence the next unit comes from */
+  int half;   /* the next unit is the low half of an astral character */
+} tyucur;
+
+/* Positions the cursor at unit zero, which is the one position that needs no
+   table: a sequential walk from here should not build one. */
+static void ucur_init(tyucur *c, tystr *s) {
+  c->s = s;
+  c->at = 0;
+  c->half = 0;
+}
+
+/* Positions the cursor at code unit i1, which must be below ulen. */
+static void ucur_at(tyucur *c, tystr *s, int64_t i1) {
+  int into = 0;
+  c->s = s;
+  if (i1 >= s->ulen) {
+    c->at = s->blen;
+    c->half = 0;
+    return;
+  }
+  c->at = str_byte_of(s, i1, &into);
+  c->half = into;
+}
+
+/* The unit the cursor is on, after which it is one unit further along. An
+   astral character is two units out of one sequence: the first call answers
+   its high surrogate and stays, the second answers the low one and steps over
+   the four bytes. */
+static uint16_t ucur_next(tyucur *c) {
+  const char *d = TY_STR_DATA(c->s);
+  int n;
+  /* A walk that has run past the last byte answers zeroes and keeps advancing
+     rather than reading the block's own padding; only a string whose ulen
+     over-claims can get here, and nothing in this file leaves one behind. */
+  if (c->at >= c->s->blen) {
+    c->half = 0;
+    c->at++;
+    return 0;
+  }
+  n = seq_len_in(d, c->s->blen, c->at);
+  if (n == 4) {
+    int32_t pair = seq_cp(d + c->at, 4) - 0x10000;
+    if (c->half) {
+      c->half = 0;
+      c->at += 4;
+      return (uint16_t)(0xDC00 + (pair & 0x3FF));
+    }
+    c->half = 1;
+    return (uint16_t)(0xD800 + (pair >> 10));
+  }
+  c->half = 0;
+  c->at += n;
+  return (uint16_t)seq_cp(d + c->at - n, n);
+}
+
+/* Whether code unit i1 begins a sequence. It does not only when i1 is the low
+   half of an astral character, whose two units share one four-byte sequence --
+   and a range that begins or ends between such a pair cannot be a copy of the
+   bytes between its ends, because the half left over is a lone surrogate with
+   an encoding of its own. */
+static int unit_is_high(int32_t c) { return c >= 0xD800 && c <= 0xDBFF; }
+static int unit_is_low(int32_t c) { return c >= 0xDC00 && c <= 0xDFFF; }
+
+static int str_on_boundary(tystr *s, int64_t i1) {
+  int into = 0;
+  if (i1 <= 0 || i1 >= s->ulen) return 1;
+  str_byte_of(s, i1, &into);
+  return into == 0;
+}
+
+/* The byte offset of the sequence holding unit i1, which is where a walk
+   starting at that unit begins. */
+static int64_t str_byte_at(tystr *s, int64_t i1) {
+  int into = 0;
+  if (i1 >= s->ulen) return s->blen;
+  return str_byte_of(s, i1, &into);
+}
+
+/* The code unit index a byte offset falls on. Every caller has an offset a
+   canonical needle can only have matched at -- a needle never begins with a
+   continuation byte, and a continuation byte is what lies inside a sequence --
+   so counting the sequence heads before the offset is the whole answer. */
+static int64_t unit_of_byte(tystr *s, int64_t at) {
+  const char *d = TY_STR_DATA(s);
+  int64_t i = 0, u = 0;
+  if (TY_STR_ASCII(s)) return at;
+  while (i < at && i < s->blen) {
+    int n = seq_len_in(d, s->blen, i);
+    if (n == 4) {
+      if (i + 4 > at) return u + 1; /* inside a pair: the low half's index */
+      u += 2;
+    } else {
+      u++;
+    }
+    i += n;
+  }
+  return u;
+}
+
+/* Defined below, and declared here because str_slice's mid-pair case -- the one
+   that cannot be a copy of bytes -- builds its answer through it. */
+tystr *ty_str_of_units(const uint16_t *u, int64_t n);
+
+/* A range of code units of another string. The two ends are usually sequence
+   boundaries and the range is the bytes between them; when one of them cuts an
+   astral character in half -- substring(1, 2) of one emoji -- the leftover half
+   is a lone surrogate, so the units are written out again. */
+static tystr *str_slice(tystr *s, int64_t from, int64_t to) {
+  if (from >= to) return ty_str_new(TY_STR_DATA(s), 0);
+  if (str_on_boundary(s, from) && str_on_boundary(s, to)) {
+    int64_t a = from == 0 ? 0 : str_byte_at(s, from);
+    int64_t b = to >= s->ulen ? s->blen : str_byte_at(s, to);
+    return ty_str_new(TY_STR_DATA(s) + a, b - a);
+  }
+  {
+    int64_t n = to - from, i;
+    uint16_t *tmp = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
+    tyucur c;
+    tystr *r;
+    ucur_at(&c, s, from);
+    for (i = 0; i < n; i++) tmp[i] = ucur_next(&c);
+    r = ty_str_of_units(tmp, n);
+    free(tmp);
+    return r;
+  }
+}
+
+/* One string out of code units, in the two passes every constructor of one
+   uses: the first measures what the second will write. Measuring first is what
+   lets the string be one allocation of exactly the right size -- the
+   breadcrumb table's offset depends on the byte length, so it cannot be
+   decided after the bytes are written. A high surrogate followed by its low
+   one is written as the single four-byte sequence they are, and it counts two
+   code units either way.
+
+   This and ty_str_units are where the two representations meet: a String is
+   WTF-8 bytes and a builder's buffer is code units, and every crossing goes
+   through one of these rather than through a loop written again at the call
+   site. */
+tystr *ty_str_of_units(const uint16_t *u, int64_t n) {
+  int64_t blen = 0, i;
+  int ascii = 1;
+  tystr *s;
+  char *p;
+  for (i = 0; i < n; i++) {
+    uint16_t c = u[i];
+    if (c < 0x80) {
+      blen += 1;
+    } else if (c < 0x800) {
+      blen += 2;
+      ascii = 0;
+    } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && u[i + 1] >= 0xDC00 &&
+               u[i + 1] <= 0xDFFF) {
+      blen += 4;
+      ascii = 0;
+      i++;
+    } else {
+      blen += 3;
+      ascii = 0;
+    }
+  }
+  s = str_alloc(blen, n, ascii);
+  p = TY_STR_DATA(s);
+  for (i = 0; i < n; i++) {
+    uint16_t c = u[i];
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && u[i + 1] >= 0xDC00 &&
+        u[i + 1] <= 0xDFFF) {
+      p += seq_put(p, 0x10000 + ((c - 0xD800) << 10) + (u[i + 1] - 0xDC00));
+      i++;
+    } else {
+      p += seq_put(p, c);
+    }
+  }
+  *p = 0;
+  return s;
+}
+
+/* The other direction: the code units of a string, written into a caller's
+   array, which must hold ulen of them. A builder appends through this, so a
+   string that arrived from anywhere lands in its buffer as units and an astral
+   character is the two halves Java would see. */
+int64_t ty_str_units(tystr *s, uint16_t *out) {
+  int64_t i;
+  if (!s) ty_npe();
+  if (TY_STR_ASCII(s)) {
+    const char *d = TY_STR_DATA(s);
+    for (i = 0; i < s->blen; i++) out[i] = (unsigned char)d[i];
+  } else {
+    tyucur c;
+    ucur_init(&c, s);
+    for (i = 0; i < s->ulen; i++) out[i] = ucur_next(&c);
+  }
+  return s->ulen;
+}
 
 /* Whether the last code unit is a high surrogate with no low one after it, and
    whether the first is a low surrogate with no high one before it. The pair of
@@ -1286,7 +1619,19 @@ static int str_starts_low(tystr *b) {
   return cp >= 0xDC00 && cp <= 0xDFFF;
 }
 
+/* String.length() is the number of UTF-16 code units, which is what a Java
+   program counts with and what every index in the API means. It is not the
+   number of bytes the string is stored in: "中文" is two units and six bytes,
+   and a supplementary character is two units and four bytes. */
 int64_t ty_str_len(tystr *s) {
+  if (!s) ty_npe();
+  return s->ulen;
+}
+
+/* The byte length, which is what the byte-oriented boundary means: getBytes,
+   a socket write, a file. Nothing in the language's own index arithmetic wants
+   this number. */
+int64_t ty_str_blen(tystr *s) {
   if (!s) ty_npe();
   return s->blen;
 }
@@ -1302,7 +1647,9 @@ tystr *ty_str_concat(tystr *a, tystr *b) {
   const char *da = TY_STR_DATA(a), *db = TY_STR_DATA(b);
   int64_t na = join ? a->blen - 3 : a->blen;
   int64_t nb = join ? b->blen - 3 : b->blen;
-  tystr *r = str_alloc(na + nb + (join ? 4 : 0), a->ulen + b->ulen - (join ? 2 : 0),
+  /* The join costs two bytes and no code unit: the two units that were encoded
+     separately are the same two units inside one sequence. */
+  tystr *r = str_alloc(na + nb + (join ? 4 : 0), a->ulen + b->ulen,
                        TY_STR_ASCII(a) && TY_STR_ASCII(b));
   char *out = TY_STR_DATA(r);
   memcpy(out, da, (size_t)na);
@@ -1325,19 +1672,56 @@ int32_t ty_str_eq(tystr *a, tystr *b) {
 }
 
 int32_t ty_str_cmp(tystr *a, tystr *b) {
+  int64_t i, n;
   if (a == b) return 0;
   if (!a) return -1;
   if (!b) return 1;
-  int64_t n = a->blen < b->blen ? a->blen : b->blen;
-  int r = memcmp(TY_STR_DATA(a), TY_STR_DATA(b), (size_t)n);
-  if (r) return r;
-  return a->blen < b->blen ? -1 : (a->blen > b->blen ? 1 : 0);
+  /* compareTo is defined on code units and answers their difference, not a
+     sign: "中".compareTo("文") is -5978 and not -1. Byte order does not give
+     that answer -- a supplementary character begins with a byte above 0xF0 and
+     so sorts after U+E000..U+FFFF, where Java sorts it before -- so the walk
+     is over units. Where both strings are ASCII a byte is a unit and the
+     comparison is a byte comparison. */
+  n = a->ulen < b->ulen ? a->ulen : b->ulen;
+  if (TY_STR_ASCII(a) && TY_STR_ASCII(b)) {
+    const char *pa = TY_STR_DATA(a), *pb = TY_STR_DATA(b);
+    int r = memcmp(pa, pb, (size_t)n);
+    if (r) {
+      for (i = 0; pa[i] == pb[i]; i++) {
+      }
+      return (int32_t)(unsigned char)pa[i] - (int32_t)(unsigned char)pb[i];
+    }
+  } else {
+    tyucur ca, cb;
+    ucur_init(&ca, a);
+    ucur_init(&cb, b);
+    for (i = 0; i < n; i++) {
+      int32_t x = ucur_next(&ca), y = ucur_next(&cb);
+      if (x != y) return x - y;
+    }
+  }
+  return (int32_t)(a->ulen - b->ulen);
 }
 
+/* String.hashCode(), which is 31*h + c over the UTF-16 code units. A string
+   built from a supplementary character hashes the two surrogate halves in
+   order, so the answer is the JDK's for those too, and it is not the same
+   answer as hashing the four UTF-8 bytes. ASCII is the fast path: there a byte
+   is a unit. */
 int32_t ty_str_hash(tystr *s) {
-  if (!s) ty_npe();
   int32_t h = 0;
-  for (int64_t i = 0; i < s->blen; i++) h = 31 * h + (unsigned char)TY_STR_DATA(s)[i];
+  int64_t i;
+  if (!s) ty_npe();
+  if (TY_STR_ASCII(s)) {
+    const char *d = TY_STR_DATA(s);
+    for (i = 0; i < s->blen; i++) h = 31 * h + (unsigned char)d[i];
+    return h;
+  }
+  {
+    tyucur c;
+    ucur_init(&c, s);
+    for (i = 0; i < s->ulen; i++) h = 31 * h + ucur_next(&c);
+  }
   return h;
 }
 
@@ -1483,7 +1867,7 @@ tystr *ty_str_of_float(float v) {
 tystr *ty_object_tostring(void *o) {
   if (!o) return ty_str_intern("null");
   char buf[128];
-  int n = snprintf(buf, sizeof buf, "%s@%llx", ty_class_jname(((tyobj *)o)->cls), (unsigned long long)(uintptr_t)o);
+  int n = snprintf(buf, sizeof buf, "%s@%llx", ((tyobj *)o)->cls->name, (unsigned long long)(uintptr_t)o);
   return ty_str_new(buf, n);
 }
 
@@ -1492,20 +1876,10 @@ tystr *ty_str_of_obj(void *o) {
   return ((tystr *(*)(void *))((tyobj *)o)->cls->vtable[0])(o);
 }
 
-tystr *ty_str_upper(tystr *s) {
-  if (!s) return NULL;
-  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
-  for (int64_t i = 0; i < r->blen; i++)
-    if (TY_STR_DATA(r)[i] >= 'a' && TY_STR_DATA(r)[i] <= 'z') TY_STR_DATA(r)[i] -= 32;
-  return r;
-}
-tystr *ty_str_lower(tystr *s) {
-  if (!s) return NULL;
-  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
-  for (int64_t i = 0; i < r->blen; i++)
-    if (TY_STR_DATA(r)[i] >= 'A' && TY_STR_DATA(r)[i] <= 'Z') TY_STR_DATA(r)[i] += 32;
-  return r;
-}
+/* ty_str_upper and ty_str_lower are not here: a case conversion is a question
+   about code points and, for the final sigma, about the word a code point sits
+   in, so both are defined beside the Unicode tables they read (see
+   "the case mappings of a String", further down). */
 tystr *ty_str_trim(tystr *s) {
   if (!s) return NULL;
   int64_t a = 0, b = s->blen;
@@ -1513,38 +1887,149 @@ tystr *ty_str_trim(tystr *s) {
   while (b > a && (unsigned char)TY_STR_DATA(s)[b - 1] <= ' ') b--;
   return ty_str_new(TY_STR_DATA(s) + a, b - a);
 }
+/* Whether the units of `p` equal the units of `s` starting at k. Only the two
+   places where a match may begin or end in the middle of an astral character
+   need this: everywhere else a byte comparison answers, because a canonical
+   needle can only match at a sequence start. */
+static int str_unit_range_eq(tystr *s, int64_t k, tystr *p) {
+  tyucur a, b;
+  int64_t i;
+  if (k < 0 || k + p->ulen > s->ulen) return 0;
+  ucur_at(&a, s, k);
+  ucur_init(&b, p);
+  for (i = 0; i < p->ulen; i++)
+    if (ucur_next(&a) != ucur_next(&b)) return 0;
+  return 1;
+}
+
+/* Whether a match of `sub` can sit at a unit position where its bytes are not
+   the haystack's bytes. It can exactly when the needle begins with a low
+   surrogate or ends with a high one: those are the two ends that can be half of
+   a pair in the haystack, where the needle spells the half alone and the
+   haystack spells the pair as one four-byte sequence. Every other needle's
+   bytes are the haystack's bytes wherever its units match. */
+static int str_cuts_pair(tystr *sub) {
+  if (sub->ulen == 0) return 0;
+  return unit_is_low(str_unit_at(sub, 0)) || unit_is_high(str_unit_at(sub, sub->ulen - 1));
+}
+
+/* The smallest unit index k >= from where `sub` occurs, or -1.
+
+   Where the needle's bytes are the haystack's bytes wherever its units match --
+   which is every needle but the surrogate-cutting one, and every `from` but one
+   inside a pair -- the scan is over bytes: a canonical needle can only match at
+   a sequence start, so a byte match is a unit match, the scan gets to be
+   memcmp, and the answer is that offset translated back into a unit index.
+   Otherwise the walk is over units, which is slower and is the only thing that
+   can see a match that sits inside a four-byte sequence. */
+static int64_t str_find(tystr *s, tystr *sub, int64_t from) {
+  const char *d, *p;
+  int64_t at, limit;
+  if (sub->ulen == 0) return from <= s->ulen ? from : (int64_t)s->ulen;
+  if (from < 0) from = 0;
+  if (from > s->ulen - sub->ulen) return -1;
+  /* A needle that can sit inside a pair, or a range that starts inside one,
+     needs the unit walk: the byte scan cannot see those matches at all, and it
+     would answer -1 where Java answers an index. */
+  if (str_cuts_pair(sub) || !str_on_boundary(s, from)) {
+    tyucur c;
+    int64_t k;
+    uint16_t first = str_unit_at(sub, 0);
+    ucur_at(&c, s, from);
+    for (k = from; k + sub->ulen <= s->ulen; k++) {
+      if (ucur_next(&c) == first && str_unit_range_eq(s, k, sub)) return k;
+    }
+    return -1;
+  }
+  d = TY_STR_DATA(s);
+  p = TY_STR_DATA(sub);
+  at = from == 0 ? 0 : str_byte_at(s, from);
+  limit = s->blen - sub->blen;
+  for (; at <= limit; at++) {
+    int64_t k;
+    if (d[at] != p[0]) continue;
+    if (memcmp(d + at, p, (size_t)sub->blen) != 0) continue;
+    k = unit_of_byte(s, at);
+    if (k >= from) return k;
+  }
+  return -1;
+}
+
+/* substring is over units, and its answer may hold half of an astral
+   character: "a中b".substring(1, 2) is 中, and the same call on "😀" (whose
+   boundaries are 0 and 2) is asked for 0..1 by the caller that wants half of
+   it, which is a lone surrogate -- a string Java has. */
 tystr *ty_str_sub(tystr *s, int32_t from, int32_t to) {
   if (!s) return NULL;
-  if (from < 0) { ty_throw((tyobj *)ty_sioobe(from, s->blen)); }
-  if (to > s->blen) { ty_throw((tyobj *)ty_sioobe(to, s->blen)); }
-  if (from > to) { ty_throw((tyobj *)ty_sioobe(to, s->blen)); }
-  return ty_str_new(TY_STR_DATA(s) + from, to - from);
+  if (from < 0) ty_throw((tyobj *)ty_sioobe(from, s->ulen));
+  if (to > s->ulen) ty_throw((tyobj *)ty_sioobe(to, s->ulen));
+  if (from > to) ty_throw((tyobj *)ty_sioobe(to, s->ulen));
+  return str_slice(s, from, to);
 }
 int32_t ty_str_indexof(tystr *s, tystr *sub) {
   if (!s || !sub) ty_npe();
-  if (sub->blen == 0) return 0;
-  for (int64_t at = 0; at + sub->blen <= s->blen; at++)
-    if (memcmp(TY_STR_DATA(s) + at, TY_STR_DATA(sub), (size_t)sub->blen) == 0) return (int32_t)at;
-  return -1;
+  return (int32_t)str_find(s, sub, 0);
+}
+/* substring(int): the same call with the end left off, and the same answer --
+   Java's substring(from) is substring(from, length()). */
+tystr *ty_str_sub_from(tystr *s, int32_t from) {
+  if (!s) return NULL;
+  if (from < 0 || from > s->ulen) ty_throw((tyobj *)ty_sioobe(from, s->ulen));
+  return str_slice(s, from, s->ulen);
 }
 int32_t ty_str_charat(tystr *s, int32_t i) {
-  if (!s || i < 0 || i >= s->blen) ty_throw((tyobj *)ty_sioobe(i, s ? s->blen : 0));
-  return (unsigned char)TY_STR_DATA(s)[i];
+  if (!s || i < 0 || i >= s->ulen) ty_throw((tyobj *)ty_sioobe(i, s ? s->ulen : 0));
+  return str_unit_at(s, i);
 }
 int32_t ty_str_contains(tystr *s, tystr *sub) { return ty_str_indexof(s, sub) >= 0; }
+/* startsWith and endsWith are unit comparisons whose common case is a byte
+   comparison: a byte prefix of a canonical string is a prefix of its units,
+   and so is a byte suffix, because the bytes of a canonical needle that sit at
+   the end of a canonical haystack can only begin where a sequence does. What
+   the byte test misses is the needle that ends or begins in the middle of an
+   astral character -- "\uD83D" is a prefix of "😀" in Java -- and the unit walk
+   behind it answers that. */
 int32_t ty_str_starts(tystr *s, tystr *p) {
   if (!s || !p) return 0;
-  return p->blen <= s->blen && memcmp(TY_STR_DATA(s), TY_STR_DATA(p), (size_t)p->blen) == 0;
+  if (p->ulen > s->ulen) return 0;
+  if (p->blen <= s->blen && memcmp(TY_STR_DATA(s), TY_STR_DATA(p), (size_t)p->blen) == 0) return 1;
+  return str_unit_range_eq(s, 0, p);
 }
 int32_t ty_str_ends(tystr *s, tystr *p) {
   if (!s || !p) return 0;
-  return p->blen <= s->blen && memcmp(TY_STR_DATA(s) + s->blen - p->blen, TY_STR_DATA(p), (size_t)p->blen) == 0;
+  if (p->ulen > s->ulen) return 0;
+  if (p->blen <= s->blen &&
+      memcmp(TY_STR_DATA(s) + s->blen - p->blen, TY_STR_DATA(p), (size_t)p->blen) == 0)
+    return 1;
+  return str_unit_range_eq(s, s->ulen - p->ulen, p);
 }
+/* replace(char, char) is over code units, and either side of it can be half of
+   an astral character, so the two units that meet where the change happened may
+   belong together. Building the unit array and letting the string constructor
+   join is what gets that right -- and it is also what keeps
+   "\uD83Dx".replace('x', '\uDE00') one character rather than two. */
 tystr *ty_str_replace(tystr *s, uint16_t a, uint16_t b) {
+  uint16_t *tmp;
+  tystr *r;
+  int64_t i;
   if (!s) return NULL;
-  tystr *r = ty_str_new(TY_STR_DATA(s), s->blen);
-  for (int64_t i = 0; i < r->blen; i++)
-    if ((unsigned char)TY_STR_DATA(r)[i] == (a & 0xFF)) TY_STR_DATA(r)[i] = (char)b;
+  if (s->ulen == 0) return ty_str_new(TY_STR_DATA(s), 0);
+  tmp = (uint16_t *)malloc((size_t)s->ulen * sizeof(uint16_t));
+  if (TY_STR_ASCII(s)) {
+    for (i = 0; i < s->blen; i++) {
+      uint16_t c = (unsigned char)TY_STR_DATA(s)[i];
+      tmp[i] = c == a ? b : c;
+    }
+  } else {
+    tyucur c;
+    ucur_init(&c, s);
+    for (i = 0; i < s->ulen; i++) {
+      uint16_t u = ucur_next(&c);
+      tmp[i] = u == a ? b : u;
+    }
+  }
+  r = ty_str_of_units(tmp, s->ulen);
+  free(tmp);
   return r;
 }
 int32_t ty_str_isempty(tystr *s) {
@@ -1722,7 +2207,40 @@ float ty_unbox_float(void *o) {
 
 /* ------------------------------------------------------------------ output */
 
-void ty_print_str(tystr *s) { if (s) fwrite(TY_STR_DATA(s), 1, (size_t)s->blen, stdout); else fputs("null", stdout); }
+void ty_str_write(FILE *f, tystr *s) {
+  const char *d;
+  int64_t i, run = 0;
+  if (!s) {
+    fputs("null", f);
+    return;
+  }
+  d = TY_STR_DATA(s);
+  /* An ASCII string holds no surrogate, so its bytes are what the encoder
+     writes. Everything else is walked, and the bytes between two lone
+     surrogates are written in one go: a string of Korean text has 0xED as a
+     lead byte all through it, and writing those one sequence at a time would
+     turn a text write into a call per character. */
+  if (TY_STR_ASCII(s) || !memchr(d, 0xED, (size_t)s->blen)) {
+    fwrite(d, 1, (size_t)s->blen, f);
+    return;
+  }
+  for (i = 0; i < s->blen;) {
+    int len = seq_len_in(d, s->blen, i);
+    if (len == 3) {
+      int32_t cp = seq_cp(d + i, 3);
+      if (unit_is_high(cp) || unit_is_low(cp)) {
+        if (i > run) fwrite(d + run, 1, (size_t)(i - run), f);
+        fputc('?', f);
+        i += 3;
+        run = i;
+        continue;
+      }
+    }
+    i += len;
+  }
+  if (s->blen > run) fwrite(d + run, 1, (size_t)(s->blen - run), f);
+}
+void ty_print_str(tystr *s) { ty_str_write(stdout, s); }
 void ty_println_str(tystr *s) { ty_print_str(s); putchar('\n'); }
 void ty_print_int(int64_t v) { printf("%lld", (long long)v); }
 void ty_println_int(int64_t v) { printf("%lld\n", (long long)v); }
@@ -1739,7 +2257,7 @@ void ty_print_float(float v) { ty_print_str(ty_str_of_float(v)); }
 void ty_println_float(float v) { ty_print_float(v); putchar('\n'); }
 void ty_print_char(uint16_t c) {
   if (c < 0x80) putchar((int)c);
-  else fputs(TY_STR_DATA(ty_str_of_char(c)), stdout);
+  else ty_str_write(stdout, ty_str_of_char(c));
 }
 void ty_println_char(uint16_t c) { ty_print_char(c); putchar('\n'); }
 void ty_print_bool(int32_t v) { fputs(v ? "true" : "false", stdout); }
@@ -2011,52 +2529,321 @@ int64_t ty_rem_long(int64_t a, int64_t b) {
 
 /* ------------------------------------------------------------- Character */
 
-/* Classification is ASCII, and it is deliberately not <ctype.h>: those
-   functions answer for the current locale, and a Teyru char is one byte of a
-   UTF-8 string, so the answer a program gets must not depend on LC_CTYPE. Java
-   classifies the whole of Unicode; a byte-oriented runtime can be exact for
-   ASCII, which is the part a program is normally asking about. */
+/* Classification, and the case mapping of one code point.
+
+   Every answer here is the JDK's, and the JDK's answers are Unicode's: the
+   tables of tyrt_unicode.c are generated from Unicode 15.0.0's own data files
+   (internal/tools/genunicode), and what this section adds is the mapping from
+   those tables onto java.lang.Character -- which categories a predicate is,
+   which property bits a predicate is, and the two case conversions that are
+   about a whole string rather than about one code point.
+
+   It is deliberately not <ctype.h>: those functions answer for the current
+   locale, and the answer a program gets must not depend on LC_CTYPE. Nor is it
+   a range of ASCII any more: the classification of a code point above the BMP
+   is answered as exactly as the classification of 'a', which is what Java does
+   and what a program comparing two strings from different scripts needs. */
 #define TY_ASCII_UPPER(c) ((c) >= 'A' && (c) <= 'Z')
 #define TY_ASCII_LOWER(c) ((c) >= 'a' && (c) <= 'z')
 #define TY_ASCII_DIGIT(c) ((c) >= '0' && (c) <= '9')
 #define TY_ASCII_ALPHA(c) (TY_ASCII_UPPER(c) || TY_ASCII_LOWER(c))
-#define TY_ASCII_ALNUM(c) (TY_ASCII_ALPHA(c) || TY_ASCII_DIGIT(c))
 
-/* The whitespace strip() strips and isWhitespace() accepts, which in Java are
-   the same set: space, the five control characters 0x09..0x0D, and the four
-   information separators 0x1C..0x1F. It is deliberately not the set trim()
-   strips -- trim takes every byte <= ' ', which is a strictly larger set -- and
-   the two must not be confused, since Java keeps them apart. */
-int32_t ty_is_whitespace(uint16_t c) {
-  return c == ' ' || (c >= 9 && c <= 13) || (c >= 0x1C && c <= 0x1F);
+/* The letters are Lu, Ll, Lt, Lm and Lo, which are the five categories the
+   general category numbers 1..5 -- a fact about how the table was written
+   (genunicode numbers them as Character's constants are numbered), not about
+   which characters they are. */
+#define TY_CAT_IS_LETTER(t) ((t) >= TY_UC_UPPERCASE_LETTER && (t) <= TY_UC_OTHER_LETTER)
+
+int32_t ty_char_type(int32_t cp) { return ty_uc_category(cp); }
+int32_t ty_is_letter(int32_t cp) { return TY_CAT_IS_LETTER(ty_uc_category(cp)); }
+int32_t ty_is_digit(int32_t cp) { return ty_uc_category(cp) == TY_UC_DECIMAL_DIGIT_NUMBER; }
+int32_t ty_is_letter_or_digit(int32_t cp) { return ty_is_letter(cp) || ty_is_digit(cp); }
+/* Alphabetic is the letters, the letter numbers and Other_Alphabetic, which is
+   the combining marks and modifier letters of the scripts that write a vowel
+   with one: U+0345 COMBINING GREEK YPOGEGRAMMENI is alphabetic and is not a
+   letter. */
+int32_t ty_is_alphabetic(int32_t cp) {
+  return ty_is_letter(cp) || ty_uc_category(cp) == TY_UC_LETTER_NUMBER ||
+         (ty_uc_props(cp) & TY_UC_OTHER_ALPHABETIC) != 0;
 }
-int32_t ty_is_letter_or_digit(uint16_t c) { return TY_ASCII_ALNUM(c); }
-int32_t ty_is_alphabetic(uint16_t c) { return TY_ASCII_ALPHA(c); }
-int32_t ty_is_upper_case(uint16_t c) { return TY_ASCII_UPPER(c); }
-int32_t ty_is_lower_case(uint16_t c) { return TY_ASCII_LOWER(c); }
-int32_t ty_char_upper(uint16_t c) { return TY_ASCII_LOWER(c) ? c - 32 : c; }
-int32_t ty_char_lower(uint16_t c) { return TY_ASCII_UPPER(c) ? c + 32 : c; }
+/* Uppercase and lowercase are their categories plus Other_Uppercase and
+   Other_Lowercase: U+2160 ROMAN NUMERAL ONE is uppercase and U+02B0 MODIFIER
+   LETTER SMALL H is lowercase, and neither is an Lu or an Ll. */
+int32_t ty_is_upper_case(int32_t cp) {
+  return ty_uc_category(cp) == TY_UC_UPPERCASE_LETTER || (ty_uc_props(cp) & TY_UC_OTHER_UPPERCASE) != 0;
+}
+int32_t ty_is_lower_case(int32_t cp) {
+  return ty_uc_category(cp) == TY_UC_LOWERCASE_LETTER || (ty_uc_props(cp) & TY_UC_OTHER_LOWERCASE) != 0;
+}
+int32_t ty_is_title_case(int32_t cp) { return ty_uc_category(cp) == TY_UC_TITLECASE_LETTER; }
+/* Whether a character carries case at all, which the Final_Sigma condition of
+   the lowercase mapping asks: Character.isCased is these three categories plus
+   the two Other_* properties, and nothing else. */
+static int uc_is_cased(int32_t cp) {
+  return ty_is_upper_case(cp) || ty_is_lower_case(cp) || ty_is_title_case(cp);
+}
+/* The whitespace strip() strips and isWhitespace() accepts, which in Java are
+   the same set. It is the White_Space property with the JDK's four exceptions
+   and its four additions (genunicode says which), and it is deliberately not
+   the set trim() strips -- trim takes every code unit <= ' ', which is a
+   strictly larger set -- and the two must not be confused, since Java keeps
+   them apart. */
+int32_t ty_is_whitespace(int32_t cp) { return (ty_uc_props(cp) & TY_UC_WHITE_SPACE) != 0; }
+/* isSpaceChar is the three separator categories and not the whitespace set:
+   U+00A0 NO-BREAK SPACE is a space character and is not whitespace, and U+001C
+   is whitespace and is not a space character. */
+int32_t ty_is_space_char(int32_t cp) {
+  int32_t t = ty_uc_category(cp);
+  return t == TY_UC_SPACE_SEPARATOR || t == TY_UC_LINE_SEPARATOR || t == TY_UC_PARAGRAPH_SEPARATOR;
+}
+int32_t ty_is_defined(int32_t cp) {
+  return cp >= 0 && cp <= 0x10FFFF && ty_uc_category(cp) != TY_UC_UNASSIGNED;
+}
+/* Character.toUpperCase(int), toLowerCase(int) and toTitleCase(int) are the
+   *simple* mapping: one code point in, one code point out, and a character with
+   no mapping of its own answers with itself -- U+00DF LATIN SMALL LETTER SHARP
+   S is unchanged by toUpperCase, and the two characters it becomes in a string
+   are a question about the string (see below). */
+int32_t ty_char_upper(int32_t cp) { return ty_uc_case(cp, 0); }
+int32_t ty_char_lower(int32_t cp) { return ty_uc_case(cp, 1); }
+int32_t ty_char_title(int32_t cp) { return ty_uc_case(cp, 2); }
 int32_t ty_char_compare(uint16_t a, uint16_t b) { return a < b ? -1 : (a > b ? 1 : 0); }
 tystr *ty_char_tostr_val(uint16_t c) { return ty_str_of_char(c); }
 int32_t ty_char_hash_val(uint16_t c) { return (int32_t)c; }
 
-/* Java's getNumericValue answers the value of a digit in any radix up to 36,
-   -1 for a character that is not one, and -2 for a character that has a
-   numeric value which is not a digit -- the byte-oriented runtime answers -1
-   where Java answers -2, because there is no such character below 0x80. */
-int32_t ty_char_numeric(uint16_t c) {
-  if (TY_ASCII_DIGIT(c)) return c - '0';
-  if (TY_ASCII_UPPER(c)) return c - 'A' + 10;
-  if (TY_ASCII_LOWER(c)) return c - 'a' + 10;
-  return -1;
-}
-/* digit() asks the same question but with a radix, and answers -1 for a digit
-   that is out of the radix as well as for a character that is not a digit. */
-int32_t ty_char_digit(uint16_t c, int32_t radix) {
+/* Java's getNumericValue answers the numeric value of a numeral (U+216B ROMAN
+   NUMERAL TWELVE is 12), the value of a digit in any radix up to 36, -1 for a
+   character with neither, and -2 for a character whose numeric value is not a
+   non-negative int -- U+00BD VULGAR FRACTION ONE HALF and U+16B60, whose value
+   is 10^10. */
+int32_t ty_char_numeric(int32_t cp) { return ty_uc_numeric_value(cp); }
+/* digit() asks the same question with a radix, and answers -1 for a value that
+   is not below the radix as well as for a character that is not a digit: 'f' is
+   a digit in radix 16 (15) and is not one in radix 10. A radix outside 2..36
+   has no digits at all. */
+int32_t ty_char_digit(int32_t cp, int32_t radix) {
+  int32_t v;
   if (radix < 2 || radix > 36) return -1;
-  int32_t v = ty_char_numeric(c);
+  v = ty_uc_digit_value(cp);
   return (v < 0 || v >= radix) ? -1 : v;
 }
+
+/* ------------------------------------------ the case mappings of a String */
+
+/* A string's case conversion is not the case conversion of each of its code
+   points, in three ways.
+
+     - A code point can map to more than one. U+00DF LATIN SMALL LETTER SHARP S
+       uppercases to "SS", U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE
+       lowercases to "i" and a combining dot above, and the ligatures expand
+       the same way. Those mappings are SpecialCasing.txt's, and the ones read
+       here are its unconditional entries: the rest are conditioned on a
+       language (Turkish, Azeri, Lithuanian), and there is no locale here to
+       condition on.
+     - U+03A3 GREEK CAPITAL LETTER SIGMA lowercases to U+03C2 the final form
+       when it ends a cased word and to U+03C3 otherwise. That is the one
+       conditional mapping that is not about a language, and the JDK applies it
+       for every locale: "ΟΔΟΣ".toLowerCase() ends in the final form.
+     - A supplementary character is one character: it is two code units, and
+       folding the units would leave both of them alone.
+
+   So the walk is over code points, and each one is asked for its full mapping
+   rather than its simple one. */
+
+/* Whether a code point can be inside a word, which is what the Final_Sigma
+   condition is about. The letters, the digits and the marks can; an ideographic
+   character cannot, because Java's word iterator breaks a run of them into one
+   word each -- which is why the sigma of "ΑΣ中Α" is final here and in the JDK. */
+static int uc_word_char(int32_t cp) {
+  if ((ty_uc_props(cp) & TY_UC_IDEOGRAPHIC) != 0) return 0;
+  switch (ty_uc_category(cp)) {
+    case TY_UC_UPPERCASE_LETTER:
+    case TY_UC_LOWERCASE_LETTER:
+    case TY_UC_TITLECASE_LETTER:
+    case TY_UC_MODIFIER_LETTER:
+    case TY_UC_OTHER_LETTER:
+    case TY_UC_DECIMAL_DIGIT_NUMBER:
+    case TY_UC_LETTER_NUMBER:
+    case TY_UC_OTHER_NUMBER:
+    case TY_UC_NON_SPACING_MARK:
+    case TY_UC_COMBINING_SPACING_MARK:
+    case TY_UC_ENCLOSING_MARK:
+      return 1;
+    default:
+      return 0;
+  }
+}
+/* The punctuation a word continues through. This set is measured against the
+   JDK rather than read off UAX #29, because the JDK's word iterator is its own
+   rule-based one and is not UAX #29: it keeps a hyphen inside a word, it joins
+   through a period or an apostrophe only when a letter is on both sides, and it
+   breaks at a middle dot or a comma. See AGENTS.md §10 for what the difference
+   is measured to be. */
+static int uc_joins(int32_t cp) {
+  return cp == '"' || cp == '\'' || cp == '-' || cp == '.' || cp == 0xAD ||
+         ty_uc_category(cp) == TY_UC_CONNECTOR_PUNCTUATION;
+}
+/* A mark or a format character attaches to the character before it and so can
+   never be a word boundary itself. U+200D ZERO WIDTH JOINER is one of these,
+   which is why a word continues across it. */
+static int uc_transparent(int32_t cp) {
+  switch (ty_uc_category(cp)) {
+    case TY_UC_NON_SPACING_MARK:
+    case TY_UC_COMBINING_SPACING_MARK:
+    case TY_UC_ENCLOSING_MARK:
+    case TY_UC_FORMAT:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* The code points of a string, by unit index. codePointAt and codePointBefore
+   in tyrt.h raise on an index outside the string; these are for callers that
+   have already established the index is inside it. */
+static int32_t uc_cp_at(tystr *s, int64_t i) {
+  uint16_t c = str_unit_at(s, i);
+  if (unit_is_high(c) && i + 1 < s->ulen) {
+    uint16_t d = str_unit_at(s, i + 1);
+    if (unit_is_low(d)) return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+  }
+  return c;
+}
+static int32_t uc_cp_before(tystr *s, int64_t i) {
+  uint16_t c = str_unit_at(s, i - 1);
+  if (unit_is_low(c) && i >= 2) {
+    uint16_t d = str_unit_at(s, i - 2);
+    if (unit_is_high(d)) return 0x10000 + ((d - 0xD800) << 10) + (c - 0xDC00);
+  }
+  return c;
+}
+static int64_t uc_cp_len(tystr *s, int64_t i) {
+  uint16_t c = str_unit_at(s, i);
+  return (unit_is_high(c) && i + 1 < s->ulen && unit_is_low(str_unit_at(s, i + 1))) ? 2 : 1;
+}
+/* The unit index of the character before i, with everything that attaches to it
+   skipped: the base character is what a word boundary is decided between. */
+static int64_t uc_base_before(tystr *s, int64_t i) {
+  int64_t j = i - 1;
+  while (j > 0 && uc_transparent(uc_cp_before(s, j + 1))) j--;
+  return j;
+}
+/* The unit index of the character after the one starting at i, with everything
+   that attaches to it skipped. */
+static int64_t uc_base_after(tystr *s, int64_t i) {
+  int64_t j = i + uc_cp_len(s, i);
+  while (j < s->ulen && uc_transparent(uc_cp_at(s, j))) j += uc_cp_len(s, j);
+  return j;
+}
+
+/* No word boundary at unit position i, which is between the characters on
+   either side of it. Only the positions inside the string are asked about: the
+   two ends are boundaries, and the callers say so by their loop conditions. */
+static int str_no_boundary(tystr *s, int64_t i) {
+  int32_t c1, c2;
+  int64_t j, k;
+  if (i <= 0 || i >= s->ulen) return 0;
+  c2 = uc_cp_at(s, i);
+  if (uc_transparent(c2)) return 1;
+  j = uc_base_before(s, i);
+  c1 = uc_cp_at(s, j);
+  if (uc_word_char(c1) && uc_word_char(c2)) return 1;
+  if (uc_joins(c1) && TY_CAT_IS_LETTER(ty_uc_category(c2))) {
+    k = uc_base_before(s, j);
+    if (k < j && TY_CAT_IS_LETTER(ty_uc_category(uc_cp_at(s, k)))) return 1;
+  }
+  if (TY_CAT_IS_LETTER(ty_uc_category(c1)) && uc_joins(c2)) {
+    k = uc_base_after(s, i);
+    if (k < s->ulen && TY_CAT_IS_LETTER(ty_uc_category(uc_cp_at(s, k)))) return 1;
+  }
+  return 0;
+}
+
+/* Java's Final_Sigma condition, which is what decides whether U+03A3 is the
+   final form: the character at unit index `index` is final-cased when there is
+   a cased character before it in its word and none after it in the same word.
+   The JDK asks this of its BreakIterator; str_no_boundary is what answers here,
+   and what it does not reproduce is recorded in AGENTS.md §10. */
+static int str_final_cased(tystr *s, int64_t index) {
+  int64_t i = index;
+  while (i > 0 && str_no_boundary(s, i)) {
+    if (uc_is_cased(uc_cp_before(s, i))) {
+      int64_t j = index + uc_cp_len(s, index);
+      while (j < s->ulen && str_no_boundary(s, j)) {
+        if (uc_is_cased(uc_cp_at(s, j))) return 0;
+        j += uc_cp_len(s, j);
+      }
+      return 1;
+    }
+    i = uc_base_before(s, i);
+  }
+  return 0;
+}
+
+/* The full case mapping of the character starting at unit `at`, written to out
+   as code points: the number written is returned, and it is never more than
+   TY_UC_MAX_EXPANSION. */
+static int32_t str_case_of(tystr *s, int64_t at, int32_t upper, int32_t *out) {
+  int32_t cp = uc_cp_at(s, at);
+  int32_t n;
+  if (!upper && cp == 0x3A3) {
+    out[0] = str_final_cased(s, at) ? 0x3C2 : 0x3C3;
+    return 1;
+  }
+  n = ty_uc_special(cp, upper, out, TY_UC_MAX_EXPANSION);
+  if (n > 0) return n;
+  out[0] = ty_uc_case(cp, upper ? 0 : 1);
+  return 1;
+}
+
+/* The case conversion of a whole string. An ASCII string is mapped byte by byte
+   in place: no code point below U+0080 has a full case mapping, so the
+   arithmetic is the whole answer, and it is what nearly every call wants. */
+static tystr *str_case(tystr *s, int32_t upper) {
+  int32_t buf[TY_UC_MAX_EXPANSION];
+  int64_t at, i, units = 0, k = 0;
+  uint16_t *tmp;
+  tystr *r;
+  if (TY_STR_ASCII(s)) {
+    r = ty_str_new(TY_STR_DATA(s), s->blen);
+    for (at = 0; at < r->blen; at++) {
+      unsigned char c = (unsigned char)TY_STR_DATA(r)[at];
+      if (upper) {
+        if (c >= 'a' && c <= 'z') TY_STR_DATA(r)[at] = (char)(c - 32);
+      } else if (c >= 'A' && c <= 'Z') {
+        TY_STR_DATA(r)[at] = (char)(c + 32);
+      }
+    }
+    return r;
+  }
+  /* The answer is a string, and a string is allocated once: the units are
+     counted first, then written. An expansion can be longer than what it
+     expands, which is why the count is not the input's. */
+  for (at = 0; at < s->ulen;) {
+    int32_t n = str_case_of(s, at, upper, buf);
+    for (i = 0; i < n; i++) units += buf[i] >= 0x10000 ? 2 : 1;
+    at += uc_cp_len(s, at);
+  }
+  tmp = (uint16_t *)malloc((size_t)(units > 0 ? units : 1) * sizeof(uint16_t));
+  for (at = 0; at < s->ulen;) {
+    int32_t n = str_case_of(s, at, upper, buf);
+    for (i = 0; i < n; i++) {
+      if (buf[i] >= 0x10000) {
+        int32_t v = buf[i] - 0x10000;
+        tmp[k++] = (uint16_t)(0xD800 + (v >> 10));
+        tmp[k++] = (uint16_t)(0xDC00 + (v & 0x3FF));
+      } else {
+        tmp[k++] = (uint16_t)buf[i];
+      }
+    }
+    at += uc_cp_len(s, at);
+  }
+  r = ty_str_of_units(tmp, units);
+  free(tmp);
+  return r;
+}
+tystr *ty_str_upper(tystr *s) { return s ? str_case(s, 1) : NULL; }
+tystr *ty_str_lower(tystr *s) { return s ? str_case(s, 0) : NULL; }
 
 /* ---------------------------------------------------- the wrappers' values */
 
@@ -2273,26 +3060,42 @@ int32_t ty_box_equals(void *a, void *b) {
 
 /* -------------------------------------------------------------- parsing */
 
+/* The code unit at index i, with the ASCII case answered from the string's own
+   bytes: the parsers walk a string one unit at a time, and the strings they are
+   handed are nearly always ASCII, where a unit index is a byte index. */
+static int32_t str_unit_fast(tystr *s, int64_t i) {
+  if (TY_STR_ASCII(s)) return (unsigned char)TY_STR_DATA(s)[i];
+  return (int32_t)str_unit_at(s, i);
+}
+
 /* The digit loop of Java's parsers, written the JDK's way: the accumulator is
    negative and the limit is the type's minimum, so that the most negative value
    of a type needs no special case, and every overflow test is a comparison
    before the operation that would overflow rather than after it. 0 means Java's
    parser would reject the string: an empty string, a lone sign, a digit outside
-   the radix, or a value that does not fit the type. */
-static int parse_int(const char *d, int64_t n, int32_t radix, int64_t limit_pos,
-                     int64_t limit_neg, int64_t *out) {
+   the radix, or a value that does not fit the type.
+
+   It walks code units and asks Character.digit about each one, which is what
+   Java's parser does -- so "１２３" is 123, since U+FF11 is a decimal digit, and
+   an OSMANYA digit above the BMP is not a number, since Java reads its two
+   surrogate units as two characters that are not digits. */
+static int parse_int(tystr *s, int32_t radix, int64_t limit_pos, int64_t limit_neg,
+                     int64_t *out) {
+  int64_t n = s->ulen;
   int64_t i = 0, result = 0, limit = limit_pos, multmin;
   int neg = 0;
+  int32_t first;
   if (n <= 0 || radix < 2 || radix > 36) return 0;
-  if (d[0] < '0') {
-    if (d[0] == '-') { neg = 1; limit = limit_neg; }
-    else if (d[0] != '+') return 0;
+  first = str_unit_fast(s, 0);
+  if (first < '0') {
+    if (first == '-') { neg = 1; limit = limit_neg; }
+    else if (first != '+') return 0;
     if (n == 1) return 0;
     i = 1;
   }
   multmin = limit / radix;
   for (; i < n; i++) {
-    int32_t digit = ty_char_digit((unsigned char)d[i], radix);
+    int32_t digit = ty_char_digit(str_unit_fast(s, i), radix);
     if (digit < 0 || result < multmin) return 0;
     result *= radix;
     if (result < limit + digit) return 0;
@@ -2304,12 +3107,12 @@ static int parse_int(const char *d, int64_t n, int32_t radix, int64_t limit_pos,
 int32_t ty_str_parsable_int(tystr *s, int32_t radix) {
   int64_t v;
   if (!s) return 0;
-  return parse_int(TY_STR_DATA(s), s->blen, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
+  return parse_int(s, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
 }
 int64_t ty_str_parsable_long(tystr *s, int32_t radix) {
   int64_t v;
   if (!s) return 0;
-  return parse_int(TY_STR_DATA(s), s->blen, radix, -INT64_MAX, INT64_MIN, &v);
+  return parse_int(s, radix, -INT64_MAX, INT64_MIN, &v);
 }
 /* The two conversions below run only on a string the parsable test above has
    already accepted, so the failure return is unreachable and the value is the
@@ -2320,13 +3123,13 @@ int64_t ty_str_parsable_long(tystr *s, int32_t radix) {
 int32_t ty_str_toint_radix(tystr *s, int32_t radix) {
   int64_t v = 0;
   if (!s) ty_npe();
-  parse_int(TY_STR_DATA(s), s->blen, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
+  parse_int(s, radix, -(int64_t)INT32_MAX, INT32_MIN, &v);
   return (int32_t)v;
 }
 int64_t ty_str_tolong_radix(tystr *s, int32_t radix) {
   int64_t v = 0;
   if (!s) ty_npe();
-  parse_int(TY_STR_DATA(s), s->blen, radix, -INT64_MAX, INT64_MIN, &v);
+  parse_int(s, radix, -INT64_MAX, INT64_MIN, &v);
   return v;
 }
 
@@ -2372,6 +3175,14 @@ static int parsable_hex_part(const char *d, int64_t i, int64_t end) {
 }
 static int parsable_float_str(const char *d, int64_t n) {
   int64_t i = 0, end = n;
+  /* Double.parseDouble and Float.parseFloat ignore leading and trailing
+     whitespace, "as if by the String.trim() method": every code unit <= ' ' at
+     either end and nothing else, so a U+00A0 is not whitespace to them and is
+     refused below. The conversion itself needs no trimming -- strtod skips the
+     leading whitespace and stops at the trailing whitespace -- so only this
+     grammar test has to look past it. */
+  while (i < end && (unsigned char)d[i] <= ' ') i++;
+  while (end > i && (unsigned char)d[end - 1] <= ' ') end--;
   if (i < n && (d[i] == '+' || d[i] == '-')) i++;
   if (n - i == 3 && memcmp(d + i, "NaN", 3) == 0) return 1;
   if (n - i == 8 && memcmp(d + i, "Infinity", 8) == 0) return 1;
@@ -2398,127 +3209,305 @@ float ty_str_tofloat_val(tystr *s) { return s ? strtof(TY_STR_DATA(s), NULL) : 0
 
 /* --------------------------------------------------------------- String */
 
-int32_t ty_str_cmp_ic(tystr *a, tystr *b) {
-  int64_t i = 0, n;
-  if (!a || !b) ty_npe();
-  n = a->blen < b->blen ? a->blen : b->blen;
-  for (; i < n; i++) {
-    int32_t x = ty_char_lower((unsigned char)TY_STR_DATA(a)[i]);
-    int32_t y = ty_char_lower((unsigned char)TY_STR_DATA(b)[i]);
-    if (x != y) return x - y;
+/* The case-insensitive comparisons: compareToIgnoreCase, equalsIgnoreCase and
+   regionMatches(ignoreCase,...) are Java's algorithm, which is a unit at a time
+   first -- what nearly every comparison is, and it needs no index arithmetic --
+   and only where two units differ does it look for the supplementary character
+   one of them may be half of, because "𐐨" and "𐐀" are one character each and
+   folding their two units would leave both alone. */
+/* Java's compareCodePointCI: the difference between two folded code points, 0
+   when they are equal ignoring case. The fold is two steps -- uppercase first
+   and lowercase of *that* -- and the two steps are not the same as lowercasing
+   once: the dotless i (U+0131) and 'i' are equal here because both uppercase to
+   'I', and neither lowercases to the other. */
+static int32_t uc_cmp_ci(int32_t a, int32_t b) {
+  int32_t ua, ub;
+  if (a == b) return 0;
+  ua = ty_char_upper(a);
+  ub = ty_char_upper(b);
+  if (ua == ub) return 0;
+  ua = ty_char_lower(ua);
+  ub = ty_char_lower(ub);
+  return ua - ub;
+}
+/* Java's codePointIncluding: the code point the unit at `index` is part of,
+   within the range [start, end) of the comparison, negated when the unit turned
+   out to be one half of it -- the caller then walks one unit further. */
+static int32_t str_cp_including(tystr *s, int32_t unit, int64_t index, int64_t start, int64_t end) {
+  if (unit_is_high(unit)) {
+    if (index + 1 < end) {
+      uint16_t c = str_unit_at(s, index + 1);
+      if (unit_is_low(c)) return -(0x10000 + ((unit - 0xD800) << 10) + (c - 0xDC00));
+    }
+  } else if (unit_is_low(unit) && index > start) {
+    uint16_t c = str_unit_at(s, index - 1);
+    if (unit_is_high(c)) return -(0x10000 + ((c - 0xD800) << 10) + (unit - 0xDC00));
   }
-  return (int32_t)(a->blen - b->blen);
+  return unit;
+}
+int32_t ty_str_cmp_ic(tystr *a, tystr *b) {
+  int64_t k1, k2, tlast, olast;
+  if (!a || !b) ty_npe();
+  tlast = a->ulen;
+  olast = b->ulen;
+  for (k1 = 0, k2 = 0; k1 < tlast && k2 < olast; k1++, k2++) {
+    int32_t cp1 = str_unit_fast(a, k1), cp2 = str_unit_fast(b, k2), diff;
+    if (cp1 == cp2 || uc_cmp_ci(cp1, cp2) == 0) continue;
+    cp1 = str_cp_including(a, cp1, k1, 0, tlast);
+    if (cp1 < 0) { k1++; cp1 = -cp1; }
+    cp2 = str_cp_including(b, cp2, k2, 0, olast);
+    if (cp2 < 0) { k2++; cp2 = -cp2; }
+    diff = uc_cmp_ci(cp1, cp2);
+    if (diff != 0) return diff;
+  }
+  return (int32_t)(tlast - olast);
 }
 int32_t ty_str_eq_ic(tystr *a, tystr *b) {
   if (a == b) return 1;
-  if (!a || !b || a->blen != b->blen) return 0;
+  if (!a || !b || a->ulen != b->ulen) return 0;
   return ty_str_cmp_ic(a, b) == 0;
+}
+/* regionMatches, the case-sensitive and the case-insensitive one in a single
+   helper because the bounds are the same and only the comparison differs.
+   Where both ranges begin and end on sequence boundaries the bytes are the
+   comparison: canonical encoding is a function of the unit sequence, so equal
+   units give equal bytes. The case-insensitive comparison is Java's
+   compareToCIImpl over the two ranges, which is why it is written the same way
+   as compareToIgnoreCase above rather than as a second fold. */
+int32_t ty_str_region_matches(tystr *s, int32_t ignore_case, int32_t toff,
+                              tystr *o, int32_t ooff, int32_t len) {
+  int64_t i, ia, ib, la, lb;
+  if (!s || !o) ty_npe();
+  if (toff < 0 || ooff < 0) return 0;
+  if (toff > s->ulen - len || ooff > o->ulen - len) return 0;
+  if (len <= 0) return 1; /* a negative length compares nothing, as in Java */
+  if (!ignore_case && str_on_boundary(s, toff) && str_on_boundary(s, toff + len) &&
+      str_on_boundary(o, ooff) && str_on_boundary(o, ooff + len)) {
+    int64_t a = str_byte_at(s, toff), b = str_byte_at(o, ooff);
+    int64_t na = str_byte_at(s, toff + len) - a, nb = str_byte_at(o, ooff + len) - b;
+    return na == nb && memcmp(TY_STR_DATA(s) + a, TY_STR_DATA(o) + b, (size_t)na) == 0;
+  }
+  if (!ignore_case) {
+    tyucur ca, cb;
+    ucur_at(&ca, s, toff);
+    ucur_at(&cb, o, ooff);
+    for (i = 0; i < len; i++)
+      if (ucur_next(&ca) != ucur_next(&cb)) return 0;
+    return 1;
+  }
+  la = (int64_t)toff + len;
+  lb = (int64_t)ooff + len;
+  for (ia = toff, ib = ooff; ia < la && ib < lb; ia++, ib++) {
+    int32_t cp1 = str_unit_fast(s, ia), cp2 = str_unit_fast(o, ib);
+    if (cp1 == cp2 || uc_cmp_ci(cp1, cp2) == 0) continue;
+    cp1 = str_cp_including(s, cp1, ia, toff, la);
+    if (cp1 < 0) { ia++; cp1 = -cp1; }
+    cp2 = str_cp_including(o, cp2, ib, ooff, lb);
+    if (cp2 < 0) { ib++; cp2 = -cp2; }
+    if (uc_cmp_ci(cp1, cp2) != 0) return 0;
+  }
+  return 1;
 }
 int32_t ty_str_starts_from(tystr *s, tystr *p, int32_t from) {
   if (!s || !p) ty_npe();
-  if (from < 0 || from > s->blen - p->blen) return 0;
-  return memcmp(TY_STR_DATA(s) + from, TY_STR_DATA(p), (size_t)p->blen) == 0;
+  if (from < 0 || from > s->ulen - p->ulen) return 0;
+  /* the same rule as startsWith: a byte prefix where the offset is a boundary,
+     a unit walk where it is not or where the needle ends inside a pair */
+  if (str_on_boundary(s, from)) {
+    int64_t at = from == 0 ? 0 : str_byte_at(s, from);
+    if (at + p->blen <= s->blen &&
+        memcmp(TY_STR_DATA(s) + at, TY_STR_DATA(p), (size_t)p->blen) == 0)
+      return 1;
+  }
+  return str_unit_range_eq(s, from, p);
 }
-/* A search for a code point above 0xFF can never match a byte, so it answers
-   -1 without walking the string: the runtime's chars are bytes. */
-static int64_t find_byte(tystr *s, int32_t c, int64_t from) {
+
+/* indexOf(int) searches for one code unit, and indexOf(int) with a value above
+   0xFFFF searches for the two units of that code point -- Java's rule, and the
+   reason a supplementary character can be found by either spelling. */
+static int64_t find_cp(tystr *s, int32_t ch, int64_t from) {
   int64_t i;
-  if (c < 0 || c > 0xFF) return -1;
-  for (i = from; i < s->blen; i++)
-    if ((unsigned char)TY_STR_DATA(s)[i] == (unsigned char)c) return i;
-  return -1;
+  if (ch < 0 || ch > 0x10FFFF) return -1;
+  if (from < 0) from = 0;
+  if (from >= s->ulen) return -1;
+  if (ch <= 0xFFFF) {
+    uint16_t want = (uint16_t)ch;
+    if (TY_STR_ASCII(s)) {
+      const char *d = TY_STR_DATA(s);
+      if (want >= 0x80) return -1;
+      for (i = from; i < s->blen; i++)
+        if ((unsigned char)d[i] == want) return i;
+      return -1;
+    }
+    {
+      tyucur c;
+      ucur_at(&c, s, from);
+      for (i = from; i < s->ulen; i++)
+        if (ucur_next(&c) == want) return i;
+      return -1;
+    }
+  }
+  {
+    int32_t hi = 0xD800 + ((ch - 0x10000) >> 10);
+    int32_t lo = 0xDC00 + ((ch - 0x10000) & 0x3FF);
+    tyucur c;
+    uint16_t a, b;
+    if (TY_STR_ASCII(s) || from > s->ulen - 2) return -1;
+    ucur_at(&c, s, from);
+    b = ucur_next(&c); /* the unit at from */
+    for (i = from; i + 1 < s->ulen; i++) {
+      a = b;
+      b = ucur_next(&c);
+      if (a == hi && b == lo) return i;
+    }
+    return -1;
+  }
 }
 int32_t ty_str_indexof_ch(tystr *s, int32_t c) {
   if (!s) ty_npe();
-  return (int32_t)find_byte(s, c, 0);
+  return (int32_t)find_cp(s, c, 0);
 }
 int32_t ty_str_indexof_ch_from(tystr *s, int32_t c, int32_t from) {
   if (!s) ty_npe();
-  if (from < 0) from = 0; /* Java treats a negative from as 0 */
-  return (int32_t)find_byte(s, c, from);
+  return (int32_t)find_cp(s, c, from); /* a negative from is 0, Java's rule */
 }
 int32_t ty_str_indexof_from(tystr *s, tystr *sub, int32_t from) {
-  int64_t i;
   if (!s || !sub) ty_npe();
-  if (from < 0) from = 0;
-  if (sub->blen == 0) return from <= s->blen ? from : (int32_t)s->blen;
-  for (i = from; i + sub->blen <= s->blen; i++)
-    if (memcmp(TY_STR_DATA(s) + i, TY_STR_DATA(sub), (size_t)sub->blen) == 0) return (int32_t)i;
-  return -1;
+  return (int32_t)str_find(s, sub, from);
 }
 int32_t ty_str_lastindexof(tystr *s, tystr *sub) {
   if (!s || !sub) ty_npe();
-  return ty_str_lastindexof_from(s, sub, (int32_t)s->blen);
+  return ty_str_lastindexof_from(s, sub, (int32_t)s->ulen);
 }
-/* Java's lastIndexOf answers the largest k <= from at which the needle starts,
-   and for a needle that is empty that is min(from, length) -- the loop below
-   gets there by starting at the right place and matching at once. */
+/* Java's lastIndexOf answers the largest k <= from at which the needle starts;
+   for a needle that is empty that is min(from, length). `from` is clamped the
+   way Java clamps it, by the unit counts. The needle that can sit inside a pair
+   -- or a `from` that does -- takes the unit walk, because the byte scan cannot
+   see those matches; where it can, the scan runs backwards by bytes and the
+   answer is the first offset it finds, capped at the sequence holding `from`. */
 int32_t ty_str_lastindexof_from(tystr *s, tystr *sub, int32_t from) {
-  int64_t i;
+  const char *d, *p;
+  int64_t at, max;
   if (!s || !sub) ty_npe();
-  if (from > s->blen) from = (int32_t)s->blen;
   if (from < 0) return -1;
-  i = (int64_t)from;
-  if (i + sub->blen > s->blen) i = s->blen - sub->blen;
-  for (; i >= 0; i--)
-    if (memcmp(TY_STR_DATA(s) + i, TY_STR_DATA(sub), (size_t)sub->blen) == 0) return (int32_t)i;
+  max = s->ulen - sub->ulen;
+  if (from > max) from = (int32_t)max;
+  if (sub->ulen == 0) return from < 0 ? -1 : from;
+  if (from < 0) return -1;
+  if (str_cuts_pair(sub) || !str_on_boundary(s, from)) {
+    int64_t k;
+    for (k = from; k >= 0; k--)
+      if (str_unit_range_eq(s, k, sub)) return (int32_t)k;
+    return -1;
+  }
+  d = TY_STR_DATA(s);
+  p = TY_STR_DATA(sub);
+  at = str_byte_at(s, from);
+  if (at > s->blen - sub->blen) at = s->blen - sub->blen;
+  for (; at >= 0; at--) {
+    if (d[at] != p[0]) continue;
+    if (memcmp(d + at, p, (size_t)sub->blen) == 0) return (int32_t)unit_of_byte(s, at);
+  }
   return -1;
+}
+static int64_t rfind_cp(tystr *s, int32_t ch, int64_t from) {
+  int64_t i;
+  if (ch < 0 || ch > 0x10FFFF) return -1;
+  if (from < 0) return -1;
+  if (ch > 0xFFFF) {
+    int32_t hi = 0xD800 + ((ch - 0x10000) >> 10);
+    int32_t lo = 0xDC00 + ((ch - 0x10000) & 0x3FF);
+    if (from > s->ulen - 2) from = s->ulen - 2;
+    for (i = from; i >= 0; i--)
+      if (str_unit_at(s, i) == (uint16_t)hi && str_unit_at(s, i + 1) == (uint16_t)lo)
+        return i;
+    return -1;
+  }
+  {
+    uint16_t want = (uint16_t)ch;
+    if (TY_STR_ASCII(s)) {
+      const char *d = TY_STR_DATA(s);
+      if (from > s->blen - 1) from = s->blen - 1;
+      if (want >= 0x80) return -1;
+      for (i = from; i >= 0; i--)
+        if ((unsigned char)d[i] == want) return i;
+      return -1;
+    }
+    if (from > s->ulen - 1) from = s->ulen - 1;
+    for (i = from; i >= 0; i--)
+      if (str_unit_at(s, i) == want) return i;
+    return -1;
+  }
 }
 int32_t ty_str_lastindexof_ch(tystr *s, int32_t c) {
   if (!s) ty_npe();
-  return ty_str_lastindexof_ch_from(s, c, (int32_t)s->blen);
+  return (int32_t)rfind_cp(s, c, s->ulen);
 }
 int32_t ty_str_lastindexof_ch_from(tystr *s, int32_t c, int32_t from) {
-  int64_t i;
   if (!s) ty_npe();
-  if (c < 0 || c > 0xFF) return -1;
-  if (from > s->blen) from = (int32_t)s->blen;
-  for (i = from; i >= 0; i--)
-    if ((unsigned char)TY_STR_DATA(s)[i] == (unsigned char)c) return (int32_t)i;
-  return -1;
-}
-int32_t ty_str_isblank(tystr *s) {
-  int64_t i;
-  if (!s) ty_npe();
-  for (i = 0; i < s->blen; i++)
-    if (!ty_is_whitespace((unsigned char)TY_STR_DATA(s)[i])) return 0;
-  return 1;
+  return (int32_t)rfind_cp(s, c, from);
 }
 /* strip is Java's strip: the whitespace isWhitespace accepts, and nothing else.
-   It is not trim, which takes every byte <= ' ' and is kept for compatibility
-   with the same method in Java. */
+   It is not trim, which takes every code unit <= ' ' and is kept for
+   compatibility with the same method in Java. The whitespace is Unicode's, so
+   U+3000 IDEOGRAPHIC SPACE is stripped and U+00A0 NO-BREAK SPACE is not; both
+   walks are over code points, because a supplementary character is one
+   character and its two units must not be asked the question separately. */
 static int64_t strip_left(tystr *s) {
   int64_t i = 0;
-  while (i < s->blen && ty_is_whitespace((unsigned char)TY_STR_DATA(s)[i])) i++;
+  while (i < s->ulen) {
+    int32_t cp = uc_cp_at(s, i);
+    if (cp != ' ' && cp != '\t' && !ty_is_whitespace(cp)) break;
+    i += uc_cp_len(s, i);
+  }
   return i;
 }
 static int64_t strip_right(tystr *s) {
-  int64_t b = s->blen;
-  while (b > 0 && ty_is_whitespace((unsigned char)TY_STR_DATA(s)[b - 1])) b--;
+  int64_t b = s->ulen;
+  while (b > 0) {
+    int32_t cp = uc_cp_before(s, b);
+    if (cp != ' ' && cp != '\t' && !ty_is_whitespace(cp)) break;
+    b -= uc_cp_len(s, b - 1);
+  }
   return b;
 }
-tystr *ty_str_strip(tystr *s) {
+int32_t ty_str_isblank(tystr *s) {
   if (!s) ty_npe();
-  return ty_str_new(TY_STR_DATA(s) + strip_left(s), strip_right(s) - strip_left(s));
+  return strip_left(s) == s->ulen;
+}
+tystr *ty_str_strip(tystr *s) {
+  int64_t a, b;
+  if (!s) ty_npe();
+  a = strip_left(s);
+  b = strip_right(s);
+  return str_slice(s, a, b > a ? b : a);
 }
 tystr *ty_str_strip_leading(tystr *s) {
   if (!s) ty_npe();
-  int64_t a = strip_left(s);
-  return ty_str_new(TY_STR_DATA(s) + a, s->blen - a);
+  return str_slice(s, strip_left(s), s->ulen);
 }
 tystr *ty_str_strip_trailing(tystr *s) {
   if (!s) ty_npe();
-  return ty_str_new(TY_STR_DATA(s), strip_right(s));
+  return str_slice(s, 0, strip_right(s));
 }
 /* Java's repeat: a negative count is an IllegalArgumentException, a count of
    zero is the empty string, and the result is the receiver repeated. */
 tystr *ty_str_repeat(tystr *s, int32_t n) {
   tystr *r;
   int64_t i;
+  int join;
   if (!s) ty_npe();
   if (n < 0) ty_throw((tyobj *)ty_illarg("count is negative"));
-  r = ty_str_new(NULL, (int64_t)n * s->blen);
+  if (n == 0 || s->blen == 0) return ty_str_new(TY_STR_DATA(s), 0);
+  /* A receiver ending in a high surrogate and beginning with a low one has the
+     two halves meet at every seam, and what meets is one four-byte sequence, not
+     two three-byte ones -- so the copies are laid down naively and str_finish
+     folds the seams, which also means the block has to be sized for the longer
+     form. An ASCII receiver cannot have a seam: it holds no surrogate. */
+  join = n > 1 && str_ends_high(s) && str_starts_low(s);
+  r = str_alloc((int64_t)n * s->blen, (int64_t)n * s->ulen, TY_STR_ASCII(s));
   for (i = 0; i < n; i++) memcpy(TY_STR_DATA(r) + i * s->blen, TY_STR_DATA(s), (size_t)s->blen);
+  if (join) str_finish(r);
   return r;
 }
 /* replace(String, String) is a literal replacement done left to right, and the
@@ -2530,6 +3519,9 @@ tystr *ty_str_replace_str(tystr *s, tystr *a, tystr *b) {
   char *p;
   tystr *r;
   if (!s || !a || !b) ty_npe();
+  /* Each piece can leave a high surrogate at the end of what has been written
+     and the next can begin with its low one, so the assembled bytes are
+     finished rather than simply measured. */
   if (a->blen == 0) {
     n = b->blen * (s->blen + 1) + s->blen;
   } else {
@@ -2558,38 +3550,173 @@ tystr *ty_str_replace_str(tystr *s, tystr *a, tystr *b) {
     }
     for (at = i; at < s->blen; at++) *p++ = TY_STR_DATA(s)[at];
   }
+  str_finish(r);
   return r;
 }
 
 /* -------------------------------------------------------------- char[] */
 
+/* toCharArray hands out the code units, not the bytes: "中文".toCharArray() is
+   the two chars, and an astral character is the two halves the array has room
+   for. */
 tyarr *ty_str_tochararray(tystr *s) {
   tyarr *a;
   int64_t i;
   if (!s) ty_npe();
-  a = ty_array_new(s->blen, 2);
-  for (i = 0; i < s->blen; i++) ((uint16_t *)a->data)[i] = (uint16_t)(unsigned char)TY_STR_DATA(s)[i];
+  a = ty_array_new(s->ulen, 2);
+  if (TY_STR_ASCII(s)) {
+    for (i = 0; i < s->blen; i++) ((uint16_t *)a->data)[i] = (unsigned char)TY_STR_DATA(s)[i];
+  } else {
+    tyucur c;
+    ucur_init(&c, s);
+    for (i = 0; i < s->ulen; i++) ((uint16_t *)a->data)[i] = ucur_next(&c);
+  }
   return a;
 }
 
+/* String(char[]) and String(char[], int, int): the array is the code units,
+   which is what makes new String("中文".toCharArray()) "中文" and a lone
+   surrogate possible. */
 tystr *ty_str_of_chars(tyarr *chars) {
-  tystr *r;
-  int64_t i;
   if (!chars) ty_npe();
-  r = ty_str_new(NULL, chars->len);
-  for (i = 0; i < chars->len; i++)
-    TY_STR_DATA(r)[i] = (char)(uint8_t)((uint16_t *)chars->data)[i];
-  return r;
+  return ty_str_of_units((const uint16_t *)chars->data, chars->len);
 }
 tystr *ty_str_of_chars_part(tyarr *chars, int32_t off, int32_t count) {
-  tystr *r;
-  int64_t i;
   if (!chars) ty_npe();
   if (off < 0 || count < 0 || off > chars->len - count) ty_sioobe(off, chars->len);
-  r = ty_str_new(NULL, count);
-  for (i = 0; i < count; i++)
-    TY_STR_DATA(r)[i] = (char)(uint8_t)((uint16_t *)chars->data)[off + i];
+  return ty_str_of_units((const uint16_t *)chars->data + off, count);
+}
+
+/* String(int[] codePoints, int offset, int count): the array holds code
+   points, so a supplementary one is a single element and becomes its two
+   units. Java rejects a value that is not a code point with an
+   IllegalArgumentException rather than producing one. */
+tystr *ty_str_of_ints(tyarr *cp, int32_t off, int32_t count) {
+  int64_t i, n = 0;
+  uint16_t *tmp;
+  tystr *r;
+  if (!cp) ty_npe();
+  if (off < 0 || count < 0 || off > cp->len - count) ty_sioobe(off, cp->len);
+  tmp = count > 0 ? (uint16_t *)malloc((size_t)count * 2 * sizeof(uint16_t)) : NULL;
+  for (i = 0; i < count; i++) {
+    int32_t c = ((int32_t *)cp->data)[off + i];
+    if (c < 0 || c > 0x10FFFF) {
+      char msg[64];
+      free(tmp);
+      snprintf(msg, sizeof msg, "Not a valid Unicode code point: 0x%X", (unsigned)c);
+      ty_throw((tyobj *)ty_illarg(msg));
+    }
+    if (c < 0x10000) {
+      tmp[n++] = (uint16_t)c;
+    } else {
+      int32_t v = c - 0x10000;
+      tmp[n++] = (uint16_t)(0xD800 + (v >> 10));
+      tmp[n++] = (uint16_t)(0xDC00 + (v & 0x3FF));
+    }
+  }
+  r = ty_str_of_units(tmp, n);
+  free(tmp);
   return r;
+}
+
+/* String.getChars(srcBegin, srcEnd, dst, dstBegin): copy a range of code units
+   into a char[], which is Java's contract -- it is the one accessor that names
+   the array as the destination rather than the answer. */
+void ty_str_get_chars(tystr *s, int32_t from, int32_t to, tyarr *dst, int32_t at) {
+  int64_t i;
+  if (!s || !dst) ty_npe();
+  if (from < 0 || to > s->ulen || from > to) ty_sioobe(from, s->ulen);
+  if (at < 0 || to - from > dst->len - at) ty_sioobe(at, dst->len);
+  if (TY_STR_ASCII(s)) {
+    for (i = from; i < to; i++)
+      ((uint16_t *)dst->data)[at + i - from] = (unsigned char)TY_STR_DATA(s)[i];
+    return;
+  }
+  {
+    tyucur c;
+    ucur_at(&c, s, from);
+    for (i = from; i < to; i++) ((uint16_t *)dst->data)[at + i - from] = ucur_next(&c);
+  }
+}
+
+/* indexOf and the code point family, in the order the plan lists them: the
+   index arithmetic walks a supplementary character as the two units it is, and
+   an index that lands between the two is a position Java's callers may name. */
+int32_t ty_str_code_point_at(tystr *s, int32_t i) {
+  uint16_t c;
+  if (!s || i < 0 || i >= s->ulen) ty_throw((tyobj *)ty_sioobe(i, s ? s->ulen : 0));
+  c = str_unit_at(s, i);
+  if (unit_is_high(c) && i + 1 < s->ulen) {
+    uint16_t d = str_unit_at(s, i + 1);
+    if (unit_is_low(d)) return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+  }
+  return c;
+}
+
+/* codePointBefore indexes the unit before `i`, and the pair it may be the low
+   half of is the one that ends there. */
+int32_t ty_str_code_point_before(tystr *s, int32_t i) {
+  uint16_t c;
+  if (!s || i < 1 || i > s->ulen) ty_throw((tyobj *)ty_sioobe(i - 1, s ? s->ulen : 0));
+  c = str_unit_at(s, i - 1);
+  if (unit_is_low(c) && i >= 2) {
+    uint16_t d = str_unit_at(s, i - 2);
+    if (unit_is_high(d)) return 0x10000 + ((d - 0xD800) << 10) + (c - 0xDC00);
+  }
+  return c;
+}
+
+/* codePointCount counts the code points a range of units spells, which is the
+   unit count less one for every pair wholly inside the range. A range whose
+   ends cut a pair does not count that pair: the halves are counted as the units
+   they are, which is what Java's arithmetic says too. */
+int32_t ty_str_code_point_count(tystr *s, int32_t from, int32_t to) {
+  int64_t i, n;
+  if (!s) ty_npe();
+  if (from < 0 || to > s->ulen || from > to) ty_throw((tyobj *)ty_sioobe(from, s->ulen));
+  n = to - from;
+  if (n == 0 || TY_STR_ASCII(s)) return (int32_t)n;
+  for (i = from; i < to;) {
+    uint16_t c = str_unit_at(s, i++);
+    if (unit_is_high(c) && i < to && unit_is_low(str_unit_at(s, i))) {
+      n--;
+      i++;
+    }
+  }
+  return (int32_t)n;
+}
+
+/* offsetByCodePoints walks code points from an index, forwards or backwards,
+   and an index that lands between the units of a pair is a position it starts
+   from or arrives at. Walking off either end is an IndexOutOfBoundsException in
+   Java; this runtime has no handle for that class, so the string one --
+   its subclass, and what a `catch (IndexOutOfBoundsException)` still catches --
+   is what comes out. */
+int32_t ty_str_offset_by_code_points(tystr *s, int32_t i, int32_t n) {
+  int64_t at;
+  if (!s) ty_npe();
+  if (i < 0 || i > s->ulen) ty_throw((tyobj *)ty_sioobe(i, s->ulen));
+  at = i;
+  if (n >= 0) {
+    int64_t left = n;
+    while (left > 0) {
+      uint16_t c;
+      if (at >= s->ulen) ty_throw((tyobj *)ty_sioobe(at, s->ulen));
+      c = str_unit_at(s, at++);
+      if (unit_is_high(c) && at < s->ulen && unit_is_low(str_unit_at(s, at))) at++;
+      left--;
+    }
+  } else {
+    int64_t left = n;
+    while (left < 0) {
+      uint16_t c;
+      if (at <= 0) ty_throw((tyobj *)ty_sioobe(at - 1, s->ulen));
+      c = str_unit_at(s, --at);
+      if (unit_is_low(c) && at > 0 && unit_is_high(str_unit_at(s, at - 1))) at--;
+      left++;
+    }
+  }
+  return (int32_t)at;
 }
 
 /* The UTF-8 bytes of the string, encoded the way the JDK's UTF-8 encoder does.
@@ -2858,33 +3985,39 @@ void *ty_sb_init(void *p, int64_t cap) {
   if (cap < 0) ty_throw((tyobj *)ty_negarr());
   if (sb->buf) return p;
   sb->cap = cap > 0 ? cap : 1;
-  sb->buf = (char *)malloc((size_t)sb->cap);
+  sb->buf = (uint16_t *)malloc((size_t)sb->cap * sizeof(uint16_t));
   return p;
 }
-static void lang_sb_ensure(tySB *sb, int64_t extra) {
-  if (sb->len + extra <= sb->cap) return;
-  while (sb->len + extra > sb->cap) sb->cap *= 2;
-  sb->buf = (char *)realloc(sb->buf, (size_t)sb->cap);
-}
-static void lang_sb_insert_raw(tySB *sb, int64_t at, const char *d, int64_t n) {
-  lang_sb_ensure(sb, n);
-  memmove(sb->buf + at + n, sb->buf + at, (size_t)(sb->len - at));
-  memcpy(sb->buf + at, d, (size_t)n);
+static void lang_sb_insert_raw(tySB *sb, int64_t at, const uint16_t *u, int64_t n) {
+  ty_sb_reserve(sb, n);
+  memmove(sb->buf + at + n, sb->buf + at, (size_t)(sb->len - at) * sizeof(uint16_t));
+  memcpy(sb->buf + at, u, (size_t)n * sizeof(uint16_t));
   sb->len += n;
+}
+/* The same for a String, whose bytes have to become units first. The shift
+   happens before the units are written so that a string being inserted into
+   the builder it came out of -- `sb.insert(0, sb.toString())` -- still reads
+   its source from the receiver's own buffer only after the move. */
+static void lang_sb_insert_str(tySB *sb, int64_t at, tystr *s) {
+  if (!s || s->ulen == 0) return;
+  ty_sb_reserve(sb, s->ulen);
+  memmove(sb->buf + at + s->ulen, sb->buf + at, (size_t)(sb->len - at) * sizeof(uint16_t));
+  ty_str_units(s, sb->buf + at);
+  sb->len += s->ulen;
 }
 /* Every index check below is Java's: an offset outside 0..length is a
    StringIndexOutOfBoundsException -- a buffer's, not an array's, which is why
    these call ty_sioobe and the array helpers call ty_aioobe. */
-static tySB *sb_checked(void *p, int64_t at, int64_t hi) {
+static tySB *sb_checked(void *p, int64_t at) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (at < 0 || at > hi) ty_sioobe(at, hi);
+  if (at < 0 || at > sb->len) ty_sioobe(at, sb->len);
   return sb;
 }
 void *ty_sb_insert_str(void *p, int32_t at, tystr *s) {
-  tySB *sb = sb_checked(p, at, ((tySB *)p)->len);
+  tySB *sb = sb_checked(p, at);
   if (!s) ty_npe();
-  lang_sb_insert_raw(sb, at, TY_STR_DATA(s), s->blen);
+  lang_sb_insert_str(sb, at, s);
   return p;
 }
 void *ty_sb_insert_obj(void *p, int32_t at, void *o) {
@@ -2906,17 +4039,25 @@ void *ty_sb_insert_bool(void *p, int32_t at, int32_t v) {
   return ty_sb_insert_str(p, at, ty_str_of_bool(v));
 }
 void *ty_sb_insert_char(void *p, int32_t at, uint16_t c) {
-  return ty_sb_insert_str(p, at, ty_str_of_char(c));
+  tySB *sb = sb_checked(p, at);
+  /* one unit, which may be half of an astral character: the builder holds
+     units, so a pair appended or inserted one half at a time is the character */
+  lang_sb_insert_raw(sb, at, &c, 1);
+  return p;
 }
 void *ty_sb_insert_chars(void *p, int32_t at, tyarr *chars) {
+  tySB *sb = sb_checked(p, at);
   if (!chars) ty_npe();
-  return ty_sb_insert_obj(p, at, ty_str_of_chars(chars));
+  lang_sb_insert_raw(sb, at, (const uint16_t *)chars->data, chars->len);
+  return p;
 }
 void *ty_sb_append_chars(void *p, tyarr *chars) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (!chars) ty_npe();
-  ty_sb_append_str(p, ty_str_of_chars(chars));
+  ty_sb_reserve(sb, chars->len);
+  memcpy(sb->buf + sb->len, chars->data, (size_t)chars->len * sizeof(uint16_t));
+  sb->len += chars->len;
   return p;
 }
 void *ty_sb_append_float(void *p, float v) { return ty_sb_append_str(p, ty_str_of_float(v)); }
@@ -2926,8 +4067,7 @@ void *ty_sb_ensure(void *p, int32_t cap) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (cap > sb->cap) {
-    while (sb->cap < cap) sb->cap *= 2;
-    sb->buf = (char *)realloc(sb->buf, (size_t)sb->cap);
+    ty_sb_reserve(sb, cap - sb->len);
   }
   return p;
 }
@@ -2935,24 +4075,27 @@ int32_t ty_sb_charat(void *p, int32_t at) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
-  return (unsigned char)sb->buf[at];
+  return sb->buf[at];
 }
 void *ty_sb_set_charat(void *p, int32_t at, uint16_t c) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
-  sb->buf[at] = (char)(uint8_t)c;
+  sb->buf[at] = c;
   return p;
 }
 /* delete is half open: [from, to), and to == length is allowed. deleteCharAt
-   is delete(at, at+1). Java answers an out-of-range index with
-   StringIndexOutOfBoundsException; an empty range is simply a no-op. */
+   is delete(at, at+1), which is the one place the range is not clamped: an
+   index outside the text is refused. `to` past the end is *clamped* rather
+   than refused -- Java's delete answers sb.delete(2, 100) by deleting to the
+   end, and only a start outside 0..length or past the end throws. An empty
+   range is a no-op. */
 void *ty_sb_delete(void *p, int32_t from, int32_t to) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
+  if (to > sb->len) to = sb->len;
   if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
-  if (to > sb->len) ty_sioobe(to, sb->len);
-  memmove(sb->buf + from, sb->buf + to, (size_t)(sb->len - to));
+  memmove(sb->buf + from, sb->buf + to, (size_t)(sb->len - to) * sizeof(uint16_t));
   sb->len -= to - from;
   return p;
 }
@@ -2960,28 +4103,47 @@ void *ty_sb_delete_charat(void *p, int32_t at) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
-  memmove(sb->buf + at, sb->buf + at + 1, (size_t)(sb->len - at - 1));
+  memmove(sb->buf + at, sb->buf + at + 1, (size_t)(sb->len - at - 1) * sizeof(uint16_t));
   sb->len--;
   return p;
 }
+/* replace has the same clamping, and it is the one builder method that refuses
+   a null String with NullPointerException rather than inserting "null": Java
+   reads str.length() after the bounds check, so an out-of-range range is the
+   StringIndexOutOfBoundsException and a null replacement inside one is the
+   NullPointerException. */
 void *ty_sb_replace(void *p, int32_t from, int32_t to, tystr *s) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (!s) ty_npe();
+  if (to > sb->len) to = sb->len;
   if (from < 0 || from > sb->len || from > to) ty_sioobe(from, sb->len);
-  if (to > sb->len) ty_sioobe(to, sb->len);
+  if (!s) ty_npe();
   ty_sb_delete(p, from, to);
-  lang_sb_insert_raw(sb, from, TY_STR_DATA(s), s->blen);
+  lang_sb_insert_str(sb, from, s);
   return p;
 }
+/* Java's reverse: the units are reversed, and then every half of an astral
+   character that the reversal put in the wrong order is swapped back with its
+   partner, so "ab中" gives "中ba" and an emoji survives the trip. */
 void *ty_sb_reverse(void *p) {
   tySB *sb = (tySB *)p;
   int64_t i;
   if (!sb) ty_npe();
-  for (i = 0; i < sb->len / 2; i++) {
-    char t = sb->buf[i];
-    sb->buf[i] = sb->buf[sb->len - 1 - i];
-    sb->buf[sb->len - 1 - i] = t;
+  if (sb->len >= 2) {
+    int64_t n = sb->len - 1;
+    for (i = (n - 1) >> 1; i >= 0; i--) {
+      uint16_t t = sb->buf[i];
+      sb->buf[i] = sb->buf[n - i];
+      sb->buf[n - i] = t;
+    }
+  }
+  for (i = 0; i + 1 < sb->len; i++) {
+    if (unit_is_low(sb->buf[i]) && unit_is_high(sb->buf[i + 1])) {
+      uint16_t t = sb->buf[i];
+      sb->buf[i] = sb->buf[i + 1];
+      sb->buf[i + 1] = t;
+      i++;
+    }
   }
   return p;
 }
@@ -2992,17 +4154,33 @@ void *ty_sb_set_length(void *p, int32_t n) {
   if (!sb) ty_npe();
   if (n < 0) ty_sioobe(n, sb->len);
   if (n > sb->len) {
-    lang_sb_ensure(sb, n - sb->len);
-    memset(sb->buf + sb->len, 0, (size_t)(n - sb->len));
+    ty_sb_reserve(sb, n - sb->len);
+    memset(sb->buf + sb->len, 0, (size_t)(n - sb->len) * sizeof(uint16_t));
   }
   sb->len = n;
   return p;
 }
+/* A builder's buffer is units and a needle is a String, so the needle is
+   decoded once into units and the scan is then a memcmp over them. */
+static uint16_t *sb_needle(tystr *s) {
+  uint16_t *u = (uint16_t *)malloc((size_t)(s->ulen > 0 ? s->ulen : 1) * sizeof(uint16_t));
+  ty_str_units(s, u);
+  return u;
+}
 static int32_t sb_find(tySB *sb, tystr *s, int64_t from) {
-  int64_t i;
-  if (s->blen == 0) return from <= sb->len ? (int32_t)from : -1;
-  for (i = from; i + s->blen <= sb->len; i++)
-    if (memcmp(sb->buf + i, TY_STR_DATA(s), (size_t)s->blen) == 0) return (int32_t)i;
+  int64_t i, n = s->ulen;
+  uint16_t *needle;
+  if (n == 0) return from <= sb->len ? (int32_t)from : -1;
+  if (from < 0) from = 0;
+  if (from > sb->len - n) return -1;
+  needle = sb_needle(s);
+  for (i = from; i + n <= sb->len; i++) {
+    if (memcmp(sb->buf + i, needle, (size_t)n * sizeof(uint16_t)) == 0) {
+      free(needle);
+      return (int32_t)i;
+    }
+  }
+  free(needle);
   return -1;
 }
 int32_t ty_sb_indexof(void *p, tystr *s) {
@@ -3020,25 +4198,34 @@ int32_t ty_sb_indexof_from(void *p, tystr *s, int32_t from) {
 }
 int32_t ty_sb_lastindexof(void *p, tystr *s) {
   tySB *sb = (tySB *)p;
-  int64_t i;
+  int64_t i, n;
+  uint16_t *needle;
   if (!sb) ty_npe();
   if (!s) ty_npe();
-  if (s->blen == 0) return (int32_t)sb->len;
-  for (i = sb->len - s->blen; i >= 0; i--)
-    if (memcmp(sb->buf + i, TY_STR_DATA(s), (size_t)s->blen) == 0) return (int32_t)i;
+  n = s->ulen;
+  if (n == 0) return (int32_t)sb->len;
+  if (n > sb->len) return -1;
+  needle = sb_needle(s);
+  for (i = sb->len - n; i >= 0; i--) {
+    if (memcmp(sb->buf + i, needle, (size_t)n * sizeof(uint16_t)) == 0) {
+      free(needle);
+      return (int32_t)i;
+    }
+  }
+  free(needle);
   return -1;
 }
 tystr *ty_sb_substring(void *p, int32_t from) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (from < 0 || from > sb->len) ty_sioobe(from, sb->len);
-  return ty_str_new(sb->buf + from, sb->len - from);
+  return ty_str_of_units(sb->buf + from, sb->len - from);
 }
 tystr *ty_sb_substring_to(void *p, int32_t from, int32_t to) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (from < 0 || to > sb->len || from > to) ty_sioobe(from, sb->len);
-  return ty_str_new(sb->buf + from, to - from);
+  return ty_str_of_units(sb->buf + from, to - from);
 }
 
 /* --------------------------------------------------------- String.format */
@@ -3370,14 +4557,20 @@ typedef struct {
 /* Java's padding rule, in one place: the sign or the radix prefix goes first,
    then -- if the zero flag is on and the conversion is not left justified -- the
    zeros that fill the width, then the digits. Grouping, when it is on, is
-   already inside the body. */
+   already inside the body.
+
+   The width counts characters and the body is bytes, so the caller says how
+   many code units its body is: for every conversion but %s the two are the same
+   number and the argument is `blen`, and for %s it is the string's ulen. That
+   is what makes String.format("[%5s|%-4s]", "中", "ab中") pad to five and four
+   rather than to the six and five bytes the two strings occupy. */
 static void fmt_put(fmtbuf *b, const fmtflags *f, const char *prefix, int64_t plen,
-                    const char *body, int64_t blen) {
+                    const char *body, int64_t blen, int64_t bunits) {
   /* The parentheses flag replaces the minus of a negative number, and the
      closing parenthesis is part of the field the width counts -- so `%(10d` of
      -42 is "      (42)", six spaces and four characters. */
   int paren = f->paren && plen == 1 && prefix[0] == '-';
-  int64_t total = plen + blen + (paren ? 1 : 0);
+  int64_t total = plen + bunits + (paren ? 1 : 0);
   int64_t pad = f->width > 0 && f->width > total ? f->width - total : 0;
   if (paren) prefix = "(";
   if (f->minus) {
@@ -3422,7 +4615,7 @@ static void fmt_null(fmtbuf *out, const fmtflags *f, int upper, int32_t P) {
   if (upper)
     for (k = 0; k < blen; k++) body[k] = (char)ty_char_upper((unsigned char)body[k]);
   nf.zero = 0;
-  fmt_put(out, &nf, "", 0, body, blen);
+  fmt_put(out, &nf, "", 0, body, blen, blen);
 }
 
 /* A number formatted into `t` is moved into the body, with its integer part
@@ -3448,19 +4641,33 @@ static void move_number(fmtbuf *body, fmtbuf *t, const fmtflags *f) {
 
 static const char *arg_class(void *o) {
   if (!o) return "null";
-  return ty_class_jname(((tyobj *)o)->cls);
+  return ((tyobj *)o)->cls->name;
+}
+static int arg_is_javalang(void *o) {
+  int i;
+  if (!o) return 0;
+  if (((tyobj *)o)->cls == TY_STRING) return 1;
+  for (i = 1; i <= 8; i++)
+    if (((tyobj *)o)->cls == TY_BOX[i]) return 1;
+  return 0;
 }
 
 /* Java refuses an argument a conversion has no meaning for, and names the class
-   it got instead: "d != java.lang.Character", and "d != java.util.ArrayList"
-   for one of its own containers. ty_class_jname is what makes both of those the
-   JDK's spelling -- this used to strip the package and put "java.lang." back on
-   by hand, which named String and the wrappers right and everything else after
-   this runtime. The exception is IllegalFormatConversionException, which the
-   runtime cannot raise, so its message travels on IllegalArgumentException. */
+   it got instead: "d != java.lang.Character". The exception is
+   IllegalFormatConversionException, which the runtime cannot raise, so its
+   message travels on IllegalArgumentException. */
 static void bad_arg(char conv, void *o) {
   char msg[160];
-  snprintf(msg, sizeof msg, "%c != %s", conv, arg_class(o));
+  const char *name = arg_class(o);
+  if (arg_is_javalang(o)) {
+    /* Java names its own classes by their binary name; here the class carries
+       this runtime's package, so the simple name is what is left of it */
+    const char *dot = strrchr(name, '.');
+    if (dot) name = dot + 1;
+    snprintf(msg, sizeof msg, "%c != java.lang.%s", conv, name);
+  } else {
+    snprintf(msg, sizeof msg, "%c != %s", conv, name);
+  }
   fmt_abandon();
   ty_throw(ty_illarg(msg));
 }
@@ -3762,7 +4969,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
     if (conv == '%') {
       if (f.minus && f.width < 0) bad_width(fmt, spec0, i - spec0);
       if (f.alt || f.plus || f.space || f.zero || f.comma || f.paren) bad_flag_set(&f);
-      fmt_put(&out, &f, "", 0, "%", 1);
+      fmt_put(&out, &f, "", 0, "%", 1, 1);
       continue;
     }
     check_flags(conv, &f, fmt, spec0, i - spec0);
@@ -3772,7 +4979,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
         void *o = pick_arg(args, &ai, fixed, &last, &have_last, relative, fmt, spec0, i - spec0);
         char *heap = NULL;
         const char *body;
-        int64_t blen, k;
+        int64_t blen, k, bunits;
         if (conv == 'b' || conv == 'B') {
           /* a Boolean prints its value, anything else non-null prints "true",
              and the word is five letters long when the value is false */
@@ -3781,6 +4988,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
           body = t;
           blen = (int64_t)strlen(t);
           if (P >= 0 && blen > P) blen = P;
+          bunits = blen; /* the word is ASCII: a byte is a code unit */
         } else if (conv == 'h' || conv == 'H') {
           /* Java's %h is Integer.toHexString(arg.hashCode()), so it is the
              object's own hashCode that answers and not the identity the
@@ -3793,6 +5001,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
           body = TY_STR_DATA(s);
           blen = s->blen;
           if (P >= 0 && blen > P) blen = P;
+          bunits = blen; /* hexadecimal digits are ASCII too */
         } else if (conv == 'c' || conv == 'C') {
           /* a null argument prints as "null" here too, which is why the
              character is fetched only once there is an argument to fetch it
@@ -3800,11 +5009,17 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
           tystr *s = o ? ty_str_of_char((uint16_t)char_arg(conv, o)) : ty_str_intern("null");
           body = TY_STR_DATA(s);
           blen = s->blen;
+          bunits = s->ulen;
         } else {
+          /* The precision of %s cuts the string to that many characters, and a
+             character is a code unit: %.1s of one emoji is its high surrogate,
+             which is the string Java's Formatter hands to substring. Cutting
+             bytes instead would leave a string that is not a prefix of units. */
           tystr *s = ty_str_of_obj(o);
+          if (P >= 0 && P < s->ulen) s = str_slice(s, 0, P);
           body = TY_STR_DATA(s);
           blen = s->blen;
-          if (P >= 0 && blen > P) blen = P;
+          bunits = s->ulen;
         }
         if (conv == 'S' || conv == 'H' || conv == 'C' || conv == 'B') {
           heap = (char *)malloc((size_t)(blen > 0 ? blen : 1));
@@ -3812,7 +5027,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
             heap[k] = (char)ty_char_upper((unsigned char)body[k]);
           body = heap;
         }
-        fmt_put(&out, &f, "", 0, body, blen);
+        fmt_put(&out, &f, "", 0, body, blen, bunits);
         free(heap);
         break;
       }
@@ -3872,7 +5087,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
           memcpy(grp, raw, (size_t)n);
           blen = n;
         }
-        fmt_put(&out, &f, prefix, plen, grp, blen);
+        fmt_put(&out, &f, prefix, plen, grp, blen, blen);
         break;
       }
       case 'e': case 'E': case 'f': case 'g': case 'G': case 'a': case 'A': {
@@ -3935,7 +5150,7 @@ tystr *ty_str_format(tystr *fmt, tyarr *args) {
           free(t.buf);
           fmt_drop(&t);
         }
-        fmt_put(&out, &f, prefix, plen, body.buf, body.len);
+        fmt_put(&out, &f, prefix, plen, body.buf, body.len, body.len);
         free(body.buf);
         fmt_drop(&body);
         break;
