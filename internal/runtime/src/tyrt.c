@@ -179,12 +179,12 @@ __attribute__((noinline)) void ty_frame_enter_(tyframe *f, void **slots, int32_t
   ty_frames = f;
 }
 
-void ty_frame_put(tyframe *f, int32_t k, void *p) {
-  if (k < 0 || k >= f->cap) {
-    fprintf(stderr, "teyru: frame %d records word %d of a map of %d\n", f->fno, k, f->cap);
-    abort();
-  }
-  f->slots[k] = p;
+/* The out-of-line half of ty_frame_put (see tyrt.h): reached only when the
+   generated code records an index outside the array its own prologue declared,
+   which is a compiler bug that must not be able to fail quietly. */
+void ty_frame_put_bad(tyframe *f, int32_t k) {
+  fprintf(stderr, "teyru: frame %d records word %d of a map of %d\n", f->fno, k, f->cap);
+  abort();
 }
 
 /* Leave it. Only the innermost frame may unlink itself: after a longjmp has

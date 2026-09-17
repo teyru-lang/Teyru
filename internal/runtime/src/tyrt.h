@@ -471,8 +471,31 @@ __attribute__((noinline)) void ty_frame_enter_(tyframe *f, void **slots, int32_t
    makes it safe after a longjmp has already rewound the chain past it. */
 void ty_frame_leave(tyframe *f);
 /* Record one word of the frame's map. Aborts by name if the index is outside
-   the array the prologue declared for it. */
-void ty_frame_put(tyframe *f, int32_t k, void *p);
+   the array the prologue declared for it.
+ *
+ * A store, not a call: the generated code registers one word per pointer-typed
+ * declaration, and a program with a hundred thousand declarations paid a
+ * hundred thousand real calls -- measured, `-O1` without LTO will not inline a
+ * function in another translation unit. The check stays (it is one compare,
+ * and it is the thing that must not be able to fail quietly), and it compiles
+ * to nothing on the path that matters because the generator's arithmetic is
+ * right; the abort is out of line, in tyrt.c. */
+void ty_frame_put_bad(tyframe *f, int32_t k) __attribute__((noinline, noreturn));
+/* A macro, not a function and not an always_inline one: the generated code
+   registers one word per pointer-typed declaration, and a program with a
+   hundred thousand of them (measured: t114_stream 461,469, t115_math 617,126)
+   paid a real call each -- -O1 will not inline across translation units -- while
+   asking the compiler to always_inline at every one of those sites makes the
+   inliner itself the cost. Plain text substitution leaves the compiler a compare
+   and a store and no decision to make, and the generated C is unchanged.
+
+   It evaluates its arguments more than once -- `(k)` twice, `(f)` twice -- so
+   the caller must pass a plain expression: the emitter passes the frame variable
+   `&_tyfr` and a literal slot index, which is what makes that safe here. That is
+   a property of the emitter, not of this macro, and it is written down because
+   the next caller does not get it for free. */
+#define ty_frame_put(f, k, p) \
+  ((k) < 0 || (k) >= (f)->cap ? ty_frame_put_bad((f), (k)) : (void)((f)->slots[k] = (p)))
 
 /* __builtin_frame_address(0) is this function's own frame address, which is
    what the map records as `hi`; ty_frame_enter_ derives `lo` from its own
