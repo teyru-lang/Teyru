@@ -450,6 +450,18 @@ source → lexer → parser → ast → sema → codegen
   gcc -O0 不像 clang 與 gcc ≥ -O1 會把沒人引用的 static 丟掉；因此 `scripts/stack-matrix.sh` 的
   gcc -O0 那一格是 BLOCKED，不是通過。LLVM 後端不吃 `Thread`（`TY-INT-0100`，指名拒絕），
   矩陣因此對它改用主執行緒的程式。
+- **這個機制的代價：`bench_fib` 長跑回退 32%（owner 已裁決，不是沒量到）**：同一台機器、
+  `/usr/bin/time -v` 量**建好的執行檔**、十次一批：`bench_fib` 放大到 fib(38) 是
+  **0.81 s → 1.07 s** 牆鐘（每次 81 ms → 107 ms），user 0.80 → 1.04。來源就是每次呼叫多一次
+  框架位址檢查（約 0.4 ns／呼叫，而 fib(38) 有約 6300 萬次呼叫）。計畫 §W4 的驗收寫「回退不超過
+  10%，超過就先做葉函式與 SCC 優化再測」，而**那兩個補救到不了 10%**：`fib` 不是葉函式（它呼叫
+  自己），而「只對呼叫圖裡在強連通分量內的函式插入」仍然會保留**每一個自我遞迴函式**的檢查——`fib`
+  正是那個自我遞迴函式，SCC 只有它一個。因此這一項以「機制落地、六格建置矩陣全綠、代價如實記錄」
+  收尾；回退幅度、理由與「不改計畫指定的做法」由 owner 記為裁決（2026-09-17），不是安靜接受。
+  還沒有試的方向（留給下一個量的人，不要當成未驗證的結論）：讓檢查本身更便宜——`__builtin_frame_address(0)`
+  會逼出 frame pointer 並可能擋掉內聯，改用區域變數的位址或 `__builtin_stack_address` 可能更省；
+  以及 D4 的備選（純保護頁＋訊號）每次呼叫零成本，但那樣就得從訊號處理器 longjmp 才能丟出可攔截的
+  `StackOverflowError`，而計畫明文禁止。
 - **執行期的兩個診斷開關（`tyrt.c` 的 `ty_gc_init`）**：`TEYRU_GC_STRESS=N` 讓**每 N 次配置**
   強制收集一次（把 `ty_gc_threshold` 設成 -1，內聯快速路徑因此把每一次配置都交給
   `ty_alloc_slow` 計數；N=1 就是每次配置都收集）；`TEYRU_GCTRACE=1` 讓每次收集在 stderr 印一行
