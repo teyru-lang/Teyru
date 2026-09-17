@@ -83,6 +83,15 @@ func (p *printer) imported(fqn string) string {
 	return name
 }
 
+// isReaderish reports whether an argument is already something Java's
+// BufferedReader takes: a nested new whose class is named ...Reader.
+func isReaderish(e ast.Expr) bool {
+	if n, ok := e.(*ast.New); ok && n.Type != nil {
+		return strings.HasSuffix(n.Type.Name, "Reader")
+	}
+	return false
+}
+
 // name rewrites a class name as the source wrote it into its Java spelling and
 // records the import it needs. A dotted name is left alone: a java.* path and a
 // nested type are both valid Java as written.
@@ -1291,6 +1300,28 @@ func (p *printer) newExpr(d *ast.New) string {
 	qual := ""
 	if d.Outer != nil {
 		qual = p.exprAt(d.Outer, precPrim) + "."
+	}
+	/* new BufferedReader("text") is a Teyru convenience: Java's BufferedReader
+	   takes a Reader, so the same program is its BufferedReader over a
+	   StringReader, and printing the Teyru form makes javac reject the file
+	   ("String cannot be converted to Reader"). The test is the argument's
+	   shape rather than its type, because a string literal is a String and
+	   nothing else -- which is what the programs using this form write. A
+	   String variable would print the Teyru form and be refused, which is a
+	   visible failure rather than a wrong answer. */
+	if d.Outer == nil && len(d.Args) == 1 && d.Type != nil && d.Type.Name == "BufferedReader" {
+		if lit, ok := d.Args[0].(*ast.Literal); ok && lit.Kind == ast.LitString {
+			return "new BufferedReader(new java.io.StringReader(" + args[0] + "))"
+		}
+		/* Any other one-argument form -- a Reader, which Java takes as it
+		   stands, or a stream, which it needs wrapped and which this printer
+		   cannot tell apart because the type of an argument is not in the tree
+		   it walks -- is refused rather than printed wrong. The differential
+		   counts a refused program as not translated, which is a stated gap,
+		   and the program still runs in the suite. */
+		if !isReaderish(d.Args[0]) {
+			p.refuse(d.Type.Pos, "new BufferedReader(<stream>)", "Java's BufferedReader takes a Reader and this printer cannot see the argument's type")
+		}
 	}
 	head := qual + "new " + p.typeExpr(d.Type) + "(" + strings.Join(args, ", ") + ")"
 	if d.Body == nil {
