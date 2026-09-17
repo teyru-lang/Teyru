@@ -35,12 +35,61 @@ void ty_unimplemented(const char *what) {
   exit(70);
 }
 
+/* Run a class's initializer once, and do not let any thread see the class
+   before it has finished. The call sites are lazy guards -- the compiler runs a
+   program's own classes at startup and leaves a library class to its first use
+   -- and a guard that only tested a flag cannot keep that promise, because a
+   thread that skips the initializer because it saw the flag reads static fields
+   that are still null: ty_npe(), and with no message, since a null field is not
+   the null a program wrote. So the initializer runs under the class's own
+   monitor and the "finished" bit is published only once it has returned, which
+   is what JLS 12.4.2 promises and what the guards assume.
+
+   The monitor is the whole of the state machine, because the thread holding it
+   is the only thread that can be inside this function for that class: every
+   other one waits in ty_sync_enter, and finds the finished bit set when it gets
+   in. TY_CLS_BUSY, set and cleared under the same monitor, is what separates
+   re-entering itself from being re-entered -- an initializer that reaches its
+   own class, which is what a cache built by the factory that reads it does
+   (04_boxing.teyru), finds the bit its own thread set and proceeds, where
+   waiting for it would be waiting for itself.
+
+   A tyclass is static data, so it cannot move and the monitors' address key is
+   stable for it. Two initializers that reach each other's classes can deadlock
+   here, as they can in Java, where the same two monitors would be held. */
 void ty_clinit(tyclass *c) {
-  if (!c || (c->flags & 8)) return;
-  c->flags |= TY_CLS_INIT;
-  if (c->super) ty_clinit(c->super);
-  for (int32_t i = 0; i < c->niface; i++) ty_clinit(c->ifaces[i]);
-  if (c->clinit) ((void (*)(void))c->clinit)();
+  if (!c || (__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & TY_CLS_INIT)) return;
+  ty_sync_enter(c);
+  if (!(c->flags & TY_CLS_INIT) && !(c->flags & TY_CLS_BUSY)) {
+    c->flags |= TY_CLS_BUSY;
+    /* An initializer is program code, so it can throw. The frame is the one
+       generated try/catch and a new thread both use; leaving by way of the
+       exception with the monitor still held would stop every other thread that
+       ever reaches this class. */
+    tycatch frame;
+    frame.prev = ty_cur_catch;
+    frame.ex = NULL;
+    ty_cur_catch = &frame;
+    if (setjmp(frame.buf) == 0) {
+      if (c->super) ty_clinit(c->super);
+      for (int32_t i = 0; i < c->niface; i++) ty_clinit(c->ifaces[i]);
+      if (c->clinit) ((void (*)(void))c->clinit)();
+      ty_cur_catch = frame.prev;
+      __atomic_fetch_and(&c->flags, ~TY_CLS_BUSY, __ATOMIC_RELAXED);
+      __atomic_fetch_or(&c->flags, TY_CLS_INIT, __ATOMIC_RELEASE);
+    } else {
+      /* An initializer that threw leaves the class uninitialized rather than
+         half built, and the next thread to use it runs the initializer itself.
+         Java calls such a class erroneous and throws NoClassDefFoundError for
+         every later use; there is no bit here for "erroneous", and running it
+         again is the answer that never hands a half-built class over. */
+      ty_cur_catch = frame.prev;
+      c->flags &= ~TY_CLS_BUSY;
+      ty_sync_exit(c);
+      ty_throw(frame.ex);
+    }
+  }
+  ty_sync_exit(c);
 }
 
 /* ---- Class objects ------------------------------------------------------ */
