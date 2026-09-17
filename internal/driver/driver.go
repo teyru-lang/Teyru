@@ -1069,7 +1069,19 @@ func Run(exe string, args []string) (int, error) {
 	return 1, err
 }
 
+// version is the compiler's version, and it is a variable rather than a constant
+// so that a release build can set it from the tag it is cutting:
+//
+//	go build -ldflags "-X github.com/teyru-lang/Teyru/internal/driver.version=0.4.0"
+//
+// A build from the tree reports this default, which is the number the release is
+// cut with -- the two agreeing is the point, so when the release changes, this
+// changes in the same commit as the tag's release notes. It said 0.2.0 while the
+// project had moved well past it, which is how a version string stops being
+// information.
+var version = "0.4.0"
+
 // Version reports the compiler version string.
 func Version() string {
-	return "teyru 0.2.0 (" + runtime.GOOS + "/" + runtime.GOARCH + ")"
+	return "teyru " + version + " (" + runtime.GOOS + "/" + runtime.GOARCH + ")"
 }
