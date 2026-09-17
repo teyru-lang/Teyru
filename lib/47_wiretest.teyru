@@ -202,8 +202,13 @@ class RawClient {
       return res
     }
     if (res.chunked) {
-      res.body = readChunks()
-      res.bodyBytes = res.body.getBytes()
+      // The bytes are read as bytes and the text is a view of them. Decoding to a
+      // String and encoding back is lossless only while a String is a byte
+      // container, which it is not: a chunked body of arbitrary bytes came back
+      // longer than it was sent (256 echoed as 512) because every byte the
+      // decoder could not read as UTF-8 became a replacement character.
+      res.bodyBytes = readChunkBytes()
+      res.body = Net.stringFrom(res.bodyBytes, 0, res.bodyBytes.length)
       return res
     }
     if (length > 0) {
