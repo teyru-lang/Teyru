@@ -1867,7 +1867,10 @@ tystr *ty_str_of_float(float v) {
 tystr *ty_object_tostring(void *o) {
   if (!o) return ty_str_intern("null");
   char buf[128];
-  int n = snprintf(buf, sizeof buf, "%s@%llx", ((tyobj *)o)->cls->name, (unsigned long long)(uintptr_t)o);
+  /* The name is the one the JDK uses (decision D8), which is what Class.getName()
+     answers too: a default toString that said teyru.Object while getName() said
+     java.lang.Object would be two answers to one question. */
+  int n = snprintf(buf, sizeof buf, "%s@%llx", ty_class_jname(((tyobj *)o)->cls), (unsigned long long)(uintptr_t)o);
   return ty_str_new(buf, n);
 }
 
