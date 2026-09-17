@@ -2825,27 +2825,45 @@ class GZIPInputStream extends InputStream implements Reader {
   }
 }
 
-/* The two calls the web layer makes on a body, kept here so that the response
+/* The calls the web layer makes on a body, kept here so that the response
    writer and the client reader share one implementation of "gzip this" and one
-   of "gunzip this" instead of each growing its own. A Teyru string is its own
-   bytes, so these take and return the body itself rather than a byte array
-   around it. */
+   of "gunzip this" instead of each growing its own.
+
+   A gzip stream is bytes, and a Teyru string is text, so the stream lives in a
+   byte[] on both sides: a String used to carry it because a string was its own
+   bytes, and that is exactly what a compressed stream cannot survive now that
+   decoding a non-UTF-8 byte string replaces what is ill-formed with U+FFFD. The
+   two text forms are the convenience around it -- the bytes of "compress this
+   text" and the text of "decompress this stream" -- and they are named for what
+   they do rather than overloading on a return type Java cannot overload on. */
 final class Gzip {
   /* A response body is compressed at the level Java's GZIPOutputStream
      compresses at -- its default, and zlib's -- because a gzip stream carries
      no level a reader could disagree with, and the last three levels cost time
      for a few percent that a body already in memory does not need. */
-  public static String compress(String text) {
+  public static byte[] compress(byte[] raw) {
+    if (raw == null) {
+      throw new NullPointerException()
+    }
     ByteArrayOutputStream bo = new ByteArrayOutputStream()
     GZIPOutputStream gz = new GZIPOutputStream(bo, 4096)
-    gz.write(text.getBytes(), 0, text.length())
+    gz.write(raw, 0, raw.length)
     gz.close()
-    return bo.toString()
+    return bo.toByteArray()
   }
 
-  public static String decompress(String text) {
-    byte[] raw = text.getBytes()
-    GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(raw), 4096)
+  public static byte[] compress(String text) {
+    if (text == null) {
+      throw new NullPointerException()
+    }
+    return compress(text.getBytes())
+  }
+
+  public static byte[] decompress(byte[] packed) {
+    if (packed == null) {
+      throw new NullPointerException()
+    }
+    GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(packed), 4096)
     ByteArrayOutputStream bo = new ByteArrayOutputStream()
     byte[] block = new byte[4096]
     while (true) {
@@ -2856,6 +2874,10 @@ final class Gzip {
       bo.write(block, 0, n)
     }
     in.close()
-    return bo.toString()
+    return bo.toByteArray()
+  }
+
+  public static String decompressText(byte[] packed) {
+    return new String(decompress(packed))
   }
 }

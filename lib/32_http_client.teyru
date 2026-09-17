@@ -173,6 +173,10 @@ class HttpClientRequest {
 // body of one exchange.
 class HttpClientResponse {
   public int status = 0
+  /* The body as the bytes that arrived, and its text. A compressed body only
+     ever exists as the bytes: gunzip is what turns it into text, and it is
+     decodeBody below that does it. */
+  public byte[] bodyBytes = new byte[0]
   public String body = ""
   public String uri = ""
   private List<String> headerNames = new ArrayList<String>()
@@ -257,7 +261,8 @@ class ClientResponseParser {
     if (enc.length() == 0 || enc.toLowerCase().indexOf("gzip") < 0) {
       return
     }
-    res.body = Gzip.decompress(res.body)
+    res.bodyBytes = Gzip.decompress(res.bodyBytes)
+    res.body = new String(res.bodyBytes)
   }
 
   /* parseRaw is the reading half on its own, without expanding a compressed
@@ -300,7 +305,8 @@ class ClientResponseParser {
       return parseRaw(in)
     }
     if (chunked) {
-      res.body = readChunks(in)
+      res.bodyBytes = readChunks(in)
+      res.body = new String(res.bodyBytes)
       return res
     }
     if (res.status == 204 || res.status == 304) {
@@ -309,19 +315,23 @@ class ClientResponseParser {
     if (length >= 0) {
       byte[] buf = new byte[length]
       in.readFully(buf, 0, length)
-      res.body = Net.stringFrom(buf, 0, length)
+      res.bodyBytes = buf
+      res.body = new String(buf)
       return res
     }
     // no length and no chunks: the body ends when the connection does
-    StringBuilder b = new StringBuilder()
+    ByteArrayOutputStream b = new ByteArrayOutputStream()
+    byte[] one = new byte[1]
     while (true) {
       int c = in.read()
       if (c < 0) {
         break
       }
-      b.append((char) c)
+      one[0] = (byte) c
+      b.write(one, 0, 1)
     }
-    res.body = b.toString()
+    res.bodyBytes = b.toByteArray()
+    res.body = new String(res.bodyBytes)
     return res
   }
 
@@ -359,13 +369,16 @@ class ClientResponseParser {
     }
     if (chunked) {
       res.body = unchunk(body)
+      res.bodyBytes = res.body.getBytes()
       return res
     }
     if (length >= 0 && length <= body.length()) {
       res.body = body.substring(0, length)
+      res.bodyBytes = res.body.getBytes()
       return res
     }
     res.body = body
+    res.bodyBytes = res.body.getBytes()
     return res
   }
 
@@ -397,8 +410,8 @@ class ClientResponseParser {
     return Integer.parseInt(parts[1])
   }
 
-  static String readChunks(SocketInputStream in) {
-    StringBuilder b = new StringBuilder()
+  static byte[] readChunks(SocketInputStream in) {
+    ByteArrayOutputStream b = new ByteArrayOutputStream()
     while (true) {
       String size = in.readLine()
       if (size == null) {
@@ -411,10 +424,10 @@ class ClientResponseParser {
       }
       byte[] buf = new byte[n]
       in.readFully(buf, 0, n)
-      b.append(Net.stringFrom(buf, 0, n))
+      b.write(buf, 0, n)
       in.readLine()
     }
-    return b.toString()
+    return b.toByteArray()
   }
 }
 

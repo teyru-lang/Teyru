@@ -805,12 +805,16 @@ class HttpResponse {
     if (bodyBytes != null || acceptsGzip(acceptEncoding) == false || bodyLength() < MIN_GZIP_BYTES) {
       return
     }
-    String packed = Gzip.compress(body)
-    if (packed.length() >= bodyLength()) {
+    byte[] packed = Gzip.compress(body)
+    if (packed.length >= bodyLength()) {
       return
     }
     header("Content-Encoding", "gzip")
-    body = packed
+    /* The stream is what goes on the wire, so it is the body's bytes that the
+       response carries from here: bodyLength() reads them, and the text stays
+       what the handler wrote, which is what a handler that logs its own answer
+       expects to see. */
+    bodyBytes = packed
   }
 
   /* acceptsGzip reads an Accept-Encoding header. The header is a comma
