@@ -992,7 +992,7 @@ void *ty_npe(void) {
 }
 void *ty_aioobe(int64_t idx, int64_t len) {
   char buf[128];
-  snprintf(buf, sizeof buf, "index %lld out of bounds for length %lld", (long long)idx, (long long)len);
+  snprintf(buf, sizeof buf, "Index %lld out of bounds for length %lld", (long long)idx, (long long)len);
   ty_throw(ty_make_ex(TY_AIOOBE, buf));
   return NULL;
 }
@@ -1002,7 +1002,7 @@ void *ty_aioobe(int64_t idx, int64_t len) {
    -- "an array index was wrong" -- must not be answering a String's. */
 void *ty_sioobe(int64_t idx, int64_t len) {
   char buf[128];
-  snprintf(buf, sizeof buf, "index %lld out of bounds for length %lld", (long long)idx, (long long)len);
+  snprintf(buf, sizeof buf, "Index %lld out of bounds for length %lld", (long long)idx, (long long)len);
   ty_throw(ty_make_ex(TY_SIOOBE, buf));
   return NULL;
 }
