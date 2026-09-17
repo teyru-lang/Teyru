@@ -130,6 +130,14 @@ source → lexer → parser → ast → sema → codegen
   context switch。要量時間就 `teyru build` 一次再量那支執行檔（`sh scripts/bench.sh` 即如此做）。
   另一個同類陷阱：**shell 自己的 `time` 關鍵字報的是外層 job 的 CPU，不是程式的**——同一個執行檔，
   shell 的 `time` 說 user 14.3／sys 37.6，`/usr/bin/time -v` 說 0.00／sys 0.00。要數字就別用 shell 的。
+- **replica 與真品不一致時，先假設 replica 錯**：微基準、抽出來的片段、另寫的小程式是 replica，
+  產品實際產生的東西是**真品**，而兩者一致的意思是**同一個執行檔、同一條指令流**，不是「看起來
+  差不多」。今天三個實例都是這一條：一個 C 微基準把 helper 標成 `noinline` 好「定價一次呼叫」，
+  但 `-O2` 是整程式 LTO、那個 helper 早就被 inline 折掉了（`nm` 在改前的 `-O2` 執行檔上根本找不到
+  那個符號），所以「占 47%」在 `-O2` 不成立；另一個的 replica 被 clang **向量化**（58 條 vector
+  指令）而真品的熱迴圈沒有（24 條純量），於是「四個嫌疑都是 0」不成立，而**真品自己的組語**顯示
+  那些包裝佔了迴圈一半以上的指令數；第三個是建置本身——worktree 忘了建 `TMPDIR`，每個建置都失敗，
+  數字就變成「314 個失敗」。遇到不一致，先去讀真品的執行檔或它的組語，不要先改 replica 的結論。
 - **端到端**：在 `tests/programs/` 放 `xxx.teyru` 與 `xxx.expected`。
   需要命令列參數時另外放 `xxx.args`（每行一個）。`go test` 會自動編譯並比對輸出。
   `tests/` 是 `teyru-lang/tests` 的 submodule：改測試要在**那個**倉庫提交，這裡只會
