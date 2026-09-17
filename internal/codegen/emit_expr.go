@@ -412,6 +412,15 @@ func (e *Emitter) literal(v *ast.Literal) string {
 // stand. The static assertions tie this struct's offsets to the macros the
 // runtime reaches through -- a literal is the one string the compiler lays out
 // and the runtime reads.
+//
+// The breadcrumb table is the struct's last member and an ASCII literal has
+// none (TY_STR_NBC is zero for one), so the initialiser's last clause is written
+// only when that member exists. A brace-enclosed clause with no member left to
+// initialise is a constraint violation -- C11 6.7.9p2, "No initializer shall
+// attempt to provide a value for an object not contained within the entity
+// being initialized" -- and GCC makes it an error where clang only warns, so an
+// unconditional `{0}` is C that one of the two compilers this project builds
+// with refuses.
 func (e *Emitter) strLit(s string) string {
 	if id, ok := e.strings[s]; ok {
 		return fmt.Sprintf("((tystr*)&S%d)", id)
@@ -426,12 +435,18 @@ func (e *Emitter) strLit(s string) string {
 	}
 	nbc := util.StrBreadcrumbs(units, ascii)
 	fmt.Fprintf(&e.data, "struct S%d_s { tystr h; char b[%d];", id, len(s)+1)
+	bcInit := ""
 	if nbc > 0 {
 		fmt.Fprintf(&e.data, " int32_t bc[%d];", nbc)
+		bcInit = ", {0}"
 	}
 	fmt.Fprintf(&e.data, " };\n")
-	fmt.Fprintf(&e.data, "static struct S%d_s S%d = {{&cls_%s, %d, %d, %du}, %s, {0}};\n", id, id,
-		mangle(e.prog.Builtins.String.Full), len(s), units, flags, e.cstr(s))
+	// `h`'s own first member is an aggregate (`tyobj`, one pointer), so the
+	// braces around it are written out: without them GCC and clang both report
+	// -Wmissing-braces on every literal in the program, which is the one
+	// diagnostic -Wall -Wextra has to say about this construct.
+	fmt.Fprintf(&e.data, "static struct S%d_s S%d = {{{&cls_%s}, %d, %d, %du}, %s%s};\n", id, id,
+		mangle(e.prog.Builtins.String.Full), len(s), units, flags, e.cstr(s), bcInit)
 	fmt.Fprintf(&e.data, "_Static_assert(offsetof(struct S%d_s, b) == sizeof(tystr), \"a literal's bytes follow its header\");\n", id)
 	if nbc > 0 {
 		fmt.Fprintf(&e.data, "_Static_assert(offsetof(struct S%d_s, bc) == TY_STR_BC_OFF(%d), \"a literal's breadcrumbs sit where TY_STR_BC looks\");\n", id, len(s))
