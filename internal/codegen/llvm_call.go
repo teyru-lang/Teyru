@@ -738,12 +738,28 @@ func (e *llvmEmitter) newArray(f *fb, v *ast.NewArray) lval {
 // newArrayDims allocates only the dimensions whose length was written: `new
 // int[2][]` is two null int[]s and builds no inner array at all.
 func (e *llvmEmitter) newArrayDims(f *fb, elem ast.Type, dims []ast.Expr, result ast.Type) lval {
-	dim := e.coerce(f, e.expr(f, dims[0]), ast.TInt)
-	n := f.reg()
-	f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, dim.v))
+	// Every dimension whose length was written is evaluated once, in the order
+	// it was written, before anything is allocated (JLS 15.10.2). Lowering each
+	// one where the array it describes is allocated put the ones after the
+	// first inside the loop that fills the level above, so `new int[f()][g()]`
+	// called g() once per element of the first dimension where the JDK calls it
+	// once.
+	lens := make([]string, len(dims))
+	for i, d := range dims {
+		dim := e.coerce(f, e.expr(f, d), ast.TInt)
+		n := f.reg()
+		f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, dim.v))
+		lens[i] = n
+	}
+	return e.newArrayLevel(f, elem, lens, result)
+}
+
+// newArrayLevel allocates one dimension of an array, given the lengths of the
+// dimensions that were written, outermost first.
+func (e *llvmEmitter) newArrayLevel(f *fb, elem ast.Type, lens []string, result ast.Type) lval {
 	e.markExn("TY_NEGARR", e.p.Builtins.NegArr)
-	arr := e.allocArrayN(f, elem, n)
-	if len(dims) == 1 {
+	arr := e.allocArrayN(f, elem, lens[0])
+	if len(lens) == 1 {
 		return value(arr, result)
 	}
 	inner := elem
@@ -765,7 +781,7 @@ func (e *llvmEmitter) newArrayDims(f *fb, elem ast.Type, dims []ast.Expr, result
 	f.ins(fmt.Sprintf("%s = icmp slt i64 %s, %s", c, cur, length))
 	f.cbr(c, body, end)
 	f.label(body)
-	sub := e.newArrayDims(f, inner, dims[1:], result)
+	sub := e.newArrayLevel(f, inner, lens[1:], result)
 	slot := e.elemAddrOfDyn(f, arr, cur, 8)
 	f.ins(fmt.Sprintf("store ptr %s, ptr %s", sub.v, slot))
 	next := f.reg()

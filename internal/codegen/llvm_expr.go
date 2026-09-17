@@ -1361,15 +1361,22 @@ func (e *llvmEmitter) addr(f *fb, x ast.Expr) (string, ast.Type) {
 // elemAddr is the address of an array element, with Java's two tests in Java's
 // order: the null test on the array, then the bounds test on the index.
 func (e *llvmEmitter) elemAddr(f *fb, ix *ast.Index) string {
-	elem := e.p.Erased(ix.GetType())
 	arr := e.expr(f, ix.X)
 	idx := e.coerce(f, e.expr(f, ix.Index), ast.TInt)
-	e.nullCheck(f, arr.v)
+	return e.elemAddrOfIndex(f, e.p.Erased(ix.GetType()), arr.v, idx.v)
+}
+
+// elemAddrOfIndex is elemAddr with the array reference and the index already
+// lowered, for a caller that has to evaluate something between the index and
+// these tests -- an assignment's value, which Java evaluates before them
+// (JLS 15.26.1).
+func (e *llvmEmitter) elemAddrOfIndex(f *fb, elem ast.Type, arr, idx string) string {
+	e.nullCheck(f, arr)
 	n := f.reg()
-	f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, idx.v))
-	length := e.loadRaw(f, "i64", e.gepBytes(f, arr.v, 8), 8)
+	f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, idx))
+	length := e.loadRaw(f, "i64", e.gepBytes(f, arr, 8), 8)
 	e.boundsCheck(f, n, length)
-	return e.elemAddrOfDyn(f, arr.v, n, util.SizeOf(elem))
+	return e.elemAddrOfDyn(f, arr, n, util.SizeOf(elem))
 }
 
 // boundsCheck throws when the index is outside the array, the way Java does.
@@ -1406,8 +1413,15 @@ func (e *llvmEmitter) assign(f *fb, a *ast.Assign) lval {
 			if selem := e.elemClassForStore(ix.GetType()); selem != "" {
 				return e.storeRefElem(f, ix, selem, a.Y)
 			}
-			ptr := e.elemAddr(f, ix)
+			// Java's order for an array assignment: the array reference, then
+			// the index, then the value, and only then the null and bounds
+			// tests (JLS 15.26.1). elemAddr's tests have to wait for the value,
+			// or `a[9] = f()` throws without calling f() where the JDK calls
+			// it and throws afterwards.
+			arr := e.expr(f, ix.X)
+			idx := e.coerce(f, e.expr(f, ix.Index), ast.TInt)
 			v := e.coerce(f, e.expr(f, a.Y), a.X.GetType())
+			ptr := e.elemAddrOfIndex(f, e.p.Erased(ix.GetType()), arr.v, idx.v)
 			e.store(f, ptr, a.X.GetType(), v)
 			return v
 		}
