@@ -8,7 +8,8 @@ every place in `lib/*.teyru` that could be asking a byte question of that API.
 It is the audit the plan asks for as its item 8: the inventory is the
 deliverable, the fixes follow from it.
 
-Audited revision: `adf58e7` (the read side and the write side both landed).
+Audited revision: `adf58e7` (the read side and the write side both landed);
+the four UNSURE rows were worked on `d7fde38`.
 The line numbers below are that revision's, after the fixes this branch
 carries, so every row names a line that exists.
 
@@ -38,12 +39,13 @@ how the numbers below were produced, and every exception to it is a row here.
 | of those, in a declaration that mentions bytes | 182, in 16 files |
 | **BYTES** | 37 rows (15 code, 22 comment) |
 | **CHARS** | 145 rows (the byte-context sites not listed below, plus every other site) |
-| **UNSURE** | 4 rows |
+| **UNSURE** | 4 rows, all four worked in the section below (three fixed, one decided) |
 
 All 15 BYTES rows are fixed on this branch. Each code fix has a test that was
-red before it and is listed in the row; the tests are t253..t259 in
+red before it and is listed in the row; the tests are t253..t263 in
 `teyru-lang/tests`, and their expectations come from OpenJDK 21.0.11+10
-except where the behaviour is this library's own (t255's socket half, t256).
+except where the behaviour is this library's own (t255's socket half, t256,
+t263, which pins a decision the JDK has no counterpart for).
 
 ## BYTES
 
@@ -87,14 +89,18 @@ except where the behaviour is this library's own (t255's socket half, t256).
 | `lib/43_util_extra.teyru:248` | `if (pos < input.length() && input.charAt(pos) == 10) {` | BYTES (code, T253) | `(input.charAt(pos) & 255) == 10` in nextLine() |
 | `lib/47_wiretest.teyru:237` | `res.body = Net.stringFrom(res.bodyBytes, 0, res.bodyBytes.length)` | BYTES (code, T258) | an unframed body was built through a String |
 
-## UNSURE
+## The four UNSURE rows, worked
 
-| file:line | why it is not a verdict |
-|---|---|
-| `lib/42_iostream.teyru:186` | ByteArrayInputStream and DataInputStream implement Reader with one byte per character where Java's equivalent is an InputStreamReader that decodes. A design deviation, not a byte question; the file documents it. |
-| `lib/42_iostream.teyru:438` | a lone surrogate is written as `?` where Java's writeUTF writes its three-byte form (Java 0003EDA0BD, here 00013F). Whether writeUTF should walk code units instead of the string's bytes is a change to the write side, not a byte question this audit can settle. |
-| `lib/43_util_extra.teyru:96` | the delimiter set is Java's \p{javaWhitespace} narrowed to its ASCII ten. Character.isWhitespace exists in the runtime now, so the narrowing could be dropped; whether Scanner should is the class's decision. |
-| `lib/43_util_extra.teyru:232` | the line terminators are LF, CRLF and CR only, where Java's Scanner also splits on U+2028, U+2029 and U+0085. Same call as the delimiter set. |
+The audit left four rows open rather than guessing. Three of them turned out to
+be fixable with the JDK as the arbiter and one is a decision; all four are
+settled here.
+
+| file:line | was | became |
+|---|---|---|
+| `lib/42_iostream.teyru` (was the lone-surrogate row) | `writeUTF` of a lone surrogate wrote `?` (Java `0003EDA0BD`, here `00013F`) | **fixed** in `lib/42_iostream.teyru`'s `ModifiedUtf8`: both directions walk code units now, as Java's do, and a lone surrogate is written as itself and read back as itself. `t260_modified_utf8` prints the bytes and the round trip for eight strings; its output is `t260_modified_utf8.java.ref`'s on OpenJDK 21.0.11+10. This also removed the hand-rolled UTF-8 decoder that `encode` began with -- it is tell #1 of this audit, and it was reading a string's bytes to find characters in them. |
+| `lib/43_util_extra.teyru:96` | the Scanner delimiter set was `\p{javaWhitespace}` narrowed to its ASCII ten | **fixed**: the set is `Character.isWhitespace`, which is what `\p{javaWhitespace}` is, so U+3000, U+2000..U+200A, U+205F and U+1680 separate tokens and U+00A0, U+2007 and U+202F do not. `t261_scanner_delimiters` asks sixteen code points, against OpenJDK 21.0.11+10. |
+| `lib/43_util_extra.teyru:232` | the line terminators were LF, CRLF and CR only | **fixed**: the terminators are Java's own set, `\r\n|[\n\r\u2028\u2029\u0085]`. `t262_scanner_line_terminators` reads thirteen strings, against the same JDK. |
+| `lib/42_iostream.teyru:186` | `ByteArrayInputStream` and `DataInputStream` as Readers answer one byte per character where Java's `InputStreamReader` decodes | **decided, not changed.** `read()` is one method with two contracts -- `InputStream.read()` is "the next byte as 0..255" and `Reader.read()` over it would be "the next character" -- and the byte contract is the one the class can keep: it IS a byte array, and `read(byte[])`, `skip()` and `available()` are over the same position. Java never chooses: its byte array stream is not a Reader, and decoding is a second object (`InputStreamReader`, or this library's `Net.stringFrom`). The tree already documents it at `lib/42_iostream.teyru`'s `Reader` interface ("here one byte is one character, so a buffer read is a loop of read() calls") and in the two class comments; `t263_reader_over_bytes` pins the behaviour so that reversing the decision is a diff and not a silence. |
 
 ## The other 182 byte-context sites: CHARS
 
