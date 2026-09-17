@@ -531,6 +531,13 @@ func (e *Emitter) stackNew(vd *ast.VarDeclarator, nw *ast.New, ct, name string) 
 	cl := cty.Class
 	slot := "_stack_" + name
 	e.line("%s %s;\n", cname(cl), slot)
+	// The object's reference fields are words of this frame -- it is a struct
+	// the emitter lays out here -- and a map that does not name them makes the
+	// collector stop reading them, which frees an object only they pointed at.
+	// The pass cannot see them in a declaration (the declaration is the struct,
+	// not a pointer), so they are named here, where the class is known and where
+	// the object's scope begins. See frameFieldsMark.
+	e.line("%s", e.stackFieldWords(slot, cl))
 	e.line("memset(&%s, 0, sizeof(%s));\n", slot, slot)
 	e.line("%s.obj.cls = &cls_%s;\n", slot, mangle(cl.Full))
 	if cl.Inner && cl.OuterField != nil {
@@ -539,6 +546,25 @@ func (e *Emitter) stackNew(vd *ast.VarDeclarator, nw *ast.New, ct, name string) 
 	e.line("%s", e.clinitStmt(cl))
 	e.line("%s;\n", e.callTo(e.argsWithCaptures("&"+slot, nw, cl), e.cfunc(nw.Ctor)+"(", ")"))
 	e.line("%s %s = &%s;\n", ct, name, slot)
+}
+
+// stackFieldWords renders the marker the frame pass expands into one
+// registration per reference field of a stack-promoted object (see
+// frameFieldsMark), or nothing when no map is being written for this body -- a
+// body without a map is scanned conservatively and names nothing. The fields
+// are the class's own, in the order the struct lays them out; a promoted class
+// is never a closure or a wrapper, so there are no captured or special fields.
+func (e *Emitter) stackFieldWords(slot string, cl *ast.Class) string {
+	if !e.frameMap || frameMapsOff {
+		return ""
+	}
+	var fields []string
+	for _, f := range cl.InstFields {
+		if ast.IsRef(f.Type) {
+			fields = append(fields, slot+".f_"+mangle(f.Name))
+		}
+	}
+	return frameFieldsMarkFor(fields)
 }
 
 // exprStmt emits an expression as a statement.
@@ -866,11 +892,11 @@ func (e *Emitter) emitTryCore(v *ast.Try, closeFn func()) {
 		e.line("{ tycatch %s; tyobj* %s_ex = NULL;\n", frame.name, frame.name)
 		e.indent++
 		/* The frame chain as of this point, which is where ty_throw rewinds it to
-	   before it jumps: a longjmp drops every frame between the throw and this
-	   setjmp, and the collector must not walk the maps of frames whose storage
-	   the jump just freed. See tycatch in internal/runtime/src/tyrt.h. */
-	e.line("%s.prev = ty_cur_catch; %s.ex = NULL; %s.frames = ty_frames; ty_cur_catch = &%s;\n",
-		frame.name, frame.name, frame.name, frame.name)
+		   before it jumps: a longjmp drops every frame between the throw and this
+		   setjmp, and the collector must not walk the maps of frames whose storage
+		   the jump just freed. See tycatch in internal/runtime/src/tyrt.h. */
+		e.line("%s.prev = ty_cur_catch; %s.ex = NULL; %s.frames = ty_frames; ty_cur_catch = &%s;\n",
+			frame.name, frame.name, frame.name, frame.name)
 		e.line("if (setjmp(%s.buf) == 0) {\n", frame.name)
 		e.indent++
 		e.finallys = append(e.finallys, frame)

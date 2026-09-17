@@ -390,14 +390,21 @@ static inline __attribute__((always_inline)) void ty_stack_check(void) {
    compiler's, not ours. We can say where our variables are; we cannot say what
    is in the words around them, and a bitmap would have to be over the
    compiler's layout. The set of words we can name is exactly the set we can
-   keep precise, and every other word of the frame is left to the conservative
-   pass -- which is why a generated frame that does *not* register is scanned
-   conservatively, and why a reference the compiler keeps somewhere we cannot
-   name is a root the collector still finds. The cost of that safety is
-   retention: a word we cannot name that used to hold an object keeps it. The
-   kill store the emitter writes after a reference's last use (see tyrt.c's
-   `ty_gc_locked` and the emitter's frameSlots) is what stops the named ones
-   from doing the same.
+   keep precise. A generated frame that registers nothing is scanned
+   conservatively, the old way; a frame that registers is read through its list
+   and its interior is *not* scanned (see the complement below), so a word of
+   such a frame that the emitter could have named and did not is a missing root
+   and not retention. That is the direction the emitter's side of this is
+   written to: every word it can name, it names -- the check is
+   internal/codegen/frames_test.go's TestEveryFrameWordIsMapped, which reads the
+   C of real programs. What covers the words it cannot name -- the compiler's
+   spill slots, the registers it saves, the outgoing arguments of the call in
+   flight -- is the register half of the map and the deliberately low floor
+   below, and the emitter's rule that a value created mid-expression goes into a
+   frame word first. The cost of the named words is retention, and the kill
+   store the emitter writes after a reference's last use (see tyrt.c's
+   `ty_gc_locked` and the emitter's frameSlots) is what stops them from holding
+   an object the program has dropped.
 
    `lo` and `hi` are the frame's own C-stack extent. The collector scans the
    *complement* of the mapped extents, so the runtime's frames -- which are not

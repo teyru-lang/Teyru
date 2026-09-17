@@ -26,9 +26,24 @@ import (
 //     sees: the pass works on the text because that is where those declarations
 //     are -- the emitter writes them in a hundred places, and a rule that had to
 //     be applied at each of them would be a rule with a hundred chances to be
-//     forgotten. `TestEveryFrameWordIsMapped` in frames_test.go is the check
-//     that the rule did not get one.
+//     forgotten. One word in a frame is not a declaration of a pointer: the
+//     reference fields of an object the emitter lays out in the frame itself
+//     (escape.go's stack promotion), whose declaration is a struct. No text
+//     scan can know a struct's fields, so the emitter names them where it lays
+//     the object out and the pass gives them slots there (frameFieldsMark).
+//     `TestEveryFrameWordIsMapped` in frames_test.go is the check that the rule
+//     did not get one, over the C of real programs.
 //
+//     The rule is a rule and not a heuristic because of what a miss costs. A
+//     word a map does not name, in a frame that has a map, is not retention:
+//     `scan_unmapped` in tyrt.c skips the extent of every frame a map covers,
+//     so the word is read by nobody and the object it held is freed while the
+//     program still points at it. Four shapes were exactly that before they
+//     were fixed, and frames_test.go's header lists them: a qualifier between
+//     the stars and the name (`T* volatile x`, i.e. every local of a method
+//     with a `try`), a declaration inside another declaration's initializer, a
+//     declaration at the very start of a body, and a stack-promoted object's
+//     fields.
 //   - the extent. The runtime's `ty_frame_enter` records the frame's C-stack
 //     extent; the collector reads everything outside it conservatively. That is
 //     what makes a frame the map describes precise and leaves the runtime's own
@@ -46,10 +61,13 @@ import (
 // function's frame is laid out by clang or gcc, and the words it uses for the
 // values it keeps across a call, for the registers it saves, and for the
 // outgoing arguments of the call it is making are not ours to name. The map
-// names what we can name, and the collector keeps reading everything else
-// conservatively -- so a value the compiler keeps somewhere the map cannot reach
-// is still a root. The cost of that direction is retention, and the alternative
-// (assuming the unnamed words hold nothing) is the missing root.
+// names what we can name; a frame with no map at all is scanned conservatively
+// by the collector the old way, and for a frame with one the register half of
+// the map (`saved[]`, read by ty_frame_enter_ out of the ABI's callee-saved
+// registers) and the extent's deliberately low floor are what cover the values
+// the compiler keeps where we cannot see them. The reasoning is in tyrt.h's
+// tyframe section, which is also where the direction is stated: a word we can
+// name and did not is the bug, and any *other* word left unnamed is a decision.
 
 // frameRegDecl is the line every frame's prologue is built from. `_tyfs` is the
 // slot array -- the addresses of the frame's reference words -- and `_tyfs_n` is
@@ -65,17 +83,46 @@ const (
 	// pass gives a statement's temporaries their words back. It is a comment
 	// and the pass takes it out again.
 	frameStmtEnd = "/*ty-s*/"
+	// frameFieldsMark stands where a stack-promoted object is declared and
+	// carries the address expressions of the reference fields that object
+	// holds, up to `*/`; the pass gives each one a slot and takes the comment
+	// out. A struct the emitter lays out in the frame (see stackNew) keeps its
+	// reference words in the frame like any other object, and the pass cannot
+	// find them by reading a declaration -- the declaration is the struct, not
+	// a pointer -- so the emitter, which knows the class, names them here.
+	// The loop is over the object's scope: the words are named where the object
+	// is, because a prologue entry could not name a variable the prologue
+	// cannot see.
+	frameFieldsMark = "/*ty-f:"
 )
 
+// frameFieldsMarkFor renders the marker that has a stack-promoted object's
+// reference words recorded: the address expressions of its reference fields
+// (`_stack_v7_c.f_data`), which is what the pass gives slots to.
+func frameFieldsMarkFor(fields []string) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	return frameFieldsMark + " " + strings.Join(fields, " ") + " */"
+}
+
 // frameDeclAt reads a declaration of a pointer-typed C object that starts at or
-// after `i` (which is just past a `;`, `{`, `(`, `}` or newline) and returns the
-// declared name, where the declaration ends, and what it was.
+// after `i` (which is the start of the body or just past a `;`, `{`, `(`, `}` or
+// newline) and returns the declared name, where the initializer starts (`eq`,
+// -1 when the declaration has none), where the declaration ends, and what it
+// was.
 //
 // The shapes it must recognise are the ones the emitter writes: `T* x = ...`,
-// `T* x;`, multi-word types (`unsigned char* p`), and `tycatch c;` -- the last
-// one because the exception a catch frame holds is a reference the handler needs
-// and the frame's own words are the only place it lives.
-func frameDeclAt(body string, i int) (name string, isCatch bool, end int, ok bool) {
+// `T* x;`, multi-word types (`unsigned char* p`), a qualifier between the stars
+// and the name (`T* volatile x`, which is every local of a method that contains
+// a `try`), and `tycatch c;` -- the last one because the exception a catch frame
+// holds is a reference the handler needs and the frame's own words are the only
+// place it lives.
+//
+// `eq` is what lets the caller look inside the initializer: a statement
+// expression there declares objects of its own, and they are words of this
+// frame too -- see framePassRange.
+func frameDeclAt(body string, i int) (name string, isCatch bool, eq, end int, ok bool) {
 	j := i
 	for j < len(body) && (body[j] == ' ' || body[j] == '\t') {
 		j++
@@ -93,9 +140,9 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, end int, ok boo
 			k++
 		}
 		if k == ns || k >= len(body) || body[k] != ';' {
-			return "", false, 0, false
+			return "", false, 0, 0, false
 		}
-		return body[ns:k], true, k + 1, true
+		return body[ns:k], true, -1, k + 1, true
 	}
 	// a run of type words: identifiers separated by whitespace
 	words := 0
@@ -119,10 +166,10 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, end int, ok boo
 		break
 	}
 	if words == 0 {
-		return "", false, 0, false
+		return "", false, 0, 0, false
 	}
-	// then a pointer: one or more `*` (with optional space), then the name, then
-	// `=` or `;`.
+	// then a pointer: one or more `*` (with optional space), then an optional
+	// run of qualifiers, then the name, then `=` or `;`.
 	stars := 0
 	for j < len(body) && (body[j] == '*' || body[j] == ' ' || body[j] == '\t') {
 		if body[j] == '*' {
@@ -131,14 +178,36 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, end int, ok boo
 		j++
 	}
 	if stars == 0 {
-		return "", false, 0, false
+		return "", false, 0, 0, false
+	}
+	/* A qualifier sits between the stars and the name: the emitter writes
+	   `T* volatile x` for every local of a method that contains a `try`, and a
+	   scan that read `volatile` as the name would leave the object that word
+	   holds unnamed -- which is a missing root, not retention, because the map
+	   is what makes the collector stop reading the frame word by word. */
+	for {
+		k := j
+		for k < len(body) && (body[k] == ' ' || body[k] == '\t') {
+			k++
+		}
+		qs := k
+		for k < len(body) && isIdentByte(body[k]) {
+			k++
+		}
+		if !isQualifier(body[qs:k]) {
+			// Not a qualifier: this is the name, and the spaces the loop
+			// skipped are not part of it.
+			j = qs
+			break
+		}
+		j = k
 	}
 	ns := j
 	for j < len(body) && isIdentByte(body[j]) {
 		j++
 	}
 	if j == ns {
-		return "", false, 0, false
+		return "", false, 0, 0, false
 	}
 	name = body[ns:j]
 	k := j
@@ -146,10 +215,10 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, end int, ok boo
 		k++
 	}
 	if k >= len(body) || (body[k] != '=' && body[k] != ';') {
-		return "", false, 0, false
+		return "", false, 0, 0, false
 	}
 	if body[k] == ';' {
-		return name, false, k + 1, true
+		return name, false, -1, k + 1, true
 	}
 	/* With an initializer the declaration runs to the semicolon that ends it,
 	   and that is not the next one: an initializer is allowed to be a statement
@@ -160,9 +229,19 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, end int, ok boo
 	   the first version of this did. */
 	end = declEnd(body, k)
 	if end < 0 {
-		return "", false, 0, false
+		return "", false, 0, 0, false
 	}
-	return name, false, end, true
+	return name, false, k, end, true
+}
+
+// isQualifier reports whether a word between a declaration's stars and its name
+// is a C qualifier rather than the name.
+func isQualifier(w string) bool {
+	switch w {
+	case "volatile", "const", "restrict", "__restrict", "__restrict__":
+		return true
+	}
+	return false
 }
 
 // declEnd returns the offset just past the `;` that ends a declaration whose
@@ -208,53 +287,103 @@ func declEnd(body string, i int) int {
 // after the variable that was supposed to own it had been cleared). The word is
 // cleared, never the variable: what the temporary holds is read out of it by the
 // statement expression that made it, and the clear happens after that.
+//
+// The scan does not stop at the end of a declaration: the initializer of one is
+// a statement expression as often as not (`T* x = (T*)({ U* y = ...; y; })`),
+// and `y` is a pointer-typed object of this frame like any other. Reading the
+// declaration to its own `;` and continuing from there would leave every
+// declaration inside it unnamed, which is what framePassRange exists to avoid.
 func framePass(body string, first int) (string, int) {
-	var out strings.Builder
-	out.Grow(len(body) + len(body)/8)
 	n := first
 	var pending []int
-	for i := 0; i < len(body); {
-		if strings.HasPrefix(body[i:], frameStmtEnd) {
+	return framePassRange(body, &n, &pending), n - first
+}
+
+// framePassRange is framePass over one range of a body: the body itself, or the
+// initializer of a declaration the scan has just read the `=` of.
+//
+// `n` is the next slot index and `pending` the temporaries of the statement
+// being scanned; both are shared with the enclosing call, because a temporary
+// declared inside an initializer is a temporary of the same statement and is
+// given its word back at the same statement end.
+//
+// The range begins at a declaration position, so the scan looks for one there
+// and not only after a separator: the first statement of a body is a declaration
+// as often as any other, and a scan that only looked just past a `;` or a `{`
+// left the first one out. A declaration inside a loop is registered once per
+// iteration with the same index (see the fixed-site note below).
+func framePassRange(s string, n *int, pending *[]int) string {
+	var out strings.Builder
+	out.Grow(len(s) + len(s)/8)
+	for i := 0; i < len(s); {
+		if strings.HasPrefix(s[i:], frameStmtEnd) {
 			// The statement that just ended can no longer have a value in
 			// flight, so the words its temporaries were recorded in go back.
-			for _, k := range pending {
+			for _, k := range *pending {
 				fmt.Fprintf(&out, " %s(&%s, %d, NULL);", framePut, frameVar, k)
 			}
-			pending = pending[:0]
+			*pending = (*pending)[:0]
 			i += len(frameStmtEnd)
 			continue
 		}
-		c := body[i]
-		out.WriteByte(c)
-		i++
-		if c != ';' && c != '{' && c != '(' && c != '}' && c != '\n' {
+		if strings.HasPrefix(s[i:], frameFieldsMark) {
+			// The reference fields of an object the emitter laid out in this
+			// frame: words of this frame that no declaration names, named here
+			// because the emitter knows the class's layout and the pass does
+			// not. They are not given back at the statement's end -- the object
+			// outlives the statement -- so a dead object's field is retention
+			// until the frame returns, which is this file's usual direction.
+			end := strings.Index(s[i:], "*/")
+			if end < 0 {
+				out.WriteString(s[i:])
+				break
+			}
+			for _, nm := range strings.Fields(s[i+len(frameFieldsMark) : i+end]) {
+				fmt.Fprintf(&out, " %s(&%s, %d, (void*)&%s);", framePut, frameVar, *n, nm)
+				*n++
+			}
+			i += end + len("*/")
 			continue
 		}
-		name, isCatch, end, ok := frameDeclAt(body, i)
-		if !ok {
-			continue
-		}
-		out.WriteString(body[i:end])
-		i = end
-		/* A site has a fixed index, not a running one. A declaration inside a
-		   loop is registered once per iteration, and a counter that advanced
-		   each time would walk off the end of the slot array on the second
-		   one; writing the same index again is the same word. */
-		if isCatch {
-			// The pending exception is the one reference a catch frame holds.
-			fmt.Fprintf(&out, " %s(&%s, %d, (void*)&%s.ex);", framePut, frameVar, n, name)
-		} else {
-			fmt.Fprintf(&out, " %s(&%s, %d, (void*)&%s);", framePut, frameVar, n, name)
-			// The emitter's own temporaries start with an underscore; the
-			// variables of the source do not. Only a temporary is given back by
-			// the statement that declared it.
-			if strings.HasPrefix(name, "_") {
-				pending = append(pending, n)
+		if i == 0 || strings.IndexByte(";{(\n}", s[i-1]) >= 0 {
+			name, isCatch, eq, end, ok := frameDeclAt(s, i)
+			if ok {
+				/* A site has a fixed index, not a running one. A declaration
+				   inside a loop is registered once per iteration, and a
+				   counter that advanced each time would walk off the end of
+				   the slot array on the second one; writing the same index
+				   again is the same word. */
+				if eq >= 0 {
+					// The initializer is scanned for declarations of its own;
+					// the registration of this one is written after them, and
+					// after the `;` that ends it.
+					out.WriteString(s[i:eq])
+					out.WriteString(framePassRange(s[eq:end], n, pending))
+				} else {
+					out.WriteString(s[i:end])
+				}
+				if isCatch {
+					// The pending exception is the one reference a catch frame
+					// holds.
+					fmt.Fprintf(&out, " %s(&%s, %d, (void*)&%s.ex);", framePut, frameVar, *n, name)
+				} else {
+					fmt.Fprintf(&out, " %s(&%s, %d, (void*)&%s);", framePut, frameVar, *n, name)
+					// The emitter's own temporaries start with an underscore;
+					// the variables of the source do not. Only a temporary is
+					// given back by the statement that declared it.
+					if strings.HasPrefix(name, "_") {
+						*pending = append(*pending, *n)
+					}
+				}
+				*n++
+				i = end
+				continue
 			}
 		}
-		n++
+		out.WriteByte(s[i])
+		i++
 	}
-	return out.String(), n - first
+	return out.String()
 }
 
 // ---------------------------------------------------------------- the kills
