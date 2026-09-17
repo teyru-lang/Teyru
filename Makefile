@@ -8,7 +8,7 @@ BIN     ?= teyru
 OPT     ?= -O2
 PREFIX  ?= /usr/local
 
-.PHONY: all build test test-go test-programs submodule bench backend-matrix fmt vet lint notices unicode-tables check ci jdk-diff progen hooks clean install examples
+.PHONY: all build test test-go test-programs submodule bench backend-matrix cache fmt vet lint notices unicode-tables check ci jdk-diff progen hooks clean install examples
 
 all: build
 
@@ -140,6 +140,18 @@ backend-matrix:
 # regenerated it without committing cannot land quietly.
 unicode-tables:
 	$(GO) run ./internal/tools/genunicode
+
+## cache: the standard library cache, checked rather than assumed
+#
+# W13's cache answers builds with a standard library compiled once, so its
+# failure mode is a wrong program rather than a slow build. This target is what
+# the release workflow calls: scripts/cache-check.sh builds a hello world three
+# ways and checks that the cache is filled, reused across programs, keyed by the
+# optimisation level, that a removed object is rebuilt, that TEYRU_NOCACHE=1
+# still builds, and that the split and whole-program builds run the same
+# program. It takes about fifteen seconds and needs no network.
+cache: build
+	./scripts/cache-check.sh
 
 ## notices: check THIRD-PARTY-NOTICES.md against the tree
 #

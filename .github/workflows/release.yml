@@ -60,6 +60,9 @@ jobs:
       - name: the back-end matrix (every program under both back ends, -O0 and -O2, clang and gcc)
         run: make backend-matrix
 
+      - name: the standard library cache is filled, reused and invalidated
+        run: make cache
+
       - name: third-party notices and the tree agree
         run: make notices
 
