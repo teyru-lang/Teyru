@@ -804,15 +804,83 @@ func (c *Checker) lombokEqualsHashCode(cl *ast.Class, s onSite) {
 		}
 		fields = append(fields, f)
 	}
-	if !hasMethodDecl(cl.Decl, "equals", 1) {
-		c.lombokEquals(cl, fields, callSuper, s)
+	// Lombok generates equals and hashCode together or not at all. A class that
+	// wrote one of them by hand gets neither, because (HandleEqualsAndHashCode)
+	// "the implementations of these 2 methods are all inter-related and should
+	// be written by the same entity".
+	if hasMethodDecl(cl.Decl, "equals", 1) || hasMethodDecl(cl.Decl, "hashCode", 0) {
+		return
 	}
-	if !hasMethodDecl(cl.Decl, "hashCode", 0) {
+	fields = c.equalsFieldOrder(fields)
+	// Lombok: `boolean needsCanEqual = !isFinal || !isDirectDescendantOfObject;
+	// `. A final class that extends Object directly cannot have a subclass that
+	// adds a field, so its instanceof test has already settled the matter; for
+	// every other class the extra `canEqual` is what makes a parent and a child
+	// with the same fields unequal.
+	canEqual := !cl.Mods.Has(ast.ModFinal) || !directDescendantOfObject(c, cl)
+	// The generated equals and hashCode are also looked for among what has
+	// already been generated: @Data generates both, and so does
+	// @EqualsAndHashCode, and the second annotation has to find the first.
+	if !hasMemberMethod(cl, "equals", 1) {
+		c.lombokEquals(cl, fields, callSuper, canEqual, s)
+	}
+	if !hasMemberMethod(cl, "hashCode", 0) {
 		c.lombokHashCode(cl, fields, callSuper, s)
+	}
+	if canEqual && !hasMemberMethod(cl, "canEqual", 1) {
+		c.lombokCanEqual(cl, s)
 	}
 }
 
-func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper bool, s onSite) {
+// directDescendantOfObject reports whether the class's only superclass is
+// java.lang.Object.
+func directDescendantOfObject(c *Checker, cl *ast.Class) bool {
+	return cl.Super == nil || cl.Super.Class == nil || cl.Super.Class == c.b.Object
+}
+
+// hasMemberMethod reports whether the class has a method of this name and
+// parameter count, generated or declared. hasMethodDecl only sees the members
+// the program wrote.
+func hasMemberMethod(cl *ast.Class, name string, nparams int) bool {
+	for _, m := range cl.Methods[name] {
+		if len(m.Params) == nparams {
+			return true
+		}
+	}
+	return false
+}
+
+// equalsIncludeRank is HandlerUtil.defaultEqualsAndHashcodeIncludeRank: a
+// primitive counts for 1000, one of the eight wrappers for 800, anything else
+// for nothing.
+func (c *Checker) equalsIncludeRank(t ast.Type) int {
+	if util.IsPrim(t) {
+		return 1000
+	}
+	if ct, ok := t.(*ast.ClassType); ok && ct.Class != nil {
+		if _, boxed := c.b.Unbox[ct.Class]; boxed {
+			return 800
+		}
+	}
+	return 0
+}
+
+// equalsFieldOrder puts the fields in the order @EqualsAndHashCode reads them.
+//
+// Unlike @ToString, whose members all rank zero and so stay in declaration
+// order, @EqualsAndHashCode sorts by rank -- primitives first, then boxed
+// primitives, then everything else -- and keeps declaration order where ranks
+// are equal, which is InclusionExclusionUtils.compareRankOrPosition. The sort
+// is over the same list equals and hashCode are built from, so both agree.
+func (c *Checker) equalsFieldOrder(fields []*ast.Field) []*ast.Field {
+	out := append([]*ast.Field(nil), fields...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return c.equalsIncludeRank(out[i].Type) > c.equalsIncludeRank(out[j].Type)
+	})
+	return out
+}
+
+func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper, canEqual bool, s onSite) {
 	self := &ast.ClassType{Class: cl, Args: typeVarArgs(cl)}
 	objType := &ast.ClassType{Class: c.b.Object}
 	stmts := []ast.Stmt{
@@ -823,16 +891,24 @@ func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper boo
 					Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}}}),
 			blockOf(returnOf(boolLit(false))), nil),
 	}
+	if canEqual || len(fields) > 0 {
+		other := &ast.VarDeclarator{Pos: pos(), Name: "other",
+			Init: &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()}, Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, X: id("o")}}
+		stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, Vars: []*ast.VarDeclarator{other}})
+	}
+	// `if (!other.canEqual(this)) return false;`, and the superclass check after
+	// it -- the order HandleEqualsAndHashCode writes them in.
+	if canEqual {
+		stmts = append(stmts, ifOf(
+			&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
+				X: callNamed(id("other"), "canEqual", thisStat(cl))},
+			blockOf(returnOf(boolLit(false))), nil))
+	}
 	if callSuper && cl.Super != nil {
 		stmts = append(stmts, ifOf(
 			&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
 				X: superCall("equals", id("o"))},
 			blockOf(returnOf(boolLit(false))), nil))
-	}
-	if len(fields) > 0 {
-		other := &ast.VarDeclarator{Pos: pos(), Name: "other",
-			Init: &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()}, Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, X: id("o")}}
-		stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, Vars: []*ast.VarDeclarator{other}})
 	}
 	for _, f := range fields {
 		other := sel(id("other"), f.Name)
@@ -846,12 +922,20 @@ func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper boo
 		case util.IsPrim(f.Type):
 			differ = binop("!=", mine, other)
 		default:
-			// reference: null-safe equality
-			differ = binop("||",
-				binop("&&", isNull(mine), binop("!=", other, nullLit())),
-				binop("&&", binop("!=", mine, nullLit()),
-					&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
-						X: callNew(mine, "equals", other)}))
+			// reference: null-safe equality, reading each side once, as
+			// HandleEqualsAndHashCode does with its this$field/other$field
+			// locals
+			li, ti := "$this$"+f.Name, "$other$"+f.Name
+			stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: objTypeExpr(c),
+				Vars: []*ast.VarDeclarator{{Pos: pos(), Name: li, Init: mine}}})
+			stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: objTypeExpr(c),
+				Vars: []*ast.VarDeclarator{{Pos: pos(), Name: ti, Init: other}}})
+			differ = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: isNull(id(li)),
+				X: binop("!=", id(ti), nullLit()),
+				Y: &ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
+					X: callNamed(id(li), "equals", id(ti))}}
+			stmts = append(stmts, ifOf(differ, blockOf(returnOf(boolLit(false))), nil))
+			continue
 		}
 		stmts = append(stmts, ifOf(differ, blockOf(returnOf(boolLit(false))), nil))
 	}
@@ -860,6 +944,33 @@ func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper boo
 		[]ast.Type{objType}, []string{"o"}, blockOf(stmts...), "")
 	m.Anno = "@EqualsAndHashCode"
 	// Lombok puts onParam_ on the parameter of the generated equals method.
+	c.placeOn(m, s.memberAnnos(), s.paramAnnos())
+	c.addSynthMethod(cl, m)
+}
+
+// objTypeExpr is `java.lang.Object` as a type reference for a synthesized
+// local: Lombok reads a reference field into an Object local before comparing
+// it, so that a field whose value changes under it cannot be read twice.
+func objTypeExpr(c *Checker) *ast.TypeExpr {
+	return &ast.TypeExpr{Pos: pos(), Name: "Object", Resolved: c.objType}
+}
+
+// lombokCanEqual generates the `canEqual` Lombok puts beside equals:
+//
+//	protected boolean canEqual(java.lang.Object other) {
+//	    return other instanceof Person;
+//	}
+//
+// Without it a parent and a child with the same fields compare equal, because
+// the child's equals accepts the parent's instance and compares the fields that
+// are there.
+func (c *Checker) lombokCanEqual(cl *ast.Class, s onSite) {
+	self := &ast.ClassType{Class: cl, Args: typeVarArgs(cl)}
+	body := blockOf(returnOf(&ast.InstanceOf{ExprBase: ast.ExprBase{Pos: pos()}, X: id("other"),
+		Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}}))
+	m := c.newSynthMethod(cl, "canEqual", ast.ModProtected, ast.TBoolean,
+		[]ast.Type{&ast.ClassType{Class: c.b.Object}}, []string{"other"}, body, "")
+	m.Anno = "@EqualsAndHashCode"
 	c.placeOn(m, s.memberAnnos(), s.paramAnnos())
 	c.addSynthMethod(cl, m)
 }
@@ -874,24 +985,29 @@ func (c *Checker) lombokHashCode(cl *ast.Class, fields []*ast.Field, callSuper b
 			Vars: []*ast.VarDeclarator{{Pos: pos(), Name: "result", Init: start}}},
 	}
 	for _, f := range fields {
+		// The constants are HandlerUtil's: 59 multiplies, 43 stands in for a
+		// null reference, 79 and 97 for the two values of a boolean. The layer
+		// used 31, 0 and 1231/1237, so no hash it produced agreed with Lombok's.
 		var h ast.Expr
 		switch {
 		case ast.IsPrim(f.Type, ast.Boolean):
-			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: thisField(f), X: intLit(1231), Y: intLit(1237)}
+			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: thisField(f), X: intLit(79), Y: intLit(97)}
 		case ast.IsPrim(f.Type, ast.Long):
-			h = &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()}, Type: &ast.TypeExpr{Pos: pos(), Name: "int", Resolved: ast.TInt},
-				X: binop("^", thisField(f), binop(">>>", thisField(f), intLit(32)))}
+			h = longToIntHash(&stmts, thisField(f), f.Name)
 		case ast.IsPrim(f.Type, ast.Double):
-			h = callNew(id("Double"), "hashCode", thisField(f))
+			h = longToIntHash(&stmts, callNew(id("Double"), "doubleToLongBits", thisField(f)), f.Name)
 		case ast.IsPrim(f.Type, ast.Float):
-			h = callNew(id("Float"), "hashCode", thisField(f))
+			h = callNew(id("Float"), "floatToIntBits", thisField(f))
 		case util.IsPrim(f.Type):
 			h = thisField(f)
 		default:
-			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: isNull(thisField(f)), X: intLit(0), Y: callNew(thisField(f), "hashCode")}
+			tmp := "$hash$" + f.Name
+			stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: objTypeExpr(c),
+				Vars: []*ast.VarDeclarator{{Pos: pos(), Name: tmp, Init: thisField(f)}}})
+			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: isNull(id(tmp)), X: intLit(43), Y: callNamed(id(tmp), "hashCode")}
 		}
 		stmts = append(stmts, exprStmtOf(assignTo(id("result"),
-			binop("+", binop("*", intLit(31), id("result")), h))))
+			binop("+", binop("*", intLit(59), id("result")), h))))
 	}
 	stmts = append(stmts, returnOf(id("result")))
 	m := c.newSynthMethod(cl, "hashCode", ast.ModPublic, ast.TInt, nil, nil, blockOf(stmts...), "")
@@ -899,6 +1015,23 @@ func (c *Checker) lombokHashCode(cl *ast.Class, fields []*ast.Field, callSuper b
 	// hashCode takes no parameter, so only the member annotations apply.
 	c.placeOn(m, s.memberAnnos(), nil)
 	c.addSynthMethod(cl, m)
+}
+
+// longToIntHash is Lombok's longToIntForHashCode: `(int) (v >>> 32 ^ v)`, the
+// high half of the long folded onto the low half, which is what a double's
+// bits are put through as well.
+//
+// The value goes into a local first, so the shift and the xor see one read of
+// it -- the same reason HandleEqualsAndHashCode declares `$fieldName` -- and
+// the declaration is appended to the statements the caller is assembling.
+func longToIntHash(stmts *[]ast.Stmt, v ast.Expr, name string) ast.Expr {
+	tmp := "$long$" + name
+	*stmts = append(*stmts, &ast.LocalVar{Pos: pos(),
+		Type: &ast.TypeExpr{Pos: pos(), Name: "long", Resolved: ast.TLong},
+		Vars: []*ast.VarDeclarator{{Pos: pos(), Name: tmp, Init: v}}})
+	return &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()},
+		Type: &ast.TypeExpr{Pos: pos(), Name: "int", Resolved: ast.TInt},
+		X:    binop("^", binop(">>>", id(tmp), intLit(32)), id(tmp))}
 }
 
 // ---------------------------------------------------------------- constructors
