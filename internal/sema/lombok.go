@@ -692,25 +692,41 @@ func (c *Checker) lombokToString(cl *ast.Class, s onSite) {
 		return
 	}
 	includeNames := annoBool(a, "includeFieldNames", true)
-	parts := []ast.Expr{strLit(cl.Name + "(")}
+	callSuper := annoBool(a, "callSuper", false) && cl.Super != nil
+	// The superclass goes first, in the position Lombok gives it: the prefix is
+	// "(super=" and `super.toString()` is appended to it before any field, so
+	// the text is `Child(super=Base(b=1), c=2)`. Writing the class's own fields
+	// first and the superclass last is what made it
+	// `Child(c=2; super=Base(b=1))`.
+	prefix := "("
+	switch {
+	case callSuper:
+		prefix = "(super="
+	case len(fields) == 0:
+		prefix = "()"
+	case includeNames:
+		prefix = "(" + fields[0].Name + "="
+	}
+	parts := []ast.Expr{strLit(cl.Name + prefix)}
 	first := true
+	if callSuper {
+		parts = append(parts, superCall("toString"))
+		first = false
+	}
 	for _, f := range fields {
-		label := ""
-		if includeNames {
-			label = f.Name + "="
-		}
 		if !first {
-			parts = append(parts, strLit(", "+label))
-		} else if label != "" {
-			parts = append(parts, strLit(label))
+			if includeNames {
+				parts = append(parts, strLit(", "+f.Name+"="))
+			} else {
+				parts = append(parts, strLit(", "))
+			}
 		}
 		first = false
 		parts = append(parts, thisField(f))
 	}
-	if annoBool(a, "callSuper", false) && cl.Super != nil {
-		parts = append(parts, strLit("; super="), superCall("toString"))
+	if !first {
+		parts = append(parts, strLit(")"))
 	}
-	parts = append(parts, strLit(")"))
 	m := c.newSynthMethod(cl, "toString", ast.ModPublic, c.strType, nil, nil,
 		blockOf(returnOf(concatStr(parts...))), "")
 	m.Anno = "@ToString"
