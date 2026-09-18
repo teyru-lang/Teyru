@@ -129,6 +129,39 @@ type Emitter struct {
 	// frameBase is how many words of the frame's map come before them: one per
 	// reference-typed parameter.
 	frameBase int
+	// frameUsed are the indices into frameTemps that the statement being emitted
+	// has written a value into. Only those are given back when that statement
+	// ends: a word that already holds NULL is back, and writing NULL into it once
+	// per later statement is a store the program does not need (measured on a
+	// reflection-heavy program: 98,489 of the registrations in the emitted C were
+	// those repeats, 3.0 MB of the 6.1 MB the maps add).
+	frameUsed []int
+}
+
+// frameRelease gives back the frame's words for values in flight that the
+// statement just emitted wrote, and forgets them.
+//
+// Called wherever a statement ends -- the block loop, and the constructor's
+// prologue, body and field initializers, which are statements the emitter writes
+// outside any block. A statement's end is where a value in flight stops being in
+// flight: what the expression answered with has been read out of its word by
+// then. A write that is never given back is a leak, not corruption -- the word
+// stays a root -- and TestEveryWrittenFrameWordIsReleased in frames_test.go is
+// the check that no write is missed.
+func (e *Emitter) frameRelease() {
+	for _, k := range e.frameUsed {
+		e.line("%s(&%s, %d, NULL);\n", framePut, frameVar, e.frameBase+k)
+	}
+	e.frameUsed = e.frameUsed[:0]
+}
+
+// stmtRelease emits one statement and gives back the words it wrote. Every place
+// that emits a statement outside the block loop goes through this, so the rule
+// holds for the constructor's parts as much as for a block.
+func (e *Emitter) stmtRelease(s ast.Stmt) {
+	e.frameUsed = e.frameUsed[:0]
+	e.stmt(s)
+	e.frameRelease()
 }
 
 // finFrame is one try statement whose finally action must still run.
@@ -1225,7 +1258,7 @@ func (e *Emitter) emitCtorBody(cl *ast.Class, m *ast.Method) {
 	// 1. prologue: statements before the explicit constructor call
 	if idx > 0 {
 		for _, st := range body.Stmts[:idx] {
-			e.stmt(st)
+			e.stmtRelease(st)
 		}
 	}
 	// 2. chain to the superclass or the sibling constructor
@@ -1268,7 +1301,7 @@ func (e *Emitter) emitCtorBody(cl *ast.Class, m *ast.Method) {
 			stmts = stmts[idx:]
 		}
 		for _, st := range stmts {
-			e.stmt(st)
+			e.stmtRelease(st)
 		}
 	}
 	if m.Decl != nil && m.Decl.Compact {
@@ -1315,7 +1348,9 @@ func (e *Emitter) emitFieldInits(cl *ast.Class, ctor *ast.Method) {
 				continue
 			}
 			target := "this->f_" + mangle(vd.Fld.Name)
+			e.frameUsed = e.frameUsed[:0]
 			e.line("%s = %s;\n", target, e.coerce(e.expr(vd.Init), vd.Init.GetType(), vd.Fld.Type))
+			e.frameRelease()
 		}
 	}
 	for _, mem := range cl.Decl.Members {
