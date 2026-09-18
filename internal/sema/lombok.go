@@ -18,41 +18,35 @@ import (
 // docs/lombok.md, including the ones that cannot work without a runtime the
 // Teyru standard library does not ship).
 
-// lombokMods are the access levels Lombok's AccessLevel maps onto.
-func annoAccess(a *ast.Annotation) (ast.Mods, bool) {
+// annoAccessLevel reads the AccessLevel an annotation asks for.
+//
+// Lombok declares the parameter under three names: `value` on @Getter, @Setter
+// and @With, `access` on the three @XxxArgsConstructor annotations and on
+// @Builder, and `level` on @FieldDefaults and @FieldNameConstants. An unnamed
+// argument is the same parameter written short -- `@Getter(AccessLevel.NONE)`
+// is `@Getter(value = AccessLevel.NONE)`.
+//
+// Reading only the unnamed form meant the spelling Lombok's own documentation
+// uses on the constructors, `@NoArgsConstructor(access = AccessLevel.PRIVATE)`,
+// looked like an annotation with no access argument at all: the level was
+// dropped and a public constructor was generated in its place.
+//
+// ok is false when no access argument is present, which is not the same as
+// AccessLevel.PACKAGE (mods 0, ok true). none reports AccessLevel.NONE, whose
+// meaning is "do not generate this member at all".
+func annoAccessLevel(a *ast.Annotation, names ...string) (mods ast.Mods, none, ok bool) {
 	if a == nil {
-		return 0, false
+		return 0, false, false
 	}
-	v := a.Value()
-	if v == nil {
-		return 0, false
+	arg := a.Value()
+	for _, n := range names {
+		if x := a.Arg(n); x != nil {
+			arg = x
+			break
+		}
 	}
-	name := ""
-	switch x := v.Value.(type) {
-	case *ast.Select:
-		name = x.Name
-	case *ast.Ident:
-		name = x.Name
-	}
-	switch name {
-	case "PRIVATE":
-		return ast.ModPrivate, true
-	case "PROTECTED":
-		return ast.ModProtected, true
-	case "PUBLIC":
-		return ast.ModPublic, true
-	case "PACKAGE":
-		return 0, true
-	case "NONE":
-		return 0, false
-	}
-	return 0, false
-}
-
-// annoAccessArg reads an AccessLevel value from a named argument.
-func annoAccessArg(arg *ast.AnnoArg) (ast.Mods, bool) {
 	if arg == nil {
-		return 0, false
+		return 0, false, false
 	}
 	name := ""
 	switch x := arg.Value.(type) {
@@ -63,15 +57,17 @@ func annoAccessArg(arg *ast.AnnoArg) (ast.Mods, bool) {
 	}
 	switch name {
 	case "PRIVATE":
-		return ast.ModPrivate, true
+		return ast.ModPrivate, false, true
 	case "PROTECTED":
-		return ast.ModProtected, true
+		return ast.ModProtected, false, true
 	case "PUBLIC":
-		return ast.ModPublic, true
+		return ast.ModPublic, false, true
 	case "PACKAGE":
-		return 0, true
+		return 0, false, true
+	case "NONE":
+		return 0, true, true
 	}
-	return 0, false
+	return 0, false, false
 }
 
 // annoBool reads a boolean argument.
@@ -199,8 +195,15 @@ type accessorsOptions struct {
 func (c *Checker) accessorsOf(annos []*ast.Annotation) accessorsOptions {
 	o := accessorsOptions{}
 	if a := hasAnno(annos, "Accessors"); a != nil {
-		o.chain = annoBool(a, "chain", false)
 		o.fluent = annoBool(a, "fluent", false)
+		o.chain = annoBool(a, "chain", false)
+		// HandlerUtil.shouldReturnThis0: an explicit `chain` decides on its
+		// own, and otherwise the setter returns `this` when `fluent` is on --
+		// which is what @Accessors's javadoc says, "default: false, unless
+		// fluent=true, then default: true".
+		if a.Arg("chain") == nil {
+			o.chain = o.chain || o.fluent
+		}
 		o.prefix = annoStringList(a, "prefix")
 	}
 	return o
@@ -530,14 +533,12 @@ func (c *Checker) lombokMembers(cl *ast.Class, accessors accessorsOptions, class
 
 func (c *Checker) lombokGetter(cl *ast.Class, fields []*ast.Field, s onSite, o accessorsOptions) {
 	a := s.gen
-	mods, ok := annoAccess(a)
-	if !ok && a.Value() != nil {
-		// AccessLevel.NONE
-		if _, isNone := accessLevelName(a); isNone {
-			return
-		}
+	mods, none, ok := annoAccessLevel(a, "value")
+	if none {
+		// AccessLevel.NONE: Lombok generates no accessor at all
+		return
 	}
-	if mods == 0 {
+	if !ok {
 		mods = ast.ModPublic
 	}
 	lazy := annoBool(a, "lazy", false)
@@ -589,27 +590,13 @@ func setterName(f *ast.Field, o accessorsOptions) string {
 	return "set" + util.Capitalize(base)
 }
 
-// accessLevelName reports AccessLevel.NONE.
-func accessLevelName(a *ast.Annotation) (string, bool) {
-	v := a.Value()
-	if v == nil {
-		return "", false
-	}
-	switch x := v.Value.(type) {
-	case *ast.Select:
-		return x.Name, x.Name == "NONE"
-	case *ast.Ident:
-		return x.Name, x.Name == "NONE"
-	}
-	return "", false
-}
-
 func (c *Checker) lombokSetter(cl *ast.Class, fields []*ast.Field, s onSite, o accessorsOptions) {
 	a := s.gen
-	if _, isNone := accessLevelName(a); isNone {
+	mods, none, ok := annoAccessLevel(a, "value")
+	if none {
+		// AccessLevel.NONE: Lombok generates no setter at all
 		return
 	}
-	mods, ok := annoAccess(a)
 	if !ok {
 		mods = ast.ModPublic
 	}
@@ -631,7 +618,9 @@ func (c *Checker) lombokSetter(cl *ast.Class, fields []*ast.Field, s onSite, o a
 		}
 		stmts = append(stmts, exprStmtOf(assignTo(thisField(f), id("value"))))
 		var result ast.Type = ast.TVoid
-		if o.chain {
+		// JavacHandlerUtil.shouldReturnThis: a static field's setter has no
+		// `this` to return, so it stays void however @Accessors reads.
+		if o.chain && !f.Mods.Has(ast.ModStatic) {
 			result = &ast.ClassType{Class: cl, Args: typeVarArgs(cl)}
 			stmts = append(stmts, returnOf(thisStat(cl)))
 		}
@@ -655,6 +644,18 @@ func (c *Checker) lombokLazyGetter(cl *ast.Class, f *ast.Field, mods ast.Mods, n
 		Anno: "@Getter(lazy)",
 	}
 	c.addSynthField(cl, holder)
+	// A null initializer is a value like any other, and Lombok caches it: its
+	// holder is an AtomicReference, so "not computed yet" is the reference
+	// itself and the value can be null. Teyru's holder is the value, so null
+	// cannot carry that meaning -- it would recompute on every read -- and the
+	// "computed" fact is a flag instead. Both are volatile and the value is
+	// written first, so a reader that sees the flag set sees the value.
+	done := &ast.Field{
+		Name: "__lazy$done$" + f.Name, Type: ast.TBoolean,
+		Mods: ast.ModPrivate | ast.ModVolatile, Pos: f.Pos, Storage: true,
+		Anno: "@Getter(lazy)",
+	}
+	c.addSynthField(cl, done)
 	var init ast.Expr = nullLit()
 	if f.Decl != nil && f.Decl.Init != nil {
 		init = f.Decl.Init
@@ -663,11 +664,26 @@ func (c *Checker) lombokLazyGetter(cl *ast.Class, f *ast.Field, mods ast.Mods, n
 		// and the lazy value would be computed twice.
 		f.Decl.Init = nil
 	}
+	compute := blockOf(
+		exprStmtOf(assignTo(thisField(holder), init)),
+		exprStmtOf(assignTo(thisField(done), boolLit(true))),
+	)
+	// Double-checked, the way Lombok's lazy getter is: the fast path reads the
+	// flag without the lock, and the second test inside it is what keeps two
+	// threads from both running the initializer.
+	//
+	// Lombok synchronizes on the AtomicReference that is its holder; Teyru's
+	// holder is the value itself and may be null, which is no monitor, so the
+	// monitor is the instance. Reentrant, so an initializer that takes the same
+	// monitor still runs.
 	body := blockOf(
-		ifOf(isNull(thisField(holder)),
-			blockOf(
-				exprStmtOf(assignTo(thisField(holder), init)),
-			), nil),
+		ifOf(&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!", X: thisField(done)},
+			blockOf(&ast.Sync{Pos: pos(),
+				Lock: &ast.This{ExprBase: ast.ExprBase{Pos: pos()}},
+				Body: blockOf(
+					ifOf(&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!", X: thisField(done)},
+						compute, nil),
+				)}), nil),
 		returnOf(thisField(holder)),
 	)
 	m := c.newSynthMethod(cl, name, mods, f.Type, nil, nil, body, "")
@@ -685,25 +701,41 @@ func (c *Checker) lombokToString(cl *ast.Class, s onSite) {
 		return
 	}
 	includeNames := annoBool(a, "includeFieldNames", true)
-	parts := []ast.Expr{strLit(cl.Name + "(")}
+	callSuper := annoBool(a, "callSuper", false) && cl.Super != nil
+	// The superclass goes first, in the position Lombok gives it: the prefix is
+	// "(super=" and `super.toString()` is appended to it before any field, so
+	// the text is `Child(super=Base(b=1), c=2)`. Writing the class's own fields
+	// first and the superclass last is what made it
+	// `Child(c=2; super=Base(b=1))`.
+	prefix := "("
+	switch {
+	case callSuper:
+		prefix = "(super="
+	case len(fields) == 0:
+		prefix = "()"
+	case includeNames:
+		prefix = "(" + fields[0].Name + "="
+	}
+	parts := []ast.Expr{strLit(cl.Name + prefix)}
 	first := true
+	if callSuper {
+		parts = append(parts, superCall("toString"))
+		first = false
+	}
 	for _, f := range fields {
-		label := ""
-		if includeNames {
-			label = f.Name + "="
-		}
 		if !first {
-			parts = append(parts, strLit(", "+label))
-		} else if label != "" {
-			parts = append(parts, strLit(label))
+			if includeNames {
+				parts = append(parts, strLit(", "+f.Name+"="))
+			} else {
+				parts = append(parts, strLit(", "))
+			}
 		}
 		first = false
 		parts = append(parts, thisField(f))
 	}
-	if annoBool(a, "callSuper", false) && cl.Super != nil {
-		parts = append(parts, strLit("; super="), superCall("toString"))
+	if !first {
+		parts = append(parts, strLit(")"))
 	}
-	parts = append(parts, strLit(")"))
 	m := c.newSynthMethod(cl, "toString", ast.ModPublic, c.strType, nil, nil,
 		blockOf(returnOf(concatStr(parts...))), "")
 	m.Anno = "@ToString"
@@ -781,15 +813,83 @@ func (c *Checker) lombokEqualsHashCode(cl *ast.Class, s onSite) {
 		}
 		fields = append(fields, f)
 	}
-	if !hasMethodDecl(cl.Decl, "equals", 1) {
-		c.lombokEquals(cl, fields, callSuper, s)
+	// Lombok generates equals and hashCode together or not at all. A class that
+	// wrote one of them by hand gets neither, because (HandleEqualsAndHashCode)
+	// "the implementations of these 2 methods are all inter-related and should
+	// be written by the same entity".
+	if hasMethodDecl(cl.Decl, "equals", 1) || hasMethodDecl(cl.Decl, "hashCode", 0) {
+		return
 	}
-	if !hasMethodDecl(cl.Decl, "hashCode", 0) {
+	fields = c.equalsFieldOrder(fields)
+	// Lombok: `boolean needsCanEqual = !isFinal || !isDirectDescendantOfObject;
+	// `. A final class that extends Object directly cannot have a subclass that
+	// adds a field, so its instanceof test has already settled the matter; for
+	// every other class the extra `canEqual` is what makes a parent and a child
+	// with the same fields unequal.
+	canEqual := !cl.Mods.Has(ast.ModFinal) || !directDescendantOfObject(c, cl)
+	// The generated equals and hashCode are also looked for among what has
+	// already been generated: @Data generates both, and so does
+	// @EqualsAndHashCode, and the second annotation has to find the first.
+	if !hasMemberMethod(cl, "equals", 1) {
+		c.lombokEquals(cl, fields, callSuper, canEqual, s)
+	}
+	if !hasMemberMethod(cl, "hashCode", 0) {
 		c.lombokHashCode(cl, fields, callSuper, s)
+	}
+	if canEqual && !hasMemberMethod(cl, "canEqual", 1) {
+		c.lombokCanEqual(cl, s)
 	}
 }
 
-func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper bool, s onSite) {
+// directDescendantOfObject reports whether the class's only superclass is
+// java.lang.Object.
+func directDescendantOfObject(c *Checker, cl *ast.Class) bool {
+	return cl.Super == nil || cl.Super.Class == nil || cl.Super.Class == c.b.Object
+}
+
+// hasMemberMethod reports whether the class has a method of this name and
+// parameter count, generated or declared. hasMethodDecl only sees the members
+// the program wrote.
+func hasMemberMethod(cl *ast.Class, name string, nparams int) bool {
+	for _, m := range cl.Methods[name] {
+		if len(m.Params) == nparams {
+			return true
+		}
+	}
+	return false
+}
+
+// equalsIncludeRank is HandlerUtil.defaultEqualsAndHashcodeIncludeRank: a
+// primitive counts for 1000, one of the eight wrappers for 800, anything else
+// for nothing.
+func (c *Checker) equalsIncludeRank(t ast.Type) int {
+	if util.IsPrim(t) {
+		return 1000
+	}
+	if ct, ok := t.(*ast.ClassType); ok && ct.Class != nil {
+		if _, boxed := c.b.Unbox[ct.Class]; boxed {
+			return 800
+		}
+	}
+	return 0
+}
+
+// equalsFieldOrder puts the fields in the order @EqualsAndHashCode reads them.
+//
+// Unlike @ToString, whose members all rank zero and so stay in declaration
+// order, @EqualsAndHashCode sorts by rank -- primitives first, then boxed
+// primitives, then everything else -- and keeps declaration order where ranks
+// are equal, which is InclusionExclusionUtils.compareRankOrPosition. The sort
+// is over the same list equals and hashCode are built from, so both agree.
+func (c *Checker) equalsFieldOrder(fields []*ast.Field) []*ast.Field {
+	out := append([]*ast.Field(nil), fields...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return c.equalsIncludeRank(out[i].Type) > c.equalsIncludeRank(out[j].Type)
+	})
+	return out
+}
+
+func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper, canEqual bool, s onSite) {
 	self := &ast.ClassType{Class: cl, Args: typeVarArgs(cl)}
 	objType := &ast.ClassType{Class: c.b.Object}
 	stmts := []ast.Stmt{
@@ -800,16 +900,24 @@ func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper boo
 					Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}}}),
 			blockOf(returnOf(boolLit(false))), nil),
 	}
+	if canEqual || len(fields) > 0 {
+		other := &ast.VarDeclarator{Pos: pos(), Name: "other",
+			Init: &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()}, Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, X: id("o")}}
+		stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, Vars: []*ast.VarDeclarator{other}})
+	}
+	// `if (!other.canEqual(this)) return false;`, and the superclass check after
+	// it -- the order HandleEqualsAndHashCode writes them in.
+	if canEqual {
+		stmts = append(stmts, ifOf(
+			&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
+				X: callNamed(id("other"), "canEqual", thisStat(cl))},
+			blockOf(returnOf(boolLit(false))), nil))
+	}
 	if callSuper && cl.Super != nil {
 		stmts = append(stmts, ifOf(
 			&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
 				X: superCall("equals", id("o"))},
 			blockOf(returnOf(boolLit(false))), nil))
-	}
-	if len(fields) > 0 {
-		other := &ast.VarDeclarator{Pos: pos(), Name: "other",
-			Init: &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()}, Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, X: id("o")}}
-		stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}, Vars: []*ast.VarDeclarator{other}})
 	}
 	for _, f := range fields {
 		other := sel(id("other"), f.Name)
@@ -823,12 +931,20 @@ func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper boo
 		case util.IsPrim(f.Type):
 			differ = binop("!=", mine, other)
 		default:
-			// reference: null-safe equality
-			differ = binop("||",
-				binop("&&", isNull(mine), binop("!=", other, nullLit())),
-				binop("&&", binop("!=", mine, nullLit()),
-					&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
-						X: callNew(mine, "equals", other)}))
+			// reference: null-safe equality, reading each side once, as
+			// HandleEqualsAndHashCode does with its this$field/other$field
+			// locals
+			li, ti := "$this$"+f.Name, "$other$"+f.Name
+			stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: objTypeExpr(c),
+				Vars: []*ast.VarDeclarator{{Pos: pos(), Name: li, Init: mine}}})
+			stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: objTypeExpr(c),
+				Vars: []*ast.VarDeclarator{{Pos: pos(), Name: ti, Init: other}}})
+			differ = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: isNull(id(li)),
+				X: binop("!=", id(ti), nullLit()),
+				Y: &ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!",
+					X: callNamed(id(li), "equals", id(ti))}}
+			stmts = append(stmts, ifOf(differ, blockOf(returnOf(boolLit(false))), nil))
+			continue
 		}
 		stmts = append(stmts, ifOf(differ, blockOf(returnOf(boolLit(false))), nil))
 	}
@@ -837,6 +953,33 @@ func (c *Checker) lombokEquals(cl *ast.Class, fields []*ast.Field, callSuper boo
 		[]ast.Type{objType}, []string{"o"}, blockOf(stmts...), "")
 	m.Anno = "@EqualsAndHashCode"
 	// Lombok puts onParam_ on the parameter of the generated equals method.
+	c.placeOn(m, s.memberAnnos(), s.paramAnnos())
+	c.addSynthMethod(cl, m)
+}
+
+// objTypeExpr is `java.lang.Object` as a type reference for a synthesized
+// local: Lombok reads a reference field into an Object local before comparing
+// it, so that a field whose value changes under it cannot be read twice.
+func objTypeExpr(c *Checker) *ast.TypeExpr {
+	return &ast.TypeExpr{Pos: pos(), Name: "Object", Resolved: c.objType}
+}
+
+// lombokCanEqual generates the `canEqual` Lombok puts beside equals:
+//
+//	protected boolean canEqual(java.lang.Object other) {
+//	    return other instanceof Person;
+//	}
+//
+// Without it a parent and a child with the same fields compare equal, because
+// the child's equals accepts the parent's instance and compares the fields that
+// are there.
+func (c *Checker) lombokCanEqual(cl *ast.Class, s onSite) {
+	self := &ast.ClassType{Class: cl, Args: typeVarArgs(cl)}
+	body := blockOf(returnOf(&ast.InstanceOf{ExprBase: ast.ExprBase{Pos: pos()}, X: id("other"),
+		Type: &ast.TypeExpr{Pos: pos(), Name: cl.Name, Resolved: self}}))
+	m := c.newSynthMethod(cl, "canEqual", ast.ModProtected, ast.TBoolean,
+		[]ast.Type{&ast.ClassType{Class: c.b.Object}}, []string{"other"}, body, "")
+	m.Anno = "@EqualsAndHashCode"
 	c.placeOn(m, s.memberAnnos(), s.paramAnnos())
 	c.addSynthMethod(cl, m)
 }
@@ -851,24 +994,29 @@ func (c *Checker) lombokHashCode(cl *ast.Class, fields []*ast.Field, callSuper b
 			Vars: []*ast.VarDeclarator{{Pos: pos(), Name: "result", Init: start}}},
 	}
 	for _, f := range fields {
+		// The constants are HandlerUtil's: 59 multiplies, 43 stands in for a
+		// null reference, 79 and 97 for the two values of a boolean. The layer
+		// used 31, 0 and 1231/1237, so no hash it produced agreed with Lombok's.
 		var h ast.Expr
 		switch {
 		case ast.IsPrim(f.Type, ast.Boolean):
-			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: thisField(f), X: intLit(1231), Y: intLit(1237)}
+			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: thisField(f), X: intLit(79), Y: intLit(97)}
 		case ast.IsPrim(f.Type, ast.Long):
-			h = &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()}, Type: &ast.TypeExpr{Pos: pos(), Name: "int", Resolved: ast.TInt},
-				X: binop("^", thisField(f), binop(">>>", thisField(f), intLit(32)))}
+			h = longToIntHash(&stmts, thisField(f), f.Name)
 		case ast.IsPrim(f.Type, ast.Double):
-			h = callNew(id("Double"), "hashCode", thisField(f))
+			h = longToIntHash(&stmts, callNew(id("Double"), "doubleToLongBits", thisField(f)), f.Name)
 		case ast.IsPrim(f.Type, ast.Float):
-			h = callNew(id("Float"), "hashCode", thisField(f))
+			h = callNew(id("Float"), "floatToIntBits", thisField(f))
 		case util.IsPrim(f.Type):
 			h = thisField(f)
 		default:
-			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: isNull(thisField(f)), X: intLit(0), Y: callNew(thisField(f), "hashCode")}
+			tmp := "$hash$" + f.Name
+			stmts = append(stmts, &ast.LocalVar{Pos: pos(), Type: objTypeExpr(c),
+				Vars: []*ast.VarDeclarator{{Pos: pos(), Name: tmp, Init: thisField(f)}}})
+			h = &ast.Cond{ExprBase: ast.ExprBase{Pos: pos()}, C: isNull(id(tmp)), X: intLit(43), Y: callNamed(id(tmp), "hashCode")}
 		}
 		stmts = append(stmts, exprStmtOf(assignTo(id("result"),
-			binop("+", binop("*", intLit(31), id("result")), h))))
+			binop("+", binop("*", intLit(59), id("result")), h))))
 	}
 	stmts = append(stmts, returnOf(id("result")))
 	m := c.newSynthMethod(cl, "hashCode", ast.ModPublic, ast.TInt, nil, nil, blockOf(stmts...), "")
@@ -876,6 +1024,23 @@ func (c *Checker) lombokHashCode(cl *ast.Class, fields []*ast.Field, callSuper b
 	// hashCode takes no parameter, so only the member annotations apply.
 	c.placeOn(m, s.memberAnnos(), nil)
 	c.addSynthMethod(cl, m)
+}
+
+// longToIntHash is Lombok's longToIntForHashCode: `(int) (v >>> 32 ^ v)`, the
+// high half of the long folded onto the low half, which is what a double's
+// bits are put through as well.
+//
+// The value goes into a local first, so the shift and the xor see one read of
+// it -- the same reason HandleEqualsAndHashCode declares `$fieldName` -- and
+// the declaration is appended to the statements the caller is assembling.
+func longToIntHash(stmts *[]ast.Stmt, v ast.Expr, name string) ast.Expr {
+	tmp := "$long$" + name
+	*stmts = append(*stmts, &ast.LocalVar{Pos: pos(),
+		Type: &ast.TypeExpr{Pos: pos(), Name: "long", Resolved: ast.TLong},
+		Vars: []*ast.VarDeclarator{{Pos: pos(), Name: tmp, Init: v}}})
+	return &ast.Cast{ExprBase: ast.ExprBase{Pos: pos()},
+		Type: &ast.TypeExpr{Pos: pos(), Name: "int", Resolved: ast.TInt},
+		X:    binop("^", binop(">>>", id(tmp), intLit(32)), id(tmp))}
 }
 
 // ---------------------------------------------------------------- constructors
@@ -918,10 +1083,15 @@ func (c *Checker) lombokCtor(cl *ast.Class, s onSite, kind string) {
 		}
 		stmts = append(stmts, exprStmtOf(assignTo(thisField(f), id(f.Name))))
 	}
-	mods, ok := annoAccess(a)
+	mods, none, ok := annoAccessLevel(a, "access")
+	if none {
+		// Lombok's handler returns before generating anything
+		return
+	}
 	if !ok {
 		mods = ast.ModPublic
 	}
+	c.dropDefaultCtor(cl)
 	if sn := annoString(a, "staticName"); sn != "" {
 		c.lombokStaticFactory(cl, sn, params, names, stmts, mods, s)
 		return
@@ -931,6 +1101,32 @@ func (c *Checker) lombokCtor(cl *ast.Class, s onSite, kind string) {
 	m.Anno = "@" + kind + "ArgsConstructor"
 	c.placeOn(m, s.ctorAnnos(), s.paramAnnos())
 	c.addSynthCtor(cl, m)
+}
+
+// dropDefaultCtor removes the constructor resolveMembers synthesized for a
+// class that declared none.
+//
+// Lombok injects its constructor into the class declaration, and javac, finding
+// a constructor declared, never adds the implicit one. Teyru adds the implicit
+// public no-argument constructor while resolving members, which happens before
+// the Lombok pass, so a generated no-argument constructor found the signature
+// taken and addSynthCtor stepped aside for it:
+// `@NoArgsConstructor(access = AccessLevel.PRIVATE)` on a class with no
+// constructors of its own left the class with the implicit public constructor
+// and no private one, which is the annotation doing nothing at all.
+//
+// @AllArgsConstructor and @RequiredArgsConstructor need this too, and for the
+// same reason: Lombok's `class A { int x; }` with @AllArgsConstructor has one
+// constructor, `A(int)`, and no `A()` at all.
+func (c *Checker) dropDefaultCtor(cl *ast.Class) {
+	kept := make([]*ast.Method, 0, len(cl.Ctors))
+	for _, m := range cl.Ctors {
+		if m.SynthKind == "default-ctor" {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	cl.Ctors = kept
 }
 
 // lombokStaticFactory emits `static Cls of(args) { return new Cls(args) }`.
@@ -1018,7 +1214,10 @@ func (c *Checker) lombokUtilityClass(cl *ast.Class) {
 }
 
 func (c *Checker) lombokFieldDefaults(cl *ast.Class, a *ast.Annotation) {
-	level, _ := annoAccessArg(a.Arg("level"))
+	// AccessLevel.NONE -- the parameter's default -- and AccessLevel.PACKAGE
+	// both come back as no modifier, which is what "leave the field's own
+	// access alone" should do.
+	level, _, _ := annoAccessLevel(a, "level")
 	makeFinal := annoBool(a, "makeFinal", false)
 	for _, f := range c.instanceAndStaticFields(cl) {
 		if f.Mods&(ast.ModPublic|ast.ModPrivate|ast.ModProtected) == 0 {
@@ -1096,6 +1295,10 @@ func (c *Checker) lombokBuilderFor(cl *ast.Class, a *ast.Annotation, classAnnos 
 		stmts = append(stmts, exprStmtOf(assignTo(thisField(f), id(f.Name))))
 		allArgs.Body = blockOf(append(stmtsFrom(allArgs.Body), stmts...)...)
 	}
+	// Lombok's builder calls a constructor of its own, so the class has one and
+	// the implicit no-argument constructor must go: `@Builder class A { int x }`
+	// has `A(int)` and no `A()` (see dropDefaultCtor).
+	c.dropDefaultCtor(cl)
 	c.addSynthCtor(cl, allArgs)
 
 	// the builder class itself
@@ -1826,7 +2029,13 @@ func (c *Checker) lombokFieldNameConstants(cl *ast.Class, a *ast.Annotation) {
 	if _, exists := cl.Nested[name]; exists {
 		return
 	}
-	cd := &ast.ClassDecl{Pos: pos(), Kind: ast.KindClass, Name: name, Mods: ast.ModPublic | ast.ModStatic | ast.ModFinal}
+	// Lombok puts `level` on the generated inner type and leaves the constants
+	// themselves public (`innerTypeName` is not read; the name is Fields).
+	level, _, ok := annoAccessLevel(a, "level")
+	if !ok {
+		level = ast.ModPublic
+	}
+	cd := &ast.ClassDecl{Pos: pos(), Kind: ast.KindClass, Name: name, Mods: level | ast.ModStatic | ast.ModFinal}
 	f := c.newClass(name, cl.Full+"$"+name, ast.KindClass)
 	f.Decl = cd
 	f.File = cl.File
