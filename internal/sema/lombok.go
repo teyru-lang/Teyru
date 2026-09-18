@@ -18,41 +18,35 @@ import (
 // docs/lombok.md, including the ones that cannot work without a runtime the
 // Teyru standard library does not ship).
 
-// lombokMods are the access levels Lombok's AccessLevel maps onto.
-func annoAccess(a *ast.Annotation) (ast.Mods, bool) {
+// annoAccessLevel reads the AccessLevel an annotation asks for.
+//
+// Lombok declares the parameter under three names: `value` on @Getter, @Setter
+// and @With, `access` on the three @XxxArgsConstructor annotations and on
+// @Builder, and `level` on @FieldDefaults and @FieldNameConstants. An unnamed
+// argument is the same parameter written short -- `@Getter(AccessLevel.NONE)`
+// is `@Getter(value = AccessLevel.NONE)`.
+//
+// Reading only the unnamed form meant the spelling Lombok's own documentation
+// uses on the constructors, `@NoArgsConstructor(access = AccessLevel.PRIVATE)`,
+// looked like an annotation with no access argument at all: the level was
+// dropped and a public constructor was generated in its place.
+//
+// ok is false when no access argument is present, which is not the same as
+// AccessLevel.PACKAGE (mods 0, ok true). none reports AccessLevel.NONE, whose
+// meaning is "do not generate this member at all".
+func annoAccessLevel(a *ast.Annotation, names ...string) (mods ast.Mods, none, ok bool) {
 	if a == nil {
-		return 0, false
+		return 0, false, false
 	}
-	v := a.Value()
-	if v == nil {
-		return 0, false
+	arg := a.Value()
+	for _, n := range names {
+		if x := a.Arg(n); x != nil {
+			arg = x
+			break
+		}
 	}
-	name := ""
-	switch x := v.Value.(type) {
-	case *ast.Select:
-		name = x.Name
-	case *ast.Ident:
-		name = x.Name
-	}
-	switch name {
-	case "PRIVATE":
-		return ast.ModPrivate, true
-	case "PROTECTED":
-		return ast.ModProtected, true
-	case "PUBLIC":
-		return ast.ModPublic, true
-	case "PACKAGE":
-		return 0, true
-	case "NONE":
-		return 0, false
-	}
-	return 0, false
-}
-
-// annoAccessArg reads an AccessLevel value from a named argument.
-func annoAccessArg(arg *ast.AnnoArg) (ast.Mods, bool) {
 	if arg == nil {
-		return 0, false
+		return 0, false, false
 	}
 	name := ""
 	switch x := arg.Value.(type) {
@@ -63,15 +57,17 @@ func annoAccessArg(arg *ast.AnnoArg) (ast.Mods, bool) {
 	}
 	switch name {
 	case "PRIVATE":
-		return ast.ModPrivate, true
+		return ast.ModPrivate, false, true
 	case "PROTECTED":
-		return ast.ModProtected, true
+		return ast.ModProtected, false, true
 	case "PUBLIC":
-		return ast.ModPublic, true
+		return ast.ModPublic, false, true
 	case "PACKAGE":
-		return 0, true
+		return 0, false, true
+	case "NONE":
+		return 0, true, true
 	}
-	return 0, false
+	return 0, false, false
 }
 
 // annoBool reads a boolean argument.
@@ -530,14 +526,12 @@ func (c *Checker) lombokMembers(cl *ast.Class, accessors accessorsOptions, class
 
 func (c *Checker) lombokGetter(cl *ast.Class, fields []*ast.Field, s onSite, o accessorsOptions) {
 	a := s.gen
-	mods, ok := annoAccess(a)
-	if !ok && a.Value() != nil {
-		// AccessLevel.NONE
-		if _, isNone := accessLevelName(a); isNone {
-			return
-		}
+	mods, none, ok := annoAccessLevel(a, "value")
+	if none {
+		// AccessLevel.NONE: Lombok generates no accessor at all
+		return
 	}
-	if mods == 0 {
+	if !ok {
 		mods = ast.ModPublic
 	}
 	lazy := annoBool(a, "lazy", false)
@@ -589,27 +583,13 @@ func setterName(f *ast.Field, o accessorsOptions) string {
 	return "set" + util.Capitalize(base)
 }
 
-// accessLevelName reports AccessLevel.NONE.
-func accessLevelName(a *ast.Annotation) (string, bool) {
-	v := a.Value()
-	if v == nil {
-		return "", false
-	}
-	switch x := v.Value.(type) {
-	case *ast.Select:
-		return x.Name, x.Name == "NONE"
-	case *ast.Ident:
-		return x.Name, x.Name == "NONE"
-	}
-	return "", false
-}
-
 func (c *Checker) lombokSetter(cl *ast.Class, fields []*ast.Field, s onSite, o accessorsOptions) {
 	a := s.gen
-	if _, isNone := accessLevelName(a); isNone {
+	mods, none, ok := annoAccessLevel(a, "value")
+	if none {
+		// AccessLevel.NONE: Lombok generates no setter at all
 		return
 	}
-	mods, ok := annoAccess(a)
 	if !ok {
 		mods = ast.ModPublic
 	}
@@ -918,7 +898,11 @@ func (c *Checker) lombokCtor(cl *ast.Class, s onSite, kind string) {
 		}
 		stmts = append(stmts, exprStmtOf(assignTo(thisField(f), id(f.Name))))
 	}
-	mods, ok := annoAccess(a)
+	mods, none, ok := annoAccessLevel(a, "access")
+	if none {
+		// Lombok's handler returns before generating anything
+		return
+	}
 	if !ok {
 		mods = ast.ModPublic
 	}
@@ -1018,7 +1002,10 @@ func (c *Checker) lombokUtilityClass(cl *ast.Class) {
 }
 
 func (c *Checker) lombokFieldDefaults(cl *ast.Class, a *ast.Annotation) {
-	level, _ := annoAccessArg(a.Arg("level"))
+	// AccessLevel.NONE -- the parameter's default -- and AccessLevel.PACKAGE
+	// both come back as no modifier, which is what "leave the field's own
+	// access alone" should do.
+	level, _, _ := annoAccessLevel(a, "level")
 	makeFinal := annoBool(a, "makeFinal", false)
 	for _, f := range c.instanceAndStaticFields(cl) {
 		if f.Mods&(ast.ModPublic|ast.ModPrivate|ast.ModProtected) == 0 {
@@ -1826,7 +1813,13 @@ func (c *Checker) lombokFieldNameConstants(cl *ast.Class, a *ast.Annotation) {
 	if _, exists := cl.Nested[name]; exists {
 		return
 	}
-	cd := &ast.ClassDecl{Pos: pos(), Kind: ast.KindClass, Name: name, Mods: ast.ModPublic | ast.ModStatic | ast.ModFinal}
+	// Lombok puts `level` on the generated inner type and leaves the constants
+	// themselves public (`innerTypeName` is not read; the name is Fields).
+	level, _, ok := annoAccessLevel(a, "level")
+	if !ok {
+		level = ast.ModPublic
+	}
+	cd := &ast.ClassDecl{Pos: pos(), Kind: ast.KindClass, Name: name, Mods: level | ast.ModStatic | ast.ModFinal}
 	f := c.newClass(name, cl.Full+"$"+name, ast.KindClass)
 	f.Decl = cd
 	f.File = cl.File
