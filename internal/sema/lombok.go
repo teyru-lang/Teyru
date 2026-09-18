@@ -195,8 +195,15 @@ type accessorsOptions struct {
 func (c *Checker) accessorsOf(annos []*ast.Annotation) accessorsOptions {
 	o := accessorsOptions{}
 	if a := hasAnno(annos, "Accessors"); a != nil {
-		o.chain = annoBool(a, "chain", false)
 		o.fluent = annoBool(a, "fluent", false)
+		o.chain = annoBool(a, "chain", false)
+		// HandlerUtil.shouldReturnThis0: an explicit `chain` decides on its
+		// own, and otherwise the setter returns `this` when `fluent` is on --
+		// which is what @Accessors's javadoc says, "default: false, unless
+		// fluent=true, then default: true".
+		if a.Arg("chain") == nil {
+			o.chain = o.chain || o.fluent
+		}
 		o.prefix = annoStringList(a, "prefix")
 	}
 	return o
@@ -611,7 +618,9 @@ func (c *Checker) lombokSetter(cl *ast.Class, fields []*ast.Field, s onSite, o a
 		}
 		stmts = append(stmts, exprStmtOf(assignTo(thisField(f), id("value"))))
 		var result ast.Type = ast.TVoid
-		if o.chain {
+		// JavacHandlerUtil.shouldReturnThis: a static field's setter has no
+		// `this` to return, so it stays void however @Accessors reads.
+		if o.chain && !f.Mods.Has(ast.ModStatic) {
 			result = &ast.ClassType{Class: cl, Args: typeVarArgs(cl)}
 			stmts = append(stmts, returnOf(thisStat(cl)))
 		}
