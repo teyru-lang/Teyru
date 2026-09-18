@@ -33,3 +33,16 @@
 #     the case that could not be written before. All five programs agree with
 #     the suite in every cell; a divergence here again means the rule has been
 #     broken again, not that it is being excused.
+
+# --- the LLVM back end's frames are not mapped (W14)
+#
+#     The LLVM back end emits no frame maps, and it does not need to: the
+#     collector is precise about the frames a compiler describes and
+#     conservative about every other frame, so a program it builds has its stack
+#     walked word by word -- the behaviour every program had before the maps
+#     existed. What that costs is retention, and `t245_dropped_reference` is the
+#     case that measures exactly that: its live set after a dropped reference is
+#     8 MB under this back end and 0 under the C one. That is a property the
+#     back end does not claim (precision), not a rule of the language either of
+#     them gets wrong, so it is recorded here rather than fixed in either.
+t245_dropped_reference none the LLVM back end maps no frames, so the collector scans its frames conservatively and the case's own subject -- the live set after a dropped reference -- reads 8 where the C back end reads 0
