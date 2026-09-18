@@ -906,6 +906,7 @@ func (c *Checker) lombokCtor(cl *ast.Class, s onSite, kind string) {
 	if !ok {
 		mods = ast.ModPublic
 	}
+	c.dropDefaultCtor(cl)
 	if sn := annoString(a, "staticName"); sn != "" {
 		c.lombokStaticFactory(cl, sn, params, names, stmts, mods, s)
 		return
@@ -915,6 +916,32 @@ func (c *Checker) lombokCtor(cl *ast.Class, s onSite, kind string) {
 	m.Anno = "@" + kind + "ArgsConstructor"
 	c.placeOn(m, s.ctorAnnos(), s.paramAnnos())
 	c.addSynthCtor(cl, m)
+}
+
+// dropDefaultCtor removes the constructor resolveMembers synthesized for a
+// class that declared none.
+//
+// Lombok injects its constructor into the class declaration, and javac, finding
+// a constructor declared, never adds the implicit one. Teyru adds the implicit
+// public no-argument constructor while resolving members, which happens before
+// the Lombok pass, so a generated no-argument constructor found the signature
+// taken and addSynthCtor stepped aside for it:
+// `@NoArgsConstructor(access = AccessLevel.PRIVATE)` on a class with no
+// constructors of its own left the class with the implicit public constructor
+// and no private one, which is the annotation doing nothing at all.
+//
+// @AllArgsConstructor and @RequiredArgsConstructor need this too, and for the
+// same reason: Lombok's `class A { int x; }` with @AllArgsConstructor has one
+// constructor, `A(int)`, and no `A()` at all.
+func (c *Checker) dropDefaultCtor(cl *ast.Class) {
+	kept := make([]*ast.Method, 0, len(cl.Ctors))
+	for _, m := range cl.Ctors {
+		if m.SynthKind == "default-ctor" {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	cl.Ctors = kept
 }
 
 // lombokStaticFactory emits `static Cls of(args) { return new Cls(args) }`.
@@ -1083,6 +1110,10 @@ func (c *Checker) lombokBuilderFor(cl *ast.Class, a *ast.Annotation, classAnnos 
 		stmts = append(stmts, exprStmtOf(assignTo(thisField(f), id(f.Name))))
 		allArgs.Body = blockOf(append(stmtsFrom(allArgs.Body), stmts...)...)
 	}
+	// Lombok's builder calls a constructor of its own, so the class has one and
+	// the implicit no-argument constructor must go: `@Builder class A { int x }`
+	// has `A(int)` and no `A()` (see dropDefaultCtor).
+	c.dropDefaultCtor(cl)
 	c.addSynthCtor(cl, allArgs)
 
 	// the builder class itself
