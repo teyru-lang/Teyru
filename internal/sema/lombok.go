@@ -635,6 +635,18 @@ func (c *Checker) lombokLazyGetter(cl *ast.Class, f *ast.Field, mods ast.Mods, n
 		Anno: "@Getter(lazy)",
 	}
 	c.addSynthField(cl, holder)
+	// A null initializer is a value like any other, and Lombok caches it: its
+	// holder is an AtomicReference, so "not computed yet" is the reference
+	// itself and the value can be null. Teyru's holder is the value, so null
+	// cannot carry that meaning -- it would recompute on every read -- and the
+	// "computed" fact is a flag instead. Both are volatile and the value is
+	// written first, so a reader that sees the flag set sees the value.
+	done := &ast.Field{
+		Name: "__lazy$done$" + f.Name, Type: ast.TBoolean,
+		Mods: ast.ModPrivate | ast.ModVolatile, Pos: f.Pos, Storage: true,
+		Anno: "@Getter(lazy)",
+	}
+	c.addSynthField(cl, done)
 	var init ast.Expr = nullLit()
 	if f.Decl != nil && f.Decl.Init != nil {
 		init = f.Decl.Init
@@ -643,11 +655,26 @@ func (c *Checker) lombokLazyGetter(cl *ast.Class, f *ast.Field, mods ast.Mods, n
 		// and the lazy value would be computed twice.
 		f.Decl.Init = nil
 	}
+	compute := blockOf(
+		exprStmtOf(assignTo(thisField(holder), init)),
+		exprStmtOf(assignTo(thisField(done), boolLit(true))),
+	)
+	// Double-checked, the way Lombok's lazy getter is: the fast path reads the
+	// flag without the lock, and the second test inside it is what keeps two
+	// threads from both running the initializer.
+	//
+	// Lombok synchronizes on the AtomicReference that is its holder; Teyru's
+	// holder is the value itself and may be null, which is no monitor, so the
+	// monitor is the instance. Reentrant, so an initializer that takes the same
+	// monitor still runs.
 	body := blockOf(
-		ifOf(isNull(thisField(holder)),
-			blockOf(
-				exprStmtOf(assignTo(thisField(holder), init)),
-			), nil),
+		ifOf(&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!", X: thisField(done)},
+			blockOf(&ast.Sync{Pos: pos(),
+				Lock: &ast.This{ExprBase: ast.ExprBase{Pos: pos()}},
+				Body: blockOf(
+					ifOf(&ast.Unary{ExprBase: ast.ExprBase{Pos: pos()}, Op: "!", X: thisField(done)},
+						compute, nil),
+				)}), nil),
 		returnOf(thisField(holder)),
 	)
 	m := c.newSynthMethod(cl, name, mods, f.Type, nil, nil, body, "")
