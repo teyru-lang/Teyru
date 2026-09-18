@@ -1124,22 +1124,7 @@ func (e *Emitter) emitMethod(cl *ast.Class, m *ast.Method, idx int) {
 		restore()
 	}()
 	for i, pv := range m.ParamVars {
-		name := fmt.Sprintf("a%d", i)
-		if e.fnTry {
-			// gcc does not honour a volatile qualifier on a parameter object:
-			// in a function that catches, it reads back the value the parameter
-			// had on entry where clang reads the one assigned inside the try
-			// (measured on gcc 16 at -O2, with and without LTO, against the
-			// same program under clang). A volatile *local* it does honour, so
-			// the parameter is copied into one at entry and every access goes
-			// through the copy. The qualifier on the C parameter is left in
-			// place for the compilers that do honour it; this copy is what
-			// makes the answer the same on both.
-			vol := fmt.Sprintf("v%d_%s", pv.ID, mangle(pv.Name))
-			e.line("%s volatile %s = %s;\n", e.ctype(pv.Type), vol, name)
-			name = vol
-		}
-		e.locals[pv] = name
+		e.locals[pv] = fmt.Sprintf("a%d", i)
 	}
 	// The frame map is written around the body: the collector's precise view of
 	// this frame is what the prologue there declares and what the body fills in
