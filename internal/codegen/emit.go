@@ -1123,8 +1123,25 @@ func (e *Emitter) emitMethod(cl *ast.Class, m *ast.Method, idx int) {
 		e.fnTry = prevTry
 		restore()
 	}()
+	var copies []string
 	for i, pv := range m.ParamVars {
-		e.locals[pv] = fmt.Sprintf("a%d", i)
+		name := fmt.Sprintf("a%d", i)
+		if e.fnTry {
+			// gcc does not honour a volatile qualifier on a parameter object:
+			// in a function that catches, it reads back the value the parameter
+			// had on entry where clang reads the one assigned inside the try
+			// (measured on gcc 16 at -O2, with and without LTO, against the
+			// same program under clang). A volatile *local* it does honour, so
+			// the parameter is copied into one at entry and every access goes
+			// through the copy. The qualifier on the C parameter is left in
+			// place for the compilers that do honour it; this copy is what
+			// makes the answer the same on both.
+			vol := fmt.Sprintf("v%d_%s", pv.ID, mangle(pv.Name))
+			copies = append(copies, fmt.Sprintf("%s volatile %s = %s;",
+				e.ctype(pv.Type), vol, name))
+			name = vol
+		}
+		e.locals[pv] = name
 	}
 	// The frame map is written around the body: the collector's precise view of
 	// this frame is what the prologue there declares and what the body fills in
@@ -1132,6 +1149,17 @@ func (e *Emitter) emitMethod(cl *ast.Class, m *ast.Method, idx int) {
 	e.frameTemps = nil
 	e.frameBase = len(e.funcParams(m))
 	e.emitMappedBody(e.cfunc(m), e.funcParams(m), func() {
+		// The parameter copies are the body's own first declarations, and that
+		// is where they have to be: what tells the collector about a word is
+		// the registration the pass writes, and the pass writes it by reading
+		// the emitted body (frames.go). A declaration emitted before the
+		// prologue is a declaration the pass never sees, and a copy of a
+		// reference parameter that no word names is retention the collector
+		// does not have -- the object the copy holds is freed while the
+		// program still points at it.
+		for _, c := range copies {
+			e.line("%s\n", c)
+		}
 		if m.IsCtor {
 			e.emitCtorBody(cl, m)
 		} else if body != nil {
