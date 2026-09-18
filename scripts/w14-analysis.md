@@ -138,6 +138,8 @@ for (int i = 0; i < 1; i++) { System.out.println(xs[i]); }   // loop entered: NP
    （AGENTS.md §10：**不是比較次數，也不是反射**）。**還沒量到的**：那 16 個標頭位元組**各是什麼**、
    其中哪些可以搬走或縮小、以及在**真的會逃逸的基準上**（見第 6 項）收窄 8 或 16 位元組各值多少。
 
+   **「那 16 個標頭位元組各是什麼」有答案了**（下面第九之一節），而答案是:**它不是物件的標頭**。
+
 ## 附錄：可重現的東西
 
 - `ab.sh` —— 交錯 A/B（綁核、取最小）。
@@ -187,3 +189,69 @@ for (int i = 0; i < 1; i++) { System.out.println(xs[i]); }   // loop entered: NP
 任何**仍然配置一個 32 位元組箱子**的捷徑（少一次前奏呼叫、少一次欄位寫入、小整數快取之外的任何做法），
 都要付那兩倍的記憶體流量；反之，若箱子變小，**所有**配置都受益，不必特別處理裝箱。
 **所以要動的是標頭／大小，不是裝箱那條路徑** —— 那是清單新增的第 9 項。
+
+---
+
+## 九之一、第 9 項的第一個答案：那 16 個位元組**不是物件的標頭**
+
+用 `internal/runtime/src/tyrt.h` 自己量（**不是推的**）：
+
+```c
+#include <stdio.h>
+#include "tyrt.h"
+int main(void) {
+  printf("sizeof(tyobj)    = %zu\n", sizeof(tyobj));
+  printf("TY_HDR=%d TY_ALIGN=%d\n", TY_HDR, TY_ALIGN);
+  printf("new Object()     = %zu bytes\n",
+         (sizeof(tyobj) + TY_HDR + TY_ALIGN - 1) & ~(size_t)(TY_ALIGN - 1));
+  return 0;
+}
+```
+
+```
+sizeof(tyobj)    = 8
+sizeof(tyintbox) = 16
+TY_HDR=16 TY_ALIGN=16
+new Object()     = 32 bytes
+a boxed int      = 32 bytes
+```
+
+**32 的組成**（三個不同的東西，只有一個是物件的）：
+
+| 位元組 | 是什麼 | 誰在用 |
+|---|---|---|
+| **16** | **配置器的區塊標頭**（`TY_HDR`）：第一個字是**大小 ＋ `TY_MARK_BIT` ＋ `TY_FREE_BIT`**，第二個字是**空閒清單的連結**（`ty_free_block`：`the free list link lives in the second header word`） | 收集器（標記／sweep／block-start map／`size_class`） |
+| **8** | `struct tyobj { tyclass *cls; }` —— 物件**真正的**標頭就只有這個 | 分派、`getClass`、收集器的類別走訪 |
+| **8** | **對齊填充** —— 8 ＋ 16 ＝ 24，`TY_ALIGN` 是 16，所以補到 32 | 沒有人用它 |
+
+**所以「16 的標頭」這個說法是錯的**：那 16 是**配置器的**，而**其中第二個字只在區塊空閒時才需要**
+（活著的區塊裡它沒有意義），另外**還有 8 個位元組是純填充**。
+
+### 兩個槓桿，以及它們各值多少（**算術，不是量測**）
+
+| 假設 | `new Object()` | 裝箱的 int |
+|---|---|---|
+| 現況 | 32 | 32 |
+| **`TY_HDR` 16 → 8** | **16**（＝ Java 的數字） | 32（`TY_ALIGN` 咬住：16 ＋ 8 ＝ 24 → 32） |
+| **`TY_ALIGN` 16 → 8** | 16 | **24** |
+| 兩者都改 | 16 | 24 |
+
+**`TY_HDR` 是 `new Object()` 的主槓桿**（32 → 16 ✓），但**對箱子沒用** ——
+箱子的 payload 自己就 16（`_Static_assert(sizeof(tyintbox) == sizeof(tyobj) + 8)`），
+16 ＋ 8 ＝ 24 會被 `TY_ALIGN=16` 補回 32。**要箱子也變小，`TY_ALIGN` 得跟著動。**
+
+### 為什麼這是「登記答案」而不是「動手」
+
+收掉那 8 個位元組**不是純賺**，代價都寫在同一份程式碼裡：
+
+- **空閒連結的位置**：它現在佔**第二個標頭字**，而程式碼自己的註解說明為什麼是那裡
+  （`the block is marked free first: the collector reads that bit before the link`）——
+  搬進 payload 要先證明**保守掃描不會把空閒區塊的第一個 payload 字追成物件**；
+- **block-start map 會變大**：`TY_START_BYTES(cap)` 是 `cap / TY_ALIGN / 8`，
+  `TY_ALIGN` 減半就**整張圖大一倍**（它是每次收集重建的）；
+- **`valid_obj` 的對齊前置測試會放寬**：那個測試是**便宜的預篩**，
+  放寬會讓更多候選字進到 slab 走訪 —— 而那一族（#57 的 512.9M 次探測）就是這樣來的；
+- **真正的收益還沒量**（第 6 項的「會逃逸的基準」還沒寫出來）。
+
+**所以第 9 項的狀態**：第一個問題（「那 16 個位元組各是什麼」）**有答案了**；
+第二個問題（「收窄 8 或 16 位元組在真實基準上值多少」）**沒有**，而它要等第 6 項。
