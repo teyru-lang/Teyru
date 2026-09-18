@@ -56,17 +56,11 @@ func (e *Emitter) emitBlockInner(b *ast.Block) {
 	decls := e.declInBlock(b)
 	texts := make([]string, len(b.Stmts))
 	uses := make([]map[*ast.Var]bool, len(b.Stmts))
-	temps := make([][]int, len(b.Stmts))
 	for i, s := range b.Stmts {
 		s := s
 		outer := e.useNow
 		e.useNow = map[*ast.Var]bool{}
-		/* Which frame words this statement wrote: recorded per statement, because
-		   every statement is rendered before any is emitted and the end of the
-		   statement is where they go back (frameRelease). */
-		e.frameUsed = e.frameUsed[:0]
 		texts[i] = e.capture(func() { e.stmt(s) })
-		temps[i] = append(temps[i][:0], e.frameUsed...)
 		uses[i] = e.useNow
 		e.useNow = outer
 		/* A use inside a nested statement is a use of this statement too: the
@@ -105,8 +99,11 @@ func (e *Emitter) emitBlockInner(b *ast.Block) {
 		   over, so the words they were held in go back. The word, not the
 		   variable -- what the expression answered with has been read out of it
 		   by now. */
-		e.frameUsed = append(e.frameUsed[:0], temps[i]...)
-		e.frameRelease()
+		if n := len(e.frameTemps); n > 0 {
+			for k := 0; k < n; k++ {
+				e.line("%s(&%s, %d, NULL);\n", framePut, frameVar, e.frameBase+k)
+			}
+		}
 		/* And where the statement ended, which is what tells the map's pass
 		   (frames.go) to give the temporaries *it* registered their words back
 		   in the same way. */
@@ -115,6 +112,23 @@ func (e *Emitter) emitBlockInner(b *ast.Block) {
 }
 
 func (e *Emitter) stmt(s ast.Stmt) {
+	/* Every statement gives back the frame words it wrote, when it ends -- and
+	   every statement is emitted through here, however it was reached: a block, a
+	   single-statement body, a loop's condition or update, a constructor's
+	   prologue, body or field initializer. The list is a stack because statements
+	   nest: an inner statement releases its own words and hands the outer
+	   statement's list back, so neither steals the other's. Putting it here rather
+	   than at each call site is what makes the rule hold for the sites that are
+	   not statement boundaries in the source -- a loop's condition is emitted
+	   while its `for` statement is, and its words belong to that statement. */
+	e.frameScope(func() {
+		e.stmtInner(s)
+	})
+}
+
+// stmtInner is the statement itself, with the frame scope around it already open
+// (see stmt and frameScope).
+func (e *Emitter) stmtInner(s ast.Stmt) {
 	switch v := s.(type) {
 	case *ast.Block:
 		e.line("{\n")
@@ -187,7 +201,7 @@ func (e *Emitter) stmt(s ast.Stmt) {
 		e.line("{\n")
 		e.indent++
 		for _, init := range v.Init {
-			e.stmtRelease(init)
+			e.stmt(init)
 		}
 		// the update and the body both run after the condition, so a variable
 		// a pattern in the condition binds belongs to the whole loop
@@ -278,10 +292,10 @@ func (e *Emitter) stmt(s ast.Stmt) {
 		// any other statement only has the break target
 		if isLoop(unwrapLabels(v.Body)) {
 			e.pendingLabels = append(e.pendingLabels, v.Label)
-			e.stmtRelease(v.Body)
+			e.stmt(v.Body)
 			return
 		}
-		e.stmtRelease(v.Body)
+		e.stmt(v.Body)
 		e.line("%s: ;\n", e.labelName(v.Label, true))
 	case *ast.Assert:
 		e.line("if (!(%s)) { ty_assertfail(%s); }\n", e.cond(v.Cond), e.assertMsg(v))
@@ -484,10 +498,7 @@ func (e *Emitter) stmtAsBlock(s ast.Stmt) {
 		e.emitBlockInner(b)
 		return
 	}
-	/* A body that is one statement rather than a block ends like a statement
-	   ends: the words this statement put values in flight into go back. A block
-	   does it per statement inside emitBlockInner. */
-	e.stmtRelease(s)
+	e.stmt(s)
 }
 
 func (e *Emitter) localVar(v *ast.LocalVar) {
@@ -857,7 +868,7 @@ func (e *Emitter) tryWithResources(v *ast.Try) {
 	for i, r := range v.Resources {
 		switch t := r.(type) {
 		case *ast.LocalVar:
-			e.stmtRelease(r)
+			e.stmt(r)
 			names[i] = e.localName(t.Vars[0].Sym)
 		case *ast.ExprStmt:
 			names[i] = e.tmpName()
@@ -1808,7 +1819,7 @@ func (e *Emitter) switchCaseBody(cs *ast.Case, resultTmp string, id int) {
 		return
 	}
 	for _, st := range cs.Body {
-		e.stmtRelease(st)
+		e.stmt(st)
 	}
 	// `case N -> { ... }` is a whole body that stops there, like the expression
 	// form above, and `case N -> throw ...` is one too -- a throw inside a try

@@ -134,34 +134,40 @@ type Emitter struct {
 	// ends: a word that already holds NULL is back, and writing NULL into it once
 	// per later statement is a store the program does not need (measured on a
 	// reflection-heavy program: 98,489 of the registrations in the emitted C were
-	// those repeats, 3.0 MB of the 6.1 MB the maps add).
-	frameUsed []int
+	// those repeats, 3.0 MB of the 6.1 MB the maps add). frameUsedStack holds the
+	// enclosing statements' lists, because statements nest (see frameRelease).
+	frameUsed      []int
+	frameUsedStack [][]int
 }
 
-// frameRelease gives back the frame's words for values in flight that the
-// statement just emitted wrote, and forgets them.
+// frameRelease gives back the frame words for values in flight that the current
+// statement wrote, and forgets them.
 //
-// Called wherever a statement ends -- the block loop, and the constructor's
-// prologue, body and field initializers, which are statements the emitter writes
-// outside any block. A statement's end is where a value in flight stops being in
-// flight: what the expression answered with has been read out of its word by
-// then. A write that is never given back is a leak, not corruption -- the word
-// stays a root -- and TestEveryWrittenFrameWordIsReleased in frames_test.go is
-// the check that no write is missed.
+// A statement's end is where a value in flight stops being in flight: what the
+// expression answered with has been read out of its word by then. A write that is
+// never given back is a leak, not corruption -- the word stays a root, so the
+// collector keeps what it last pointed at -- and
+// TestEveryWrittenFrameWordIsReleased in frames_test.go is the check that no write
+// is missed: it reads the emitted C and requires a release for every write.
+// frameScope emits a piece of code that is not a statement of its own -- a
+// constructor's field initializer is the one the emitter writes -- and gives back
+// the frame words it wrote, the way a statement's end does.
+func (e *Emitter) frameScope(f func()) {
+	e.frameUsedStack = append(e.frameUsedStack, e.frameUsed)
+	e.frameUsed = nil
+	f()
+	e.frameRelease()
+	if n := len(e.frameUsedStack); n > 0 {
+		e.frameUsed = e.frameUsedStack[n-1]
+		e.frameUsedStack = e.frameUsedStack[:n-1]
+	}
+}
+
 func (e *Emitter) frameRelease() {
 	for _, k := range e.frameUsed {
 		e.line("%s(&%s, %d, NULL);\n", framePut, frameVar, e.frameBase+k)
 	}
 	e.frameUsed = e.frameUsed[:0]
-}
-
-// stmtRelease emits one statement and gives back the words it wrote. Every place
-// that emits a statement outside the block loop goes through this, so the rule
-// holds for the constructor's parts as much as for a block.
-func (e *Emitter) stmtRelease(s ast.Stmt) {
-	e.frameUsed = e.frameUsed[:0]
-	e.stmt(s)
-	e.frameRelease()
 }
 
 // finFrame is one try statement whose finally action must still run.
@@ -1258,7 +1264,7 @@ func (e *Emitter) emitCtorBody(cl *ast.Class, m *ast.Method) {
 	// 1. prologue: statements before the explicit constructor call
 	if idx > 0 {
 		for _, st := range body.Stmts[:idx] {
-			e.stmtRelease(st)
+			e.stmt(st)
 		}
 	}
 	// 2. chain to the superclass or the sibling constructor
@@ -1301,7 +1307,7 @@ func (e *Emitter) emitCtorBody(cl *ast.Class, m *ast.Method) {
 			stmts = stmts[idx:]
 		}
 		for _, st := range stmts {
-			e.stmtRelease(st)
+			e.stmt(st)
 		}
 	}
 	if m.Decl != nil && m.Decl.Compact {
@@ -1348,9 +1354,9 @@ func (e *Emitter) emitFieldInits(cl *ast.Class, ctor *ast.Method) {
 				continue
 			}
 			target := "this->f_" + mangle(vd.Fld.Name)
-			e.frameUsed = e.frameUsed[:0]
-			e.line("%s = %s;\n", target, e.coerce(e.expr(vd.Init), vd.Init.GetType(), vd.Fld.Type))
-			e.frameRelease()
+			e.frameScope(func() {
+				e.line("%s = %s;\n", target, e.coerce(e.expr(vd.Init), vd.Init.GetType(), vd.Fld.Type))
+			})
 		}
 	}
 	for _, mem := range cl.Decl.Members {
