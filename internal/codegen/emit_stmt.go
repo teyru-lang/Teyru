@@ -112,6 +112,23 @@ func (e *Emitter) emitBlockInner(b *ast.Block) {
 }
 
 func (e *Emitter) stmt(s ast.Stmt) {
+	/* Every statement gives back the frame words it wrote, when it ends -- and
+	   every statement is emitted through here, however it was reached: a block, a
+	   single-statement body, a loop's condition or update, a constructor's
+	   prologue, body or field initializer. The list is a stack because statements
+	   nest: an inner statement releases its own words and hands the outer
+	   statement's list back, so neither steals the other's. Putting it here rather
+	   than at each call site is what makes the rule hold for the sites that are
+	   not statement boundaries in the source -- a loop's condition is emitted
+	   while its `for` statement is, and its words belong to that statement. */
+	e.frameScope(func() {
+		e.stmtInner(s)
+	})
+}
+
+// stmtInner is the statement itself, with the frame scope around it already open
+// (see stmt and frameScope).
+func (e *Emitter) stmtInner(s ast.Stmt) {
 	switch v := s.(type) {
 	case *ast.Block:
 		e.line("{\n")

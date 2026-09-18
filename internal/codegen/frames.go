@@ -478,10 +478,10 @@ func frameID(cname string) int32 {
 // of the method being mapped: the statements of that nested body are not this
 // frame's, and the map being built must not claim their words.
 func (e *Emitter) frameReset() func() {
-	prevMap, prevUse, prevTemps, prevBase := e.frameMap, e.useNow, e.frameTemps, e.frameBase
+	prevMap, prevUse, prevTemps, prevBase, prevUsed := e.frameMap, e.useNow, e.frameTemps, e.frameBase, e.frameUsed
 	e.frameMap, e.useNow = false, nil
 	return func() {
-		e.frameMap, e.useNow, e.frameTemps, e.frameBase = prevMap, prevUse, prevTemps, prevBase
+		e.frameMap, e.useNow, e.frameTemps, e.frameBase, e.frameUsed = prevMap, prevUse, prevTemps, prevBase, prevUsed
 	}
 }
 
@@ -561,6 +561,19 @@ func (e *Emitter) frameTemp(t ast.Type, v string) string {
 	k := len(e.frameTemps)
 	name := fmt.Sprintf("_tyft%d", k)
 	e.frameTemps = append(e.frameTemps, name)
+	// Remember that this statement put a value in the word, so its end gives that
+	// one back and not every word of the frame. A site written twice in one
+	// statement is still one word.
+	seen := false
+	for _, u := range e.frameUsed {
+		if u == k {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		e.frameUsed = append(e.frameUsed, k)
+	}
 	return fmt.Sprintf("({ %s = (void*)(%s); (%s)%s; })", name, v, e.ctype(t), name)
 }
 
