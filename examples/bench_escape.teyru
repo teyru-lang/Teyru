@@ -1,0 +1,55 @@
+// Allocation pressure where the object escapes the method that makes it.
+//
+// bench_alloc measures the opposite shape: its cells never leave the loop, the
+// escape analysis keeps each one on the stack, and TEYRU_GCTRACE=1 prints no
+// collection for it at all -- so it times the loop and not the allocator. Here
+// nothing can be promoted: the cell is built in a method and returned, stored
+// into a ring that a static field holds (a GC root, so the object is reachable
+// long after make() returned), and read back out of it. The ring is 1024 slots,
+// so the cells it has wrapped past are garbage the collector has to find, and
+// the live set stays at 1024 objects rather than the whole run.
+//
+// The shape is what a program that builds a result out of objects does: parse
+// into nodes, accumulate into a list, hand the object back to a caller. It is
+// the allocator's own benchmark, unlike bench_invoke which reaches it by
+// accident.
+//
+// The argument is the number of cells allocated.
+class EscCell {
+  private long value
+  public EscCell(long v) {
+    value = v
+  }
+  public long value() {
+    return value
+  }
+}
+
+class BenchEscape {
+  // 1024 is a power of two so the index is a mask rather than a division; the
+  // mask is what the loop below costs beyond the allocation itself.
+  private static int ringSize = 1024
+  private static EscCell[] ring = new EscCell[ringSize]
+
+  // Returning the cell is what makes it escape: the caller stores it somewhere
+  // the analysis cannot follow it to, which is a slot of an array a static
+  // field holds.
+  private static EscCell make(long v) {
+    return new EscCell(v)
+  }
+
+  public static void main(String[] args) {
+    int n = 20000000
+    if (args.length > 0) {
+      n = Integer.parseInt(args[0])
+    }
+    int mask = ringSize - 1
+    long sum = 0
+    for (int i = 0 : i < n : i++) {
+      EscCell c = make(i)
+      ring[i & mask] = c
+      sum += ring[i & mask].value()
+    }
+    System.out.println(sum)
+  }
+}

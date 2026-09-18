@@ -182,7 +182,8 @@ scale_of() {
     bench_loop)       if [ "$2" = long ]; then echo 1000000;   else echo 20000;     fi ;;
     bench_oop)        if [ "$2" = long ]; then echo 500000;    else echo 2000;      fi ;;
     bench_alloc)      if [ "$2" = long ]; then echo 800000000; else echo 20000000;  fi ;;
-    bench_string)     if [ "$2" = long ]; then echo 16000000;  else echo 200000;    fi ;;
+    bench_escape)     if [ "$2" = long ]; then echo 40000000;  else echo 20000000;  fi ;;
+    bench_string)     if [ "$2" = long ]; then echo 16000000;  else echo 200000;   fi ;;
     bench_string_cjk) if [ "$2" = long ]; then echo 4000000;   else echo 200000;    fi ;;
     bench_invoke)     if [ "$2" = long ]; then echo 200000000; else echo 20000000;  fi ;;
     *) echo "" ;;
