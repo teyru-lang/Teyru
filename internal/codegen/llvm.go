@@ -86,24 +86,25 @@ type bail struct{ r *Refusal }
 // it.
 func EmitLLVM(p *sema.Program) (ir string, ref *Refusal) {
 	e := newLLVMEmitter(p)
-	/* The collector is precise about the frames a compiler describes, and this
-	   back end describes none: it emits the program's own IR, where a reference
-	   can live in an SSA register or in an alloca of the back end's choosing,
-	   and it has no frame maps to hand the runtime. A program built with it
-	   would get a collector that believes its roots are exact and a back end
-	   that never said which words are references, and the failure that follows
-	   is a use-after-free that shows up as a wrong answer days later. So it is
-	   refused by name, the way every other construct outside this back end's
-	   subset is, and the refusal names the switch that puts the conservative
-	   collector back so the program can still be built. */
-	if !frameMapsOff {
-		return "", &Refusal{
-			Code: CodeLLVMUnsupported,
-			Thing: "frame maps: this back end does not say which of a frame's words hold references, and the " +
-				"collector now reads exactly what a compiler describes -- set TEYRU_NO_FRAME_MAPS=1 to build " +
-				"this program with the conservative collector instead",
-		}
-	}
+	/* This back end emits no frame maps, and it does not need to: the collector
+	   is precise about the frames a compiler *describes* and conservative about
+	   every other frame. `mark_frame` reads exactly the words a map names, and
+	   `scan_unmapped` covers the complement of the mapped extents -- so a frame
+	   that never calls ty_frame_enter is not "a frame with exact roots that the
+	   back end forgot to describe", it is a frame the collector walks word by
+	   word, which is what every frame of every program was before the maps
+	   existed. A program this back end builds therefore runs with the
+	   conservative collector, and the price is retention rather than a root the
+	   collector misses.
+
+	   That price is visible and expected: a program whose expectation depends on
+	   precision (tests/programs/t245_dropped_reference, which reads the live set
+	   after a dropped reference) answers 8 under this back end where the C back
+	   end answers 0. That is the divergence the back-end matrix exists to
+	   record, not a backend that cannot run. It used to refuse by name here
+	   (TY-INT-0100) on the view that a back end without maps would get exact
+	   roots it never described; the view was wrong, and refusing every program
+	   made half of the matrix untestable. */
 	defer func() {
 		if r := recover(); r != nil {
 			b, ok := r.(bail)
