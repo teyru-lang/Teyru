@@ -572,3 +572,78 @@ func frameSnippet(body string, i int) string {
 	}
 	return fmt.Sprintf("%q", s)
 }
+
+// TestEveryWrittenFrameWordIsReleased is the sibling of TestEveryFrameWordIsMapped.
+// That one says every word of a frame that can hold a reference is named by the
+// map; this one says every word the map names, and that the body put a value in,
+// is given back before the frame leaves.
+//
+// It is the premise the statement-end releases rest on. A value in flight lives
+// in one of the frame's own words for exactly as long as the statement that
+// needs it (frameTemp), and the end of that statement is where the word goes
+// back to NULL. If a write is missed, the word keeps pointing at an object the
+// program has dropped and the collector keeps it -- a leak, not corruption, and
+// precisely what tests/programs/t245_dropped_reference measures at the end of a
+// method. A check that reads the C is the only way to see it for every frame
+// rather than for the one program somebody thought to write.
+//
+// The perturbation it was checked against: making frameTemp not record the word
+// it wrote (dropping the frameUsed bookkeeping) leaves the writes unreleased and
+// turns this red in every case, with lines like
+//
+//	frame M_teyru_String_chars_0: _tyft0 is written and its word is never given
+//	back (a leak: the collector keeps what the word last pointed at)
+//
+// while TestEveryFrameWordIsMapped stays green -- which is the point of having
+// both: one catches a word nothing names, the other a word nothing clears.
+func TestEveryWrittenFrameWordIsReleased(t *testing.T) {
+	for _, tc := range frameCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			c := emitFrameCase(t, tc.src)
+			funcs := mappedFrames(c)
+			if len(funcs) < 100 {
+				t.Fatalf("only %d mapped frames in the generated C; the check would prove nothing", len(funcs))
+			}
+			written := 0
+			for _, f := range funcs {
+				loc := frameEnterRe.FindStringIndex(f.text)
+				if loc == nil {
+					continue
+				}
+				// Which slot each frame temp was registered in: the prologue names
+				// the word, so the release that gives it back can be matched to it.
+				slots := map[string]string{}
+				for _, m := range frameTempRegRe.FindAllStringSubmatch(f.text, -1) {
+					slots[m[2]] = m[1] // the temp's name -> the slot it was given
+				}
+				body := f.text[loc[1]:]
+				for _, m := range frameTempWriteRe.FindAllStringSubmatch(body, -1) {
+					name, slot := m[1], slots[m[1]]
+					if slot == "" {
+						continue
+					}
+					written++
+					if !strings.Contains(body, framePut+"(&"+frameVar+", "+slot+", NULL);") {
+						t.Errorf("frame %s: %s is written and its word is never given back (a leak: the collector keeps what the word last pointed at)",
+							f.name, name)
+						break
+					}
+				}
+			}
+			if testing.Verbose() {
+				t.Logf("cases checked=%d written frame words=%d", len(funcs), written)
+			}
+			if written < 50 {
+				t.Errorf("only %d written frame words were checked; the check would prove nothing", written)
+			}
+		})
+	}
+}
+
+var (
+	// frameTempRegRe reads the prologue's registration of a frame temp: the word
+	// it names and the slot it was given.
+	frameTempRegRe = regexp.MustCompile(`ty_frame_put\(&_tyfr, (\d+), \(void\*\)&(_tyft\d+)\);`)
+	// frameTempWriteRe reads a write into a frame temp's word.
+	frameTempWriteRe = regexp.MustCompile(`(_tyft\d+) = \(void\*\)\(`)
+)
