@@ -3,6 +3,7 @@ package cache
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -244,5 +245,57 @@ func TestEntryNeedsEveryFileItWasAskedFor(t *testing.T) {
 	}
 	if e.Has("typrelude.h", "prelude.c", "prelude.o") {
 		t.Error("an entry missing one of the files it was asked for is a hit")
+	}
+}
+
+// A compiler's identity has to be the compiler and not only the commit it was
+// built from. Two worktrees of one commit with different edits in them report
+// the same revision and the same "dirty", and they emit different C; if their
+// keys matched, a build of one would link a prelude the other emitted.
+func TestTwoDirtyCompilersOfOneCommitAreDifferentCompilers(t *testing.T) {
+	// The same compiler is the same key, twice.
+	if buildFor("0.4.1", "aa11") != buildFor("0.4.1", "aa11") {
+		t.Error("one compiler is two cache keys")
+	}
+	// The case vcs.revision cannot see: same version, same revision, same dirty
+	// flag, different bytes.
+	if buildFor("0.4.1", "aa11") == buildFor("0.4.1", "bb22") {
+		t.Error("two different compilers share a cache key")
+	}
+	// The version is still an input, and it is a different input from the
+	// compiler's own bytes.
+	if buildFor("0.4.1", "aa11") == buildFor("0.4.2", "aa11") {
+		t.Error("two versions of one compiler share a cache key")
+	}
+	// A field boundary that can move must not: the identity is joined into the
+	// key by its own separator and not by string concatenation.
+	if buildFor("0.4.1", "aa11") == buildFor("0.4.1aa", "11") {
+		t.Error("the identity and the version run together")
+	}
+}
+
+// The identity in the key is the running compiler's own bytes, and it is the
+// running compiler's: this reads the executable the test is in and hashes it
+// the same way, so a Build that stopped naming the binary at all is caught
+// rather than quietly reverting to the revision-only key it replaced.
+func TestBuildNamesTheRunningCompiler(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("this platform cannot name the running executable: %v", err)
+	}
+	sum, err := sumOfFile(exe)
+	if err != nil {
+		t.Fatalf("hashing %s: %v", exe, err)
+	}
+	if !strings.Contains(Build("0.4.1"), "self="+sum[:16]) {
+		t.Errorf("Build(0.4.1) = %q, which does not name %s", Build("0.4.1"), exe)
+	}
+	// Hashed once and not per call: a build asks for this key on every program
+	// it compiles, and a compiler binary is megabytes.
+	if selfHash() != selfHash() {
+		t.Error("the compiler's own identity changed between two calls")
+	}
+	if selfHash() != sum[:16] {
+		t.Errorf("selfHash() = %q, want the hash of %s", selfHash(), exe)
 	}
 }
