@@ -30,6 +30,11 @@ tyclass *TY_ILLMON;
 /* The class-initializer errors and the Error class the initializer path tests
    a throwable against (tyrt2.c's ty_clinit). */
 tyclass *TY_EIIE, *TY_NCDFE, *TY_ERROR;
+/* IndexOutOfBoundsException, the parent of the array and string index
+   exceptions above: String's offsetByCodePoints and codePointCount throw it
+   rather than the string subclass, which is what the JDK's do, and catching
+   the parent is the idiom those two are written for. */
+tyclass *TY_IOOBE = NULL;
 /* StackOverflowError, which the runtime throws from a prologue check rather
    than from a call site: it is installed by the generated startup like the rest
    of them. */
@@ -1313,6 +1318,25 @@ void *ty_sioobe(int64_t idx, int64_t len) {
   char buf[128];
   snprintf(buf, sizeof buf, "Index %lld out of bounds for length %lld", (long long)idx, (long long)len);
   ty_throw(ty_make_ex(TY_SIOOBE, buf));
+  return NULL;
+}
+/* The parent class, which is what the JDK throws from String's
+   offsetByCodePoints -- `new IndexOutOfBoundsException()`, with no message at
+   all: getMessage answers null, and an uncaught one reads as the class name
+   alone, which is what ty_make_ex's null message gives. */
+void *ty_ioobe(void) {
+  ty_throw(ty_make_ex(TY_IOOBE, NULL));
+  return NULL;
+}
+/* java.util.Objects.checkFromToIndex's message, which is what a code point
+   count reports a range that is not inside the string or the buffer with. The
+   range is half open and the message prints it the way Java's does, so a
+   program that prints what it caught reads the same on both sides. */
+void *ty_ioobe_range(int64_t from, int64_t to, int64_t len) {
+  char buf[128];
+  snprintf(buf, sizeof buf, "Range [%lld, %lld) out of bounds for length %lld",
+           (long long)from, (long long)to, (long long)len);
+  ty_throw(ty_make_ex(TY_IOOBE, buf));
   return NULL;
 }
 void *ty_arith(const char *msg) {
@@ -4024,7 +4048,7 @@ int32_t ty_str_code_point_before(tystr *s, int32_t i) {
 int32_t ty_str_code_point_count(tystr *s, int32_t from, int32_t to) {
   int64_t i, n;
   if (!s) ty_npe();
-  if (from < 0 || to > s->ulen || from > to) ty_throw((tyobj *)ty_sioobe(from, s->ulen));
+  if (from < 0 || to > s->ulen || from > to) ty_ioobe_range(from, to, s->ulen);
   n = to - from;
   if (n == 0 || TY_STR_ASCII(s)) return (int32_t)n;
   for (i = from; i < to;) {
@@ -4039,20 +4063,19 @@ int32_t ty_str_code_point_count(tystr *s, int32_t from, int32_t to) {
 
 /* offsetByCodePoints walks code points from an index, forwards or backwards,
    and an index that lands between the units of a pair is a position it starts
-   from or arrives at. Walking off either end is an IndexOutOfBoundsException in
-   Java; this runtime has no handle for that class, so the string one --
-   its subclass, and what a `catch (IndexOutOfBoundsException)` still catches --
-   is what comes out. */
+   from or arrives at. Walking off either end, or starting outside 0..length, is
+   the parent IndexOutOfBoundsException with no message, which is what the JDK
+   throws and what the runtime's TY_IOOBE handle is for. */
 int32_t ty_str_offset_by_code_points(tystr *s, int32_t i, int32_t n) {
   int64_t at;
   if (!s) ty_npe();
-  if (i < 0 || i > s->ulen) ty_throw((tyobj *)ty_sioobe(i, s->ulen));
+  if (i < 0 || i > s->ulen) ty_ioobe();
   at = i;
   if (n >= 0) {
     int64_t left = n;
     while (left > 0) {
       uint16_t c;
-      if (at >= s->ulen) ty_throw((tyobj *)ty_sioobe(at, s->ulen));
+      if (at >= s->ulen) ty_ioobe();
       c = str_unit_at(s, at++);
       if (unit_is_high(c) && at < s->ulen && unit_is_low(str_unit_at(s, at))) at++;
       left--;
@@ -4061,7 +4084,7 @@ int32_t ty_str_offset_by_code_points(tystr *s, int32_t i, int32_t n) {
     int64_t left = n;
     while (left < 0) {
       uint16_t c;
-      if (at <= 0) ty_throw((tyobj *)ty_sioobe(at - 1, s->ulen));
+      if (at <= 0) ty_ioobe();
       c = str_unit_at(s, --at);
       if (unit_is_low(c) && at > 0 && unit_is_high(str_unit_at(s, at - 1))) at--;
       left++;
@@ -4325,18 +4348,19 @@ tystr *ty_str_interned(tystr *s) {
    specialNew; a constructor that takes an argument is compiled as an ordinary
    allocation followed by a call to the Teyru constructor, so the object
    arrives here with ty_alloc's zeroes in its fields and no buffer at all. The
-   capacity is floored at 1 rather than left at 0 (which `new StringBuilder(0)`
-   asks for): both growth loops in the runtime double a capacity and a zero
-   never leaves zero, so a zero-capacity builder could never be appended to.
-   capacity() is the only place the difference shows. Java throws
-   NegativeArraySizeException for a negative one, and so does this. */
+   capacity is the one the constructor was given, including zero, because
+   capacity() is Java's answer and Java reports zero for `new StringBuilder(0)`.
+   The buffer behind a zero capacity is one unit rather than none: a zero-length
+   allocation's pointer is not a place to write, and ty_sb_reserve grows it
+   before anything is written. Java throws NegativeArraySizeException for a
+   negative one, and so does this. */
 void *ty_sb_init(void *p, int64_t cap) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
   if (cap < 0) ty_throw((tyobj *)ty_negarr(cap));
   if (sb->buf) return p;
-  sb->cap = cap > 0 ? cap : 1;
-  sb->buf = (uint16_t *)malloc((size_t)sb->cap * sizeof(uint16_t));
+  sb->cap = cap;
+  sb->buf = (uint16_t *)malloc((size_t)(cap > 0 ? cap : 1) * sizeof(uint16_t));
   return p;
 }
 static void lang_sb_insert_raw(tySB *sb, int64_t at, const uint16_t *u, int64_t n) {
@@ -4427,6 +4451,51 @@ int32_t ty_sb_charat(void *p, int32_t at) {
   if (!sb) ty_npe();
   if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
   return sb->buf[at];
+}
+/* The builder's code point reads, which are String's reads over the buffer
+   instead of over a string: the unit at an index may be half of an astral
+   character, and these walk the pair the way ty_str_code_point_* do. The
+   exception classes are Java's, and they are not all the same one: a single
+   index is the string's own subclass, while a range is checked with
+   Objects.checkFromToIndex and is the parent. */
+int32_t ty_sb_code_point_at(void *p, int32_t at) {
+  tySB *sb = (tySB *)p;
+  uint16_t c;
+  if (!sb) ty_npe();
+  if (at < 0 || at >= sb->len) ty_sioobe(at, sb->len);
+  c = sb->buf[at];
+  if (unit_is_high(c) && at + 1 < sb->len && unit_is_low(sb->buf[at + 1]))
+    return 0x10000 + ((c - 0xD800) << 10) + (sb->buf[at + 1] - 0xDC00);
+  return c;
+}
+int32_t ty_sb_code_point_before(void *p, int32_t at) {
+  tySB *sb = (tySB *)p;
+  uint16_t c;
+  if (!sb) ty_npe();
+  /* Java checks index - 1, and the message says so: codePointBefore(0) of a
+     four-unit builder reports "Index -1 out of bounds for length 4". */
+  if (at < 1 || at > sb->len) ty_sioobe(at - 1, sb->len);
+  c = sb->buf[at - 1];
+  if (unit_is_low(c) && at >= 2) {
+    uint16_t d = sb->buf[at - 2];
+    if (unit_is_high(d)) return 0x10000 + ((d - 0xD800) << 10) + (c - 0xDC00);
+  }
+  return c;
+}
+int32_t ty_sb_code_point_count(void *p, int32_t from, int32_t to) {
+  tySB *sb = (tySB *)p;
+  int64_t i, n;
+  if (!sb) ty_npe();
+  if (from < 0 || to > sb->len || from > to) ty_ioobe_range(from, to, sb->len);
+  n = to - from;
+  for (i = from; i < to;) {
+    uint16_t c = sb->buf[i++];
+    if (unit_is_high(c) && i < to && unit_is_low(sb->buf[i])) {
+      n--;
+      i++;
+    }
+  }
+  return (int32_t)n;
 }
 void *ty_sb_set_charat(void *p, int32_t at, uint16_t c) {
   tySB *sb = (tySB *)p;

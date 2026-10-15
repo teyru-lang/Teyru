@@ -16,11 +16,13 @@ package teyru
 //     lookbehind, no backreferences, no named groups, no \p{...} classes.
 //     Anything unsupported is refused by Pattern.compile with a message naming
 //     it, rather than silently matching something else.
-//   - Matching is over UTF-16 code units, which is the unit this library's
-//     String is indexed by. For ASCII -- which is what the patterns in ordinary
-//     code are -- that is the same thing as Java's code points; for text outside
-//     it, `.` and a character class take one unit at a time where Java takes one
-//     code point, so an astral character is two of them here and one there.
+//
+// What a node consumes is a code point, which is what Java's does: `.` takes
+// the emoji of "\uD83D\uDE00a" in one step, a class matches a character rather
+// than a unit, and a supplementary character written literally in the pattern
+// is one node. The positions the engine passes around are code unit indices
+// throughout -- the unit String is indexed by -- so Matcher.start/end report
+// what the JDK reports for the same match (0 and 2 for that emoji).
 
 // ---------------------------------------------------------------- syntax tree
 
@@ -57,18 +59,31 @@ class EmptyNode extends Node {
 }
 
 class LitNode extends Node {
-  char ch
-  LitNode(char ch) { this.ch = ch }
+  int cp
+  LitNode(int cp) { this.cp = cp }
+  /* Java matches a literal below the BMP as the single code unit it is, and a
+     supplementary one as the pair it takes: `"\uD83D".matches("\uD83D")` is
+     true, and a pattern holding an emoji does not match the lone high half of
+     one. The two cases are the JDK's own two node kinds, not a shortcut. */
   boolean run(MatchState st, int pos, Cont k) {
     if (pos >= st.text.length()) {
       return false
     }
-    if (st.text.charAt(pos) != ch) {
+    if (cp < 0x10000) {
+      if (st.text.charAt(pos) != cp) {
+        return false
+      }
+      return k.at(pos + 1)
+    }
+    if (st.text.codePointAt(pos) != cp) {
       return false
     }
-    return k.at(pos + 1)
+    return k.at(pos + Character.charCount(cp))
   }
-  void dump(StringBuilder b) { b.append(ch) }
+  /* the unit, which is the whole character for everything below the BMP: this
+     is a debugging aid nothing calls, and the code point's string spelling
+     would be Character.toString, which the LLVM backend cannot lower */
+  void dump(StringBuilder b) { b.append((char) cp) }
 }
 
 class AnyNode extends Node {
@@ -78,30 +93,37 @@ class AnyNode extends Node {
     }
     // `.` does not match a line terminator unless DOTALL, which is not
     // implemented -- Java's default is what this is.
-    char c = st.text.charAt(pos)
+    // It takes one code point and not one code unit, which is what Java means
+    // by a character: the emoji of "\uD83D\uDE00a" is one `.`, so ".a" matches
+    // the whole string. The position it reaches is still a code unit index, so
+    // what Matcher reports does not change.
+    int c = st.text.codePointAt(pos)
     if (c == '\n' || c == '\r') {
       return false
     }
-    return k.at(pos + 1)
+    return k.at(pos + Character.charCount(c))
   }
   void dump(StringBuilder b) { b.append('.') }
 }
 
 // CharSet is a character class: ranges, single characters, and the predefined
-// classes (\d and friends) it was built from.
+// classes (\d and friends) it was built from. The set is one of code points,
+// not of code units, because that is what a class matches: [\uD83D\uDE00] is
+// the one emoji, and [\uD800-\uDFFF] is the surrogate range rather than a
+// range every half of a pair falls into.
 class CharSet {
   public boolean negated = false
-  public char[] rangeFrom = new char[8]
-  public char[] rangeTo = new char[8]
+  public int[] rangeFrom = new int[8]
+  public int[] rangeTo = new int[8]
   public int ranges = 0
   public boolean digit = false
   public boolean word = false
   public boolean space = false
 
-  public void addRange(char a, char z) {
+  public void addRange(int a, int z) {
     if (ranges == rangeFrom.length) {
-      char[] nf = new char[ranges * 2]
-      char[] nt = new char[ranges * 2]
+      int[] nf = new int[ranges * 2]
+      int[] nt = new int[ranges * 2]
       for (int i = 0 : i < ranges : i++) {
         nf[i] = rangeFrom[i]
         nt[i] = rangeTo[i]
@@ -114,16 +136,16 @@ class CharSet {
     ranges++
   }
 
-  public boolean contains(char c) {
+  public boolean contains(int cp) {
     boolean hit = false
     for (int i = 0 : i < ranges : i++) {
-      if (c >= rangeFrom[i] && c <= rangeTo[i]) {
+      if (cp >= rangeFrom[i] && cp <= rangeTo[i]) {
         hit = true
       }
     }
-    if (!hit && digit && RegexSyntax.isDigit(c)) { hit = true }
-    if (!hit && word && RegexSyntax.isWord(c)) { hit = true }
-    if (!hit && space && RegexSyntax.isSpace(c)) { hit = true }
+    if (!hit && digit && RegexSyntax.isDigit(cp)) { hit = true }
+    if (!hit && word && RegexSyntax.isWord(cp)) { hit = true }
+    if (!hit && space && RegexSyntax.isSpace(cp)) { hit = true }
     return negated ? !hit : hit
   }
 }
@@ -131,14 +153,16 @@ class CharSet {
 class ClassNode extends Node {
   CharSet set
   ClassNode(CharSet set) { this.set = set }
+  /* one code point, which is what Java's CharProperty matches */
   boolean run(MatchState st, int pos, Cont k) {
     if (pos >= st.text.length()) {
       return false
     }
-    if (!set.contains(st.text.charAt(pos))) {
+    int cp = st.text.codePointAt(pos)
+    if (!set.contains(cp)) {
       return false
     }
-    return k.at(pos + 1)
+    return k.at(pos + Character.charCount(cp))
   }
   void dump(StringBuilder b) { b.append("[class]") }
 }
@@ -284,11 +308,14 @@ class AnchorEnd extends Node {
 // ---------------------------------------------------------------- syntax
 
 final class RegexSyntax {
-  public static boolean isDigit(char c) { return c >= '0' && c <= '9' }
-  public static boolean isWord(char c) {
+  /* The three classifiers take a code point, not a code unit: they are asked
+     about what a class or a quantifier is looking at, and that is a character.
+     All three are ASCII, so a code point above the BMP is none of them. */
+  public static boolean isDigit(int c) { return c >= '0' && c <= '9' }
+  public static boolean isWord(int c) {
     return isDigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
   }
-  public static boolean isSpace(char c) {
+  public static boolean isSpace(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == 0x0b
   }
 }
@@ -459,18 +486,22 @@ class PatternParser {
       if (pos >= src.length()) {
         throw new PatternSyntaxException("Unexpected internal error", src, pos - 1)
       }
-      char e = src.charAt(pos)
-      pos++
+      int e = src.codePointAt(pos)
+      pos += Character.charCount(e)
       return escapeNode(e)
     }
     if (c == '*' || c == '+' || c == '?' || c == '{') {
       throw new PatternSyntaxException("Dangling meta character '" + c + "'", src, pos)
     }
-    pos++
-    return new LitNode(c)
+    /* A literal is a code point: the pattern "\uD83D\uDE00" is one character
+       and not two, which is what makes `"😀".matches("😀?")` mean "the emoji,
+       optionally" rather than "the high half, optionally, then the low half". */
+    int cp = src.codePointAt(pos)
+    pos += Character.charCount(cp)
+    return new LitNode(cp)
   }
 
-  private Node escapeNode(char e) {
+  private Node escapeNode(int e) {
     if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
       CharSet set = new CharSet()
       if (e == 'd') { set.digit = true }
@@ -513,13 +544,13 @@ class PatternParser {
     boolean first = true
     while (pos < src.length() && (src.charAt(pos) != ']' || first)) {
       first = false
-      char lo = classChar()
+      int lo = classChar()
       if (lo == 0) {
         break
       }
       if (pos + 1 < src.length() && src.charAt(pos) == '-' && src.charAt(pos + 1) != ']') {
         pos++
-        char hi = classChar()
+        int hi = classChar()
         if (hi == 0) {
           throw new PatternSyntaxException("Unclosed character class", src, pos)
         }
@@ -535,23 +566,30 @@ class PatternParser {
     return new ClassNode(set)
   }
 
-  private char classChar() {
-    char c = src.charAt(pos)
+  /* One member of a class, which is a code point: a surrogate pair written
+     inside a class is the one character it spells, and a range between two
+     code points is a range of characters. Zero is the answer that means the
+     class ran out, which the caller tests for. */
+  private int classChar() {
+    int c = src.codePointAt(pos)
     if (c != '\\') {
-      pos++
+      pos += Character.charCount(c)
       return c
     }
     pos++
     if (pos >= src.length()) {
       throw new PatternSyntaxException("trailing backslash in class", src, pos - 1)
     }
-    char e = src.charAt(pos)
-    pos++
+    int e = src.codePointAt(pos)
+    pos += Character.charCount(e)
     Node n = escapeNode(e)
     if (n instanceof ClassNode) {
-      throw new PatternSyntaxException("\\" + e + " inside a class is not supported", src, pos - 2)
+      /* the concat takes the char rather than the code point: only \d, \w and
+         \s reach here, so the two are the same, and Character.toString(int)
+         is a call the LLVM backend cannot lower */
+      throw new PatternSyntaxException("\\" + (char) e + " inside a class is not supported", src, pos - 2)
     }
-    return ((LitNode) n).ch
+    return ((LitNode) n).cp
   }
 }
 

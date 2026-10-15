@@ -258,7 +258,7 @@ void ty_uncaught(void *e) __attribute__((noreturn));
 /* Preallocated exception classes (filled by generated code at startup). */
 extern tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT,
     *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE,
-    *TY_ILLMON, *TY_SOE, *TY_EIIE, *TY_NCDFE, *TY_ERROR;
+    *TY_ILLMON, *TY_SOE, *TY_EIIE, *TY_NCDFE, *TY_ERROR, *TY_IOOBE;
 
 /* The exceptions java.lang.reflect throws by name. A program that never
    reflects never names one, and the generated startup leaves the pointer NULL
@@ -270,6 +270,12 @@ void *ty_npe(void);
 void *ty_npe_msg(const char *action, const char *cause);
 void *ty_aioobe(int64_t idx, int64_t len);
 void *ty_sioobe(int64_t idx, int64_t len);
+/* IndexOutOfBoundsException, the parent: the JDK throws it with no message at
+   all from String.offsetByCodePoints, and with Objects.checkFromToIndex's
+   "Range [from, to) out of bounds for length len" from the code point count
+   of a String or a builder. */
+void *ty_ioobe(void);
+void *ty_ioobe_range(int64_t from, int64_t to, int64_t len);
 void *ty_arith(const char *msg);
 void *ty_cce(tyclass *from, tyclass *to);
 void *ty_negarr(int64_t len);
@@ -1448,6 +1454,9 @@ void *ty_sb_replace(void *sb, int32_t from, int32_t to, tystr *s);
 void *ty_sb_reverse(void *sb);
 void *ty_sb_set_charat(void *sb, int32_t at, uint16_t c);
 int32_t ty_sb_charat(void *sb, int32_t at);
+int32_t ty_sb_code_point_at(void *sb, int32_t at);
+int32_t ty_sb_code_point_before(void *sb, int32_t at);
+int32_t ty_sb_code_point_count(void *sb, int32_t from, int32_t to);
 int32_t ty_sb_capacity(void *sb);
 int32_t ty_sb_indexof(void *sb, tystr *s);
 int32_t ty_sb_indexof_from(void *sb, tystr *s, int32_t from);

@@ -279,11 +279,14 @@ class StringBuilder extends Object {
   public StringBuilder(int capacity) {
     init(capacity)
   }
+  /* Java's StringBuilder(String) is `super(str.length() + 16)`, so the
+     capacity of a builder made from a string is that string's length plus the
+     default -- the same +16 that `new StringBuilder()` starts at. */
   public StringBuilder(String s) {
     if (s == null) {
       throw new NullPointerException()
     }
-    init(s.length())
+    init(s.length() + 16)
     appendRaw(s)
   }
   private native void init(int capacity)
@@ -326,6 +329,13 @@ class StringBuilder extends Object {
   public native StringBuilder replace(int from, int to, String s)
   public native StringBuilder reverse()
   public native char charAt(int at)
+  /* The code point family, which Java's AbstractStringBuilder has and which
+     reads the buffer the same way String reads its own units: codePointAt(1)
+     of a builder holding an emoji is the low half, codePointCount(0, 2) is
+     one, and the index and range checks are Java's. */
+  public native int codePointAt(int at)
+  public native int codePointBefore(int at)
+  public native int codePointCount(int from, int to)
   public native void setCharAt(int at, char c)
   public native int length()
   public native boolean isEmpty()
@@ -362,11 +372,12 @@ class StringBuffer extends Object {
   public StringBuffer(int capacity) {
     init(capacity)
   }
+  /* the same +16 as StringBuilder's, which is Java's */
   public StringBuffer(String s) {
     if (s == null) {
       throw new NullPointerException()
     }
-    init(s.length())
+    init(s.length() + 16)
     append(s)
   }
   private native void init(int capacity)
@@ -402,6 +413,10 @@ class StringBuffer extends Object {
   public native StringBuffer replace(int from, int to, String s)
   public native StringBuffer reverse()
   public native char charAt(int at)
+  /* the same code point family as StringBuilder's, over the same helper set */
+  public native int codePointAt(int at)
+  public native int codePointBefore(int at)
+  public native int codePointCount(int from, int to)
   public native void setCharAt(int at, char c)
   public native int length()
   public native boolean isEmpty()
