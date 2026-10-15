@@ -24,6 +24,17 @@ import (
 // tables beside it -- and a second copy of them is a second thing to keep true.
 func (e *llvmEmitter) cEmitter() *Emitter { return &Emitter{prog: e.p} }
 
+// The helpful NullPointerException's two halves are computed by the C back
+// end's builders, so both back ends name a failure the same way: one
+// implementation of the wording, and the slot layout it needs, rather than a
+// second copy in the IR path that could drift from the first.
+
+// npeInvoke is the `invoke "M"` action for a call.
+func (e *llvmEmitter) npeInvoke(m *ast.Method) string { return e.cEmitter().npeInvokeSig(m) }
+
+// npeCause is the `because ...` half for a null expression.
+func (e *llvmEmitter) npeCause(x ast.Expr) npeCause { return e.cEmitter().npeCauseOf(x) }
+
 // expr lowers an expression.
 func (e *llvmEmitter) expr(f *fb, x ast.Expr) lval {
 	if x == nil {
@@ -164,7 +175,7 @@ func (e *llvmEmitter) ident(f *fb, v *ast.Ident) lval {
 			return e.staticField(f, r, v.GetType())
 		}
 		e.bareFieldCheck(f, r)
-		return e.fieldRead(f, r, e.selfOperand(f), v.GetType())
+		return e.fieldRead(f, r, e.selfOperand(f), v.GetType(), nil)
 	case *ast.Var:
 		if r == nil {
 			return e.zeroValue(v.GetType())
@@ -227,13 +238,13 @@ func (e *llvmEmitter) selectExpr(f *fb, v *ast.Select) lval {
 		if r.Mods.Has(ast.ModStatic) {
 			return e.staticField(f, r, v.GetType())
 		}
-		return e.fieldRead(f, r, e.expr(f, v.X).v, v.GetType())
+		return e.fieldRead(f, r, e.expr(f, v.X).v, v.GetType(), v.X)
 	case string:
 		if r == "length" {
 			// an array's length, with Java's null test first
 			arr := e.expr(f, v.X)
 			e.useArray()
-			e.nullCheck(f, arr.v)
+			e.nullCheck(f, arr.v, "read the array length", e.npeCause(v.X))
 			return value(e.loadRaw(f, "i64", e.gepBytes(f, arr.v, 8), 8), ast.TLong)
 		}
 	case *ast.Class:
@@ -254,11 +265,11 @@ func (e *llvmEmitter) staticField(f *fb, fd *ast.Field, t ast.Type) lval {
 // fieldRead reads an instance field, testing the receiver first when it is not
 // `this`: reading through a null reference is a NullPointerException in Java and
 // a load from address zero in C.
-func (e *llvmEmitter) fieldRead(f *fb, fd *ast.Field, recv string, t ast.Type) lval {
+func (e *llvmEmitter) fieldRead(f *fb, fd *ast.Field, recv string, t ast.Type, recvX ast.Expr) lval {
 	if fd.Owner == nil {
 		return e.zeroValue(t)
 	}
-	return e.load(f, e.fieldAddr(f, fd, recv, recv != "%this"), t)
+	return e.load(f, e.fieldAddrMsg(f, fd, recv, recv != "%this", npeField("read", fd.Name), recvX), t)
 }
 
 // propertyStorageRead is the `field` a property accessor reads: a static
@@ -270,7 +281,7 @@ func (e *llvmEmitter) propertyStorageRead(f *fb, fd *ast.Field, t ast.Type) lval
 	if fd.Mods.Has(ast.ModStatic) {
 		return e.staticField(f, fd, t)
 	}
-	return e.fieldRead(f, fd, e.selfOperand(f), t)
+	return e.fieldRead(f, fd, e.selfOperand(f), t, nil)
 }
 
 // propertyStorageAddr is the same storage as an address, for an assignment to
@@ -337,6 +348,13 @@ func (e *llvmEmitter) bareFieldCheck(f *fb, fd *ast.Field) {
 // emitted struct type, whose fields were laid out with util.FieldOffsets, so the
 // offset is the one the collector was told about.
 func (e *llvmEmitter) fieldAddr(f *fb, fd *ast.Field, recv string, check bool) string {
+	return e.fieldAddrMsg(f, fd, recv, check, npeField("read", fd.Name), nil)
+}
+
+// fieldAddrMsg is fieldAddr with the helpful NullPointerException's action, for
+// a store site: the same shape, but the JDK says "assign field" rather than
+// "read field".
+func (e *llvmEmitter) fieldAddrMsg(f *fb, fd *ast.Field, recv string, check bool, action string, recvX ast.Expr) string {
 	fd = e.canonicalField(fd)
 	cl := fd.Owner
 	e.needClass(cl)
@@ -345,7 +363,7 @@ func (e *llvmEmitter) fieldAddr(f *fb, fd *ast.Field, recv string, check bool) s
 		e.refuse(noPos, "the field %s of %s is not in the instance layout", fd.Name, cl.Full)
 	}
 	if check {
-		e.nullCheck(f, recv)
+		e.nullCheck(f, recv, action, e.npeCause(recvX))
 	}
 	r := f.reg()
 	f.ins(fmt.Sprintf("%s = getelementptr inbounds %s, ptr %s, i32 0, i32 %d",
@@ -413,22 +431,44 @@ func (e *llvmEmitter) gepIndex(f *fb, ty, base, idx string) string {
 }
 
 // nullCheck throws the way Java's null test does, and falls through when the
-// reference is there.
-func (e *llvmEmitter) nullCheck(f *fb, p string) {
+// reference is there. `action` and `cause` are the helpful NullPointerException's
+// two halves (JEP 358): either may be empty, and the runtime then prints the
+// bare "null" this backend has always printed, so a site that has nothing to
+// describe is unchanged rather than wrong.
+func (e *llvmEmitter) nullCheck(f *fb, p string, action string, cause npeCause) {
 	if p == "0" {
 		// a reference the lowering answered with the integer zero: the two are
 		// the same object, and only one of them parses here
 		p = "null"
 	}
 	e.markExn("TY_NPE", e.p.Builtins.NPE)
-	e.decl("ty_npe", "ptr", nil, "")
+	if cause == "" || cause == "null" {
+		// No cause to name: the bare form, which is the C string literal the
+		// header declares and nothing more.
+		e.decl("ty_npe", "ptr", nil, "")
+		ok := f.nextLabel("npe_ok")
+		bad := f.nextLabel("npe_bad")
+		c := f.reg()
+		f.ins(fmt.Sprintf("%s = icmp eq ptr %s, null", c, p))
+		f.cbr(c, bad, ok)
+		f.label(bad)
+		f.ins("call ptr @ty_npe()")
+		f.br(ok)
+		f.label(ok)
+		return
+	}
+	e.decl("ty_npe_msg", "ptr", []string{"ptr", "ptr"}, "")
 	ok := f.nextLabel("npe_ok")
 	bad := f.nextLabel("npe_bad")
 	c := f.reg()
 	f.ins(fmt.Sprintf("%s = icmp eq ptr %s, null", c, p))
 	f.cbr(c, bad, ok)
 	f.label(bad)
-	f.ins("call ptr @ty_npe()")
+	a := "null"
+	if action != "" {
+		a = e.cstring(action)
+	}
+	f.ins(fmt.Sprintf("call ptr @ty_npe_msg(ptr %s, ptr %s)", a, e.cstring(string(cause))))
 	f.br(ok)
 	f.label(ok)
 }
@@ -462,6 +502,14 @@ func (e *llvmEmitter) clinitIfNeeded(f *fb, cl *ast.Class) {
 // converts implicitly, the boxes a boxed/unboxed boundary needs, and nothing at
 // all between two references, which are both pointers.
 func (e *llvmEmitter) coerce(f *fb, v lval, dst ast.Type) lval {
+	return e.coerceFrom(f, v, dst, nil)
+}
+
+// coerceFrom is coerce with the expression the value came from, for the
+// unboxing case: a conversion that unboxes raises a NullPointerException naming
+// the box, and a lowered value cannot be turned back into the expression the
+// programmer wrote.
+func (e *llvmEmitter) coerceFrom(f *fb, v lval, dst ast.Type, from ast.Expr) lval {
 	src := v.t
 	if src == nil || dst == nil || dst == ast.TVoid || ast.IsError(src) || ast.IsError(dst) {
 		return v
@@ -476,7 +524,7 @@ func (e *llvmEmitter) coerce(f *fb, v lval, dst ast.Type) lval {
 	case sIsPrim && !dIsPrim:
 		return e.boxValue(f, value(v.v, src), sp, dst)
 	case !sIsPrim && dIsPrim:
-		return e.unboxValue(f, value(v.v, src), src, dp)
+		return e.unboxValueMsg(f, value(v.v, src), src, dp, from)
 	}
 	return value(v.v, dst)
 }
@@ -505,6 +553,12 @@ func (e *llvmEmitter) boxValue(f *fb, v lval, sp *ast.PrimType, dst ast.Type) lv
 // is that call and then that conversion, which is why `double d = someInteger`
 // is 11.0 and not a look at the integer's four bytes as a double.
 func (e *llvmEmitter) unboxValue(f *fb, v lval, src ast.Type, dp *ast.PrimType) lval {
+	return e.unboxValueMsg(f, v, src, dp, nil)
+}
+
+// unboxValueMsg is unboxValue with the expression the box came from, so the
+// helpful NullPointerException can name the local that was null.
+func (e *llvmEmitter) unboxValueMsg(f *fb, v lval, src ast.Type, dp *ast.PrimType, boxX ast.Expr) lval {
 	ct, ok := src.(*ast.ClassType)
 	if !ok {
 		e.refuse(noPos, "reading a %s out of a %s: the llvm back end does not lower this conversion", dp.String(), src.String())
@@ -535,7 +589,7 @@ func (e *llvmEmitter) unboxValue(f *fb, v lval, src ast.Type, dp *ast.PrimType) 
 	e.boxUsed[kind] = true
 	// The accessor reads its own field, so a null reference throws here, where
 	// Java throws it and where ty_unbox_int used to.
-	e.nullCheck(f, v.v)
+	e.nullCheck(f, v.v, e.npeInvoke(m), e.npeCause(boxX))
 	res := e.directCall(f, m, v.v, nil)
 	if kind == dp.Kind {
 		return value(res.v, dp)
@@ -1349,7 +1403,7 @@ func (e *llvmEmitter) addr(f *fb, x ast.Expr) (string, ast.Type) {
 				return e.staticGlobal(r.Owner, r), v.GetType()
 			}
 			recv := e.expr(f, v.X)
-			return e.fieldAddr(f, r, recv.v, true), v.GetType()
+			return e.fieldAddrMsg(f, r, recv.v, true, npeField("assign", r.Name), v.X), v.GetType()
 		}
 	case *ast.Index:
 		return e.elemAddr(f, v), v.GetType()
@@ -1363,15 +1417,15 @@ func (e *llvmEmitter) addr(f *fb, x ast.Expr) (string, ast.Type) {
 func (e *llvmEmitter) elemAddr(f *fb, ix *ast.Index) string {
 	arr := e.expr(f, ix.X)
 	idx := e.coerce(f, e.expr(f, ix.Index), ast.TInt)
-	return e.elemAddrOfIndex(f, e.p.Erased(ix.GetType()), arr.v, idx.v)
+	return e.elemAddrOfIndex(f, e.p.Erased(ix.GetType()), arr.v, idx.v, ix.X, "load from ")
 }
 
 // elemAddrOfIndex is elemAddr with the array reference and the index already
 // lowered, for a caller that has to evaluate something between the index and
 // these tests -- an assignment's value, which Java evaluates before them
 // (JLS 15.26.1).
-func (e *llvmEmitter) elemAddrOfIndex(f *fb, elem ast.Type, arr, idx string) string {
-	e.nullCheck(f, arr)
+func (e *llvmEmitter) elemAddrOfIndex(f *fb, elem ast.Type, arr, idx string, arrX ast.Expr, verb string) string {
+	e.nullCheck(f, arr, verb+npeElemName(elem)+" array", e.npeCause(arrX))
 	n := f.reg()
 	f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, idx))
 	length := e.loadRaw(f, "i64", e.gepBytes(f, arr, 8), 8)
@@ -1421,7 +1475,7 @@ func (e *llvmEmitter) assign(f *fb, a *ast.Assign) lval {
 			arr := e.expr(f, ix.X)
 			idx := e.coerce(f, e.expr(f, ix.Index), ast.TInt)
 			v := e.coerce(f, e.expr(f, a.Y), a.X.GetType())
-			ptr := e.elemAddrOfIndex(f, e.p.Erased(ix.GetType()), arr.v, idx.v)
+			ptr := e.elemAddrOfIndex(f, e.p.Erased(ix.GetType()), arr.v, idx.v, ix.X, "store to ")
 			e.store(f, ptr, a.X.GetType(), v)
 			return v
 		}
@@ -1554,7 +1608,7 @@ func (e *llvmEmitter) storeRefElem(f *fb, ix *ast.Index, selem string, val ast.E
 	arr := e.expr(f, ix.X)
 	idx := e.coerce(f, e.expr(f, ix.Index), ast.TInt)
 	v := e.coerce(f, e.expr(f, val), ix.GetType())
-	e.nullCheck(f, arr.v)
+	e.nullCheck(f, arr.v, "store to "+npeElemName(ix.GetType())+" array", e.npeCause(ix.X))
 	n := f.reg()
 	f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, idx.v))
 	length := e.loadRaw(f, "i64", e.gepBytes(f, arr.v, 8), 8)
@@ -1585,14 +1639,14 @@ func (e *llvmEmitter) storeRefElem(f *fb, ix *ast.Index, selem string, val ast.E
 	f.cbr(sameCls, store, chk4)
 	f.label(chk4)
 	e.markExn("TY_ARRAYSTORE", e.p.Builtins.ArrayStore)
-	e.decl("ty_arraystore", "ptr", nil, "")
+	e.decl("ty_arraystore", "ptr", []string{"ptr"}, "")
 	inst := e.rtCall(f, "ty_instanceof", ast.TBoolean, []lval{
 		value(v.v, e.refType()), value(elemcls, e.refType())})
 	ok := f.reg()
 	f.ins(fmt.Sprintf("%s = icmp ne i32 %s, 0", ok, inst.v))
 	f.cbr(ok, store, fail)
 	f.label(fail)
-	f.ins("call ptr @ty_arraystore()")
+	f.ins(fmt.Sprintf("call ptr @ty_arraystore(ptr %s)", v.v))
 	f.br(store)
 	f.label(store)
 	e.store(f, slot, ix.GetType(), v)

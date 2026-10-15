@@ -125,7 +125,7 @@ func (e *llvmEmitter) localVar(f *fb, v *ast.LocalVar) {
 			e.store(f, slot, vd.Sym.Type, f.zero(vd.Sym.Type))
 			continue
 		}
-		e.store(f, slot, vd.Sym.Type, e.coerce(f, e.expr(f, vd.Init), vd.Sym.Type))
+		e.store(f, slot, vd.Sym.Type, e.coerceFrom(f, e.expr(f, vd.Init), vd.Sym.Type, vd.Init))
 	}
 }
 
@@ -238,14 +238,14 @@ func (e *llvmEmitter) forEach(f *fb, v *ast.ForEach) {
 		if itM == nil || hnM == nil || nxM == nil {
 			e.refuse(noPos, "a colon loop over an Iterable: this program's prelude has no iterator protocol")
 		}
-		it := e.ifaceDispatch(f, itM, e.expr(f, v.X), nil)
+		it := e.ifaceDispatch(f, itM, e.expr(f, v.X), nil, &ast.Call{Name: itM.Name, Recv: v.X, Method: itM})
 		cond := f.nextLabel("fe_cond")
 		body := f.nextLabel("fe_body")
 		upd := f.nextLabel("fe_upd")
 		end := f.nextLabel("fe_end")
 		f.br(cond)
 		f.label(cond)
-		has := e.ifaceDispatch(f, hnM, it, nil)
+		has := e.ifaceDispatch(f, hnM, it, nil, nil)
 		c := f.reg()
 		f.ins(fmt.Sprintf("%s = icmp ne i32 %s, 0", c, has.v))
 		f.cbr(c, body, end)
@@ -253,7 +253,7 @@ func (e *llvmEmitter) forEach(f *fb, v *ast.ForEach) {
 		e.safepoint(f)
 		f.pushLoop(loopFrame{cont: upd, brk: end, labels: labels})
 		if v.Var.Sym != nil {
-			raw := e.ifaceDispatch(f, nxM, it, nil)
+			raw := e.ifaceDispatch(f, nxM, it, nil, nil)
 			got := e.coerce(f, value(raw.v, nxM.Result), v.Elem)
 			e.store(f, f.localSlot(v.Var.Sym), v.Var.Sym.Type, e.coerce(f, got, v.Var.Sym.Type))
 		}
@@ -267,7 +267,7 @@ func (e *llvmEmitter) forEach(f *fb, v *ast.ForEach) {
 	}
 	elem := v.Elem
 	arr := e.expr(f, v.X)
-	e.nullCheck(f, arr.v)
+	e.nullCheck(f, arr.v, "read the array length", e.npeCause(v.X))
 	length := e.loadRaw(f, "i64", e.gepBytes(f, arr.v, 8), 8)
 	i := f.tempSlot(ast.TLong, "fei")
 	f.ins(fmt.Sprintf("store i64 0, ptr %s", i))
@@ -481,7 +481,13 @@ type switchSel struct {
 func (e *llvmEmitter) switchSelector(f *fb, s *ast.Switch, caseLabels []string) switchSel {
 	sel := e.expr(f, s.X)
 	if _, isStr := e.p.Erased(s.X.GetType()).(*ast.ClassType); isStr && e.isStringType(s.X.GetType()) {
-		e.nullCheck(f, sel.v)
+		// A String switch dispatches on the selector's hashCode, so that is
+		// what the JDK names (measured on JDK 21: a null String selector reads
+		// `Cannot invoke "String.hashCode()" because "<localN>" is null`).
+		e.nullCheck(f, sel.v, npeInvokeOf(&ast.Method{
+			Name:  "hashCode",
+			Owner: &ast.Class{Full: "java.lang.String", Name: "String"},
+		}), e.npeCause(s.X))
 		idx := f.tempSlot(ast.TInt, "swk")
 		f.ins(fmt.Sprintf("store i32 -1, ptr %s", idx))
 		for i, cs := range s.Cases {

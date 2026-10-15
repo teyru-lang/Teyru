@@ -138,6 +138,14 @@ type Emitter struct {
 	// enclosing statements' lists, because statements nest (see frameRelease).
 	frameUsed      []int
 	frameUsedStack [][]int
+	// npeSlots is the helpful NullPointerException's javac slot layout: one map
+	// per method, keyed by the variable it names, built the first time one of
+	// that method's variables is named. It is per method rather than one shared
+	// map because a method's layout is computed by walking its body, and a later
+	// method's walk would otherwise overwrite the entries the earlier one put
+	// there -- leaving a variable the emitter still asks about unnumbered. See
+	// npe.go.
+	npeSlots map[*ast.Method]map[*ast.Var]npeSlot
 }
 
 // frameRelease gives back the frame words for values in flight that the current

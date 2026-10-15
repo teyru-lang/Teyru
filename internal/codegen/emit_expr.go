@@ -62,7 +62,7 @@ func (e *Emitter) cond(x ast.Expr) string {
 		return v
 	}
 	if k, ok := e.prog.Builtins.Unbox[ct.Class]; ok && k == ast.Boolean {
-		return e.unboxCall(v, ct, ast.TBoolean)
+		return e.unboxCall(v, ct, ast.TBoolean, nil)
 	}
 	return v
 }
@@ -72,8 +72,17 @@ func (e *Emitter) refExpr(x ast.Expr) string {
 	return e.expr(x)
 }
 
-// coerce converts an emitted value from src to dst type.
+// coerce converts an emitted value from src to dst type. The `from` is the
+// expression `v` was emitted from, when the caller has it: a conversion that
+// unboxes has to raise a NullPointerException naming the box, and a rendered
+// value cannot be turned back into the expression the programmer wrote. A
+// caller with no expression to hand passes nil (see coerceFrom).
 func (e *Emitter) coerce(v string, src, dst ast.Type) string {
+	return e.coerceFrom(v, src, dst, nil)
+}
+
+// coerceFrom is coerce with the source expression, for the unboxing case.
+func (e *Emitter) coerceFrom(v string, src, dst ast.Type, from ast.Expr) string {
 	if src == nil || dst == nil || dst == ast.TVoid || ast.IsError(src) || ast.IsError(dst) {
 		return v
 	}
@@ -103,7 +112,7 @@ func (e *Emitter) coerce(v string, src, dst ast.Type) string {
 	case sp && !dp:
 		return e.boxCall(v, src.(*ast.PrimType), dst)
 	case !sp && dp:
-		return e.unboxCall(v, src, dst.(*ast.PrimType))
+		return e.unboxCall(v, src, dst.(*ast.PrimType), from)
 	case !sp && !dp:
 		if e.isRef(src) && e.isRef(dst) {
 			return "(" + e.ctype(dst) + ")" + v
@@ -230,7 +239,12 @@ func (e *Emitter) wrapperCall(m *ast.Method, args string) string {
 	return "(" + e.clinitCall(m.Owner) + e.cfunc(m) + "(" + args + "))"
 }
 
-func (e *Emitter) unboxCall(v string, src ast.Type, p *ast.PrimType) string {
+// `box` is the expression the box came from, as an AST node: the helpful
+// NullPointerException an unboxing raises names the local that was null, and `v`
+// is a rendered string by the time this runs, which cannot be turned back into
+// one. A caller that has no expression to hand passes nil and the message falls
+// back to the bare "null" this runtime has always printed.
+func (e *Emitter) unboxCall(v string, src ast.Type, p *ast.PrimType, box ast.Expr) string {
 	if ct, ok := src.(*ast.ClassType); ok {
 		kind, ok2 := e.prog.Builtins.Unbox[ct.Class]
 		if ok2 {
@@ -249,7 +263,7 @@ func (e *Emitter) unboxCall(v string, src ast.Type, p *ast.PrimType) string {
 				n := e.tmpName()
 				call := "({ " + cname(ct.Class) + "* " + n + " = (" + cname(ct.Class) + "*)" + v + "; " +
 					n + " ? " + e.cfunc(m) + "(" + n + ") : (" + e.ctype(&ast.PrimType{Kind: kind}) +
-					")(intptr_t)ty_npe(); })"
+					")(intptr_t)" + e.npeCall(e.npeInvokeSig(m), e.npeCauseOf(box)) + "; })"
 				if kind == p.Kind {
 					return call
 				}
@@ -1078,7 +1092,8 @@ func (e *Emitter) fieldRead(f *ast.Field, recv ast.Expr) string {
 	n := e.tmpName()
 	ct := cname(f.Owner)
 	return "({ " + ct + "* " + n + " = (" + ct + "*)" + e.expr(recv) + ";" +
-		" if (!" + n + ") ty_npe(); " + n + "->f_" + mangle(f.Name) + "; })"
+		" if (!" + n + ") " + e.npeCall(npeField("read", f.Name), e.npeCauseOf(recv)) + "; " +
+		n + "->f_" + mangle(f.Name) + "; })"
 }
 
 // fieldStore renders an assignable field through a receiver expression.
@@ -1089,11 +1104,17 @@ func (e *Emitter) fieldRead(f *ast.Field, recv ast.Expr) string {
 // The statement expression's value is the address of the field, so what comes
 // back is still an lvalue, which both the assignment and lvalueTemp's `&(...)`
 // need.
-func (e *Emitter) fieldStore(f *ast.Field, recv string) string {
+// fieldStore renders an assignable field through a receiver expression. The
+// receiver arrives already rendered (the caller binds it to a temp so the field
+// address is a constant), and `recvX` is the same receiver as an AST node: it
+// is what the helpful NullPointerException names, and a rendered string cannot
+// be turned back into one.
+func (e *Emitter) fieldStore(f *ast.Field, recv string, recvX ast.Expr) string {
 	n := e.tmpName()
 	ct := cname(f.Owner)
 	return "(*({ " + ct + "* " + n + " = (" + ct + "*)" + recv + ";" +
-		" if (!" + n + ") ty_npe(); &" + n + "->f_" + mangle(f.Name) + "; }))"
+		" if (!" + n + ") " + e.npeCall(npeField("assign", f.Name), e.npeCauseOf(recvX)) +
+		"; &" + n + "->f_" + mangle(f.Name) + "; }))"
 }
 
 // fieldAssign renders `recv.f = val` in Java's order: the receiver, then the
@@ -1110,7 +1131,7 @@ func (e *Emitter) fieldAssign(recv ast.Expr, f *ast.Field, t, val string) string
 	ct := cname(f.Owner)
 	return "({ " + ct + "* " + p + " = (" + ct + "*)" + e.expr(recv) + "; " +
 		t + " " + v + " = (" + t + ")(" + val + ");" +
-		" if (!" + p + ") ty_npe(); " +
+		" if (!" + p + ") " + e.npeCall(npeField("assign", f.Name), e.npeCauseOf(recv)) + "; " +
 		p + "->f_" + mangle(f.Name) + " = " + v + "; " + v + "; })"
 }
 
@@ -1138,7 +1159,8 @@ func (e *Emitter) selectExpr(v *ast.Select) string {
 		// is a struct with no len. Every array's C type is tyarr*, so the cast
 		// says the same thing whether anything was erased or not.
 		arr := e.tmpRef("(tyarr*)" + e.expr(v.X))
-		return "(" + arr + " ? " + arr + "->len : (int64_t)(intptr_t)ty_npe())"
+		return "(" + arr + " ? " + arr + "->len : (int64_t)(intptr_t)" +
+			e.npeCall("read the array length", e.npeCauseOf(v.X)) + ")"
 	}
 	if f, ok := v.Ref.(*ast.Field); ok {
 		if f.Mods.Has(ast.ModStatic) {
@@ -1158,11 +1180,15 @@ func (e *Emitter) selectExpr(v *ast.Select) string {
 // tests have to run before the element is formed, which a plain subscript
 // cannot promise: C may load the array's data pointer before it evaluates the
 // subscript, dereferencing a null array instead of throwing.
-func (e *Emitter) boundCheck(a, i, slot string) string {
+//
+// `arrX` is the array as an AST node and `elem` its element type: the helpful
+// NullPointerException says which array was being read ("load from int array")
+// and what was null, and neither is recoverable from the rendered strings.
+func (e *Emitter) boundCheck(a, i, slot string, arrX ast.Expr, elem ast.Type) string {
 	n := e.tmpName()
 	k := e.tmpName()
 	return "({ tyarr* " + n + " = (tyarr*)" + a + "; int64_t " + k + " = (int64_t)(" + i + ");" +
-		" if (!" + n + ") ty_npe();" +
+		" if (!" + n + ") " + e.npeCall("load from "+npeElemName(elem)+" array", e.npeCauseOf(arrX)) + ";" +
 		" if (" + k + " < 0 || " + k + " >= " + n + "->len) ty_aioobe(" + k + ", " + n + "->len);" +
 		" (" + slot + "*)" + n + "->data + " + k + "; })"
 }
@@ -1178,7 +1204,7 @@ func (e *Emitter) elemSlot(elem ast.Type) string {
 
 func (e *Emitter) indexExpr(v *ast.Index) string {
 	elem := v.GetType()
-	elemPtr := "(*" + e.boundCheck(e.expr(v.X), e.expr(v.Index), e.elemSlot(elem)) + ")"
+	elemPtr := "(*" + e.boundCheck(e.expr(v.X), e.expr(v.Index), e.elemSlot(elem), v.X, elem) + ")"
 	if e.isRef(elem) {
 		return "(((" + e.ctype(elem) + ")" + elemPtr + "))"
 	}
@@ -1200,7 +1226,7 @@ func (e *Emitter) cast(v *ast.Cast) string {
 	case sp && !dp:
 		return e.boxCall(inner, src.(*ast.PrimType), dst)
 	case !sp && dp:
-		return e.unboxCall(inner, src, dst.(*ast.PrimType))
+		return e.unboxCall(inner, src, dst.(*ast.PrimType), nil)
 	}
 	if ct, ok := dst.(*ast.ClassType); ok {
 		return "((" + cname(ct.Class) + "*)ty_checkcast((tyobj*)" + e.refExpr(v.X) + ", &cls_" + mangle(ct.Class.Full) + "))"
@@ -1397,7 +1423,7 @@ func (e *Emitter) unaryInner(v *ast.Unary) string {
 		// the checker types every unary operand through unboxOrPrim and
 		// promoteUnary, and the emitter has to answer in the same type.
 		if k, ok := e.boxKindOf(xt); ok {
-			return e.unboxCall(x, xt, promoteOf(k))
+			return e.unboxCall(x, xt, promoteOf(k), nil)
 		}
 		return "(" + x + ")"
 	case "-":
@@ -1406,7 +1432,7 @@ func (e *Emitter) unaryInner(v *ast.Unary) string {
 		// it wraps to itself. Integer negation goes through an unsigned value
 		// instead, where every input is defined.
 		if k, ok := e.boxKindOf(xt); ok {
-			return negate(e.unboxCall(x, xt, promoteOf(k)), promoteOf(k))
+			return negate(e.unboxCall(x, xt, promoteOf(k), nil), promoteOf(k))
 		}
 		if p, ok := xt.(*ast.PrimType); ok && p.IsIntegral() {
 			return negate(x, p)
@@ -1414,7 +1440,7 @@ func (e *Emitter) unaryInner(v *ast.Unary) string {
 		return "(-(" + x + "))"
 	case "!":
 		if _, ok := xt.(*ast.PrimType); !ok {
-			return "(!(" + e.unboxCall("("+x+")", xt, ast.TBoolean) + "))"
+			return "(!(" + e.unboxCall("("+x+")", xt, ast.TBoolean, nil) + "))"
 		}
 		return "(!(" + x + "))"
 	case "~":
@@ -1496,7 +1522,7 @@ func (e *Emitter) boxedUpdate(v *ast.Unary, k ast.PrimKind, xt ast.Type) string 
 	// The read is unboxCall's: it tests the receiver, so a null wrapper raises
 	// NullPointerException here rather than reading a field of address zero, and
 	// it promotes byte, short and char to int the way the checker types them.
-	read := e.unboxCall(ref, xt, promoted)
+	read := e.unboxCall(ref, xt, promoted, nil)
 	step := " + 1"
 	if v.Op == "--" {
 		step = " - 1"
@@ -1561,7 +1587,7 @@ func (e *Emitter) assignBoxed(v *ast.Assign, lv, read string, k ast.PrimKind) st
 	n := e.tmpName()
 	value := e.compoundOp(v, n, ot)
 	back := e.wrapperCall(e.wrapperStatic(k, "valueOf"), "("+e.ctype(own)+")("+value+")")
-	return "({ " + e.ctype(own) + " " + n + " = " + e.unboxCall(read, xt, own) + "; " +
+	return "({ " + e.ctype(own) + " " + n + " = " + e.unboxCall(read, xt, own, nil) + "; " +
 		lv + " = " + back + "; })"
 }
 
@@ -1644,11 +1670,11 @@ func (e *Emitter) lvalue(x ast.Expr) string {
 			if f.Mods.Has(ast.ModStatic) {
 				return "G_" + mangle(f.Owner.Full) + "_" + mangle(f.Name)
 			}
-			return e.fieldStore(f, e.tmpRef(e.expr(v.X)))
+			return e.fieldStore(f, e.tmpRef(e.expr(v.X)), v.X)
 		}
 		return "0"
 	case *ast.Index:
-		return "(*" + e.boundCheck(e.expr(v.X), e.expr(v.Index), e.elemSlot(v.GetType())) + ")"
+		return "(*" + e.boundCheck(e.expr(v.X), e.expr(v.Index), e.elemSlot(v.GetType()), v.X, v.GetType()) + ")"
 	}
 	return e.expr(x)
 }
@@ -1956,7 +1982,7 @@ func (e *Emitter) operand(x ast.Expr, op ast.Type) string {
 		return v
 	}
 	if _, ok := x.GetType().(*ast.PrimType); !ok {
-		return e.unboxCall(v, x.GetType(), op.(*ast.PrimType))
+		return e.unboxCall(v, x.GetType(), op.(*ast.PrimType), nil)
 	}
 	return v
 }
@@ -1972,9 +1998,9 @@ func (e *Emitter) equality(v *ast.Binary, lt, rt ast.Type) string {
 		// boxed/unboxed comparison
 		x, y := e.expr(v.X), e.expr(v.Y)
 		if lsOk {
-			y = e.unboxCall(y, rt, ls)
+			y = e.unboxCall(y, rt, ls, nil)
 		} else {
-			x = e.unboxCall(x, lt, rs)
+			x = e.unboxCall(x, lt, rs, nil)
 		}
 		return e.sequence(pair(v.X, x, v.Y, y), cmp)
 	}
@@ -2342,8 +2368,16 @@ func (e *Emitter) refElemStore(ix *ast.Index, selem, val string) string {
 	k := e.tmpName()
 	v := e.tmpName()
 	t := e.ctype(ix.GetType())
+	// The null test is written here rather than left to ty_array_store_ref
+	// because the helpful NullPointerException needs the array as the program
+	// wrote it, and the runtime helper is handed a pointer. The helper keeps
+	// its own test: a store site that did not come through here (a native
+	// helper, the reflection path) has no emitter to give it a message, and a
+	// test that only existed here would be one more way to miss it. The second
+	// test costs one compare against a value the first one has already loaded.
 	return "({ tyarr* " + n + " = (tyarr*)" + e.expr(ix.X) + "; int64_t " + k + " = (int64_t)(" +
 		e.expr(ix.Index) + "); " + t + " " + v + " = (" + t + ")(" + val + ");" +
+		" if (!" + n + ") " + e.npeCall("store to "+npeElemName(ix.GetType())+" array", e.npeCauseOf(ix.X)) + ";" +
 		" ty_array_store_ref(" + n + ", " + selem + ", " + k + ", (void*)" + v + "); " + v + "; })"
 }
 
@@ -2362,7 +2396,7 @@ func (e *Emitter) elemStore(ix *ast.Index, val string) string {
 	slot := e.elemSlot(ix.GetType())
 	return "({ tyarr* " + n + " = (tyarr*)" + e.expr(ix.X) + "; int64_t " + k + " = (int64_t)(" +
 		e.expr(ix.Index) + "); " + slot + " " + v + " = (" + slot + ")(" + val + ");" +
-		" if (!" + n + ") ty_npe();" +
+		" if (!" + n + ") " + e.npeCall("store to "+npeElemName(ix.GetType())+" array", e.npeCauseOf(ix.X)) + ";" +
 		" if (" + k + " < 0 || " + k + " >= " + n + "->len) ty_aioobe(" + k + ", " + n + "->len);" +
 		" ((" + slot + "*)" + n + "->data)[" + k + "] = " + v + "; " + v + "; })"
 }
@@ -2427,7 +2461,7 @@ func (e *Emitter) callExpr(v *ast.Call) string {
 		}
 	}
 	if _, ok := nativeTable[nativeKey(m)]; ok && e.nativeIsFinal(m) {
-		return e.nativeCall(m, recv, v.Args)
+		return e.nativeCall(m, recv, recvExp, v.Args)
 	}
 	name := e.cfunc(m)
 	a := e.argsFor(receiver(recvExp, recv), v.Args, m, v)
@@ -2494,12 +2528,13 @@ func (e *Emitter) bindCall(m *ast.Method, recvT string, recv ast.Expr, args []as
 	}
 	n := e.tmpName()
 	inner := e.callTo(e.argsFor(seqOperand{text: n}, args, m, call), e.cfunc(m)+"(", ")")
+	npe := e.npeCall(e.npeInvokeSig(m), e.npeCauseOf(recv))
 	if ret := e.ctype(m.Result); ret != "void" {
 		return "({ " + recvT + " " + n + " = (" + recvT + ")" + e.expr(recv) + "; " +
-			"((" + n + ") ? " + inner + " : (" + ret + ")((intptr_t)ty_npe())); })"
+			"((" + n + ") ? " + inner + " : (" + ret + ")((intptr_t)" + npe + ")); })"
 	}
 	return "({ " + recvT + " " + n + " = (" + recvT + ")" + e.expr(recv) + "; " +
-		"((" + n + ") ? (void)" + inner + " : (void)ty_npe()); })"
+		"((" + n + ") ? (void)" + inner + " : (void)" + npe + "); })"
 }
 
 // virtCallTemp dispatches a virtual call whose receiver may be an expression
@@ -2533,10 +2568,27 @@ func (e *Emitter) virtCall(m *ast.Method, recvT, recv string, args []ast.Expr, c
 		fn := "((" + recv + ")->obj.cls->vtable[" + fmt.Sprint(m.VIndex) + "])"
 		body = e.indirect(m, fn, recvT, recv, args, call)
 	}
+	// The receiver is a rendered temporary by now, so the helpful message's
+	// "because" half has to come from the call node: the expression the caller
+	// wrote is the thing the JDK names, not the temp it was bound to.
+	npe := e.npeCall(e.npeInvokeSig(m), e.npeCauseOf(callRecv(call, m)))
 	if ret := e.ctype(m.Result); ret != "void" {
-		return "((" + recv + ") ? (" + body + ") : (" + ret + ")((intptr_t)ty_npe()))"
+		return "((" + recv + ") ? (" + body + ") : (" + ret + ")((intptr_t)" + npe + "))"
 	}
-	return "((" + recv + ") ? (void)(" + body + ") : (void)ty_npe())"
+	return "((" + recv + ") ? (void)(" + body + ") : (void)" + npe + ")"
+}
+
+// callRecv is the expression whose null made a call throw. It is the call's own
+// receiver; an unqualified call has an implicit `this` receiver that cannot be
+// null in Teyru, so it has nothing to name.
+func callRecv(c *ast.Call, m *ast.Method) ast.Expr {
+	if c == nil {
+		return nil
+	}
+	if c.Recv != nil {
+		return c.Recv
+	}
+	return nil
 }
 
 // indirect builds a call through a runtime-resolved function pointer.
@@ -2727,7 +2779,19 @@ func (e *Emitter) newArrayDims(elem ast.Type, dims []ast.Expr) string {
 		fmt.Fprintf(&head, "int64_t %s = (int64_t)(%s); ", n, e.expr(d))
 		lens[i] = n
 	}
-	return "({ " + head.String() + e.newArrayLevel(elem, lens) + "; })"
+	// Then each written dimension is tested, outermost first, and the first
+	// negative one is the exception. The tests come before any allocation and
+	// not where the level it describes is built, because an allocation is not
+	// what tests a size: `new int[0][-1]` never builds an inner level at all
+	// (the outer one is empty) and the JDK still refuses the inner size, and
+	// `new int[-1][-1]` answers the outer one. JLS 15.10.2 says every written
+	// dimension is evaluated before any of them is tested, which is what the
+	// loop above already did; the order of the tests is this loop.
+	var tests strings.Builder
+	for _, n := range lens {
+		fmt.Fprintf(&tests, " if (%s < 0) ty_throw((tyobj *)ty_negarr(%s));", n, n)
+	}
+	return "({ " + head.String() + tests.String() + e.newArrayLevel(elem, lens) + "; })"
 }
 
 // newArrayLevel builds the expression that allocates one dimension of an array,

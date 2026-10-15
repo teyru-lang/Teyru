@@ -28,6 +28,66 @@ class Object {
 interface Cloneable {
 }
 
+/* java.lang.CharSequence, the one type here that is not a Teyru invention: it
+   is what a String, a StringBuilder and a StringBuffer are all, and Java's API
+   takes it wherever a "string-ish" argument or element type is wanted. Its
+   three abstract methods are the ones a string already has under their Java
+   names, so a class that implements it is a class with length/charAt and a
+   subSequence returning the same kind of thing.
+
+   The defaults are Java's own (JDK 11 and later): isEmpty is length() == 0,
+   and chars()/codePoints() stream the units and the code points, the same
+   IntStream a String's own do. */
+interface CharSequence {
+  int length()
+  char charAt(int index)
+  CharSequence subSequence(int start, int end)
+  default boolean isEmpty() {
+    return length() == 0
+  }
+  default IntStream chars() {
+    int n = length()
+    int[] out = new int[n]
+    for (var i = 0 : i < n : i++) {
+      out[i] = charAt(i)
+    }
+    return IntStream.of(out)
+  }
+  default IntStream codePoints() {
+    int n = length()
+    int[] out = new int[codePointCount(0, n)]
+    int k = 0
+    int i = 0
+    while (i < n) {
+      int cp = codePointAt(i)
+      out[k] = cp
+      k++
+      i += (cp >= 0x10000 ? 2 : 1)
+    }
+    return IntStream.of(out)
+  }
+  /* The two code-point walks, on the same indices String's own use. They are
+     here rather than only on String because CharSequence is what a
+     StringBuilder is too, and a builder can be asked the same questions. */
+  default int codePointAt(int index) {
+    int n = length()
+    char c = charAt(index)
+    if (index + 1 < n && Character.isHighSurrogate(c) && Character.isLowSurrogate(charAt(index + 1))) {
+      return Character.toCodePoint(c, charAt(index + 1))
+    }
+    return c
+  }
+  default int codePointCount(int index, int limit) {
+    int n = 0
+    var i = index
+    while (i < limit) {
+      i += (codePointAt(i) >= 0x10000 ? 2 : 1)
+      n++
+    }
+    return n
+  }
+}
+
 interface Comparable<T> {
   int compareTo(T o)
 }

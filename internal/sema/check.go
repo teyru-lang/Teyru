@@ -2313,12 +2313,17 @@ func (ctx *methodCtx) checkCond2(v *ast.Cond, want ast.Type) {
 func (ctx *methodCtx) checkNewArray(v *ast.NewArray) {
 	c := ctx.c
 	elem := c.resolveType(ctx.env, v.Elem)
+	// A negative dimension is a run-time exception, not a compile error:
+	// javac compiles `new int[-1]` and the array creation throws
+	// NegativeArraySizeException (JLS 15.10.2, and t281 is the JDK's own
+	// output). The check that used to sit here rejected the program outright,
+	// which refused a program Java compiles -- and a size that is computed
+	// rather than written could not be written at all. The runtime's
+	// ty_alloc_arr raises it, with the length in the message, so the constant
+	// case and the computed case take one path.
 	for i, d := range v.Dims {
 		ctx.checkExpr(d, ast.TInt)
 		ctx.convertTo(d, ast.TInt)
-		if cv := c.constEval(d); cv.ok && cv.i < 0 {
-			ctx.errf(d.GetPos(), "TY-TYP-0067", "array dimension must be non-negative")
-		}
 		_ = i
 	}
 	levels := len(v.Dims) + v.Extra

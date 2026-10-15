@@ -328,7 +328,7 @@ void ty_arraycopy(void *src, int32_t spos, void *dst, int32_t dpos, int32_t len)
       snprintf(msg, sizeof msg, "arraycopy: type mismatch: can not copy %s into %s", src, dst);
       ty_throw(ty_make_ex(TY_ARRAYSTORE, msg));
     }
-    ty_throw((tyobj *)ty_arraystore());
+    ty_throw((tyobj *)ty_arraystore(NULL));
   }
   memmove((char *)b->data + (size_t)dpos * b->esize, (char *)a->data + (size_t)spos * a->esize,
           (size_t)len * a->esize);

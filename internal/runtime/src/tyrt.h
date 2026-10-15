@@ -267,12 +267,13 @@ extern tyclass *TY_CNF, *TY_NSFE, *TY_NSME, *TY_ILLACCESS, *TY_INVOCATION,
     *TY_INSTANTIATION;
 
 void *ty_npe(void);
+void *ty_npe_msg(const char *action, const char *cause);
 void *ty_aioobe(int64_t idx, int64_t len);
 void *ty_sioobe(int64_t idx, int64_t len);
 void *ty_arith(const char *msg);
 void *ty_cce(tyclass *from, tyclass *to);
-void *ty_negarr(void);
-void *ty_arraystore(void);
+void *ty_negarr(int64_t len);
+void *ty_arraystore(void *v);
 void *ty_assertfail(const char *msg);
 
 /* ---- the stack limit --------------------------------------------------
@@ -897,7 +898,7 @@ static inline void ty_array_store_ref(tyarr *a, tyclass *selem, int64_t i, void 
   if (i < 0 || i >= a->len) ty_aioobe(i, a->len);
   if (a->elemcls != selem && a->elemcls && v &&
       ((tyobj *)v)->cls != a->elemcls && !ty_instanceof(v, a->elemcls)) {
-    ty_arraystore();
+    ty_arraystore(v);
   }
   ((void **)a->data)[i] = v;
 }

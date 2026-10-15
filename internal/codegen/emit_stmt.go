@@ -518,7 +518,7 @@ func (e *Emitter) localVar(v *ast.LocalVar) {
 				continue
 			}
 			e.hoistPatterns(vd.Init)
-			e.line("%s volatile %s = %s;\n", ct, name, e.coerce(e.expr(vd.Init), vd.Init.GetType(), vd.Sym.Type))
+			e.line("%s volatile %s = %s;\n", ct, name, e.coerceFrom(e.expr(vd.Init), vd.Init.GetType(), vd.Sym.Type, vd.Init))
 			e.clearPatterns()
 			continue
 		}
