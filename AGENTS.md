@@ -786,7 +786,12 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   的建置會讀到另一棵吐出的 prelude。這不是假想的狀態：這個倉庫的常態就是每個工作項一個 worktree，而實測
   兩棵這樣的樹在補上之前**共用同一個 entry**（`101d2b09…`），補上之後是兩個（`internal/cache/cache_test.go`
   的 `TestTwoDirtyCompilersOfOneCommitAreDifferentCompilers` 與 `TestBuildNamesTheRunningCompiler`，兩個在
-  沒有那一根時都是紅的）。代價是**任何**改動編譯器原始碼的編輯都會讓 prelude 冷一次——包括改一個註解、
+  沒有那一根時都是紅的）。**而在這台機器上，實測比「兩棵髒樹」更糟**：`go version -m` 對這裡建出來的二進位
+  檔**一個 `vcs.*` 設定都沒有**（三棵樹、含 `-trimpath` 與 `-buildvcs=true` 都試過），所以 `cache.Build` 的
+  revision 那一段是空的，Compiler 欄位就是 `0.4.1 go1.26.5-X:nodwarf5 linux amd64`——**每一棵樹的每一個
+  建置都是同一個**。同一台機器上稍早建的那支 `teyru` **有** `vcs.revision=d7fde38`，所以蓋章不是永遠不會
+  發生；一個要靠它才正確的 key 就是一個會安靜地錯的 key，而現在補的這一根不依賴 buildinfo。代價是**任何**
+  改動編譯器原始碼的編輯都會讓 prelude 冷一次——包括改一個註解、
   或改測試檔（`go test` 的測試二進位檔就是那個「執行檔」）——所以這是保守的一根，而保守的方向是「多編一次」
   而不是「讀到別人的產物」。寫入是 `CreateTemp` ＋ `rename`，讀者只會
   看到完整檔，`Has()` 把 0 位元組當未命中；標頭、原始碼、物件共用一個 entry，不會混用不同建置的產物；
