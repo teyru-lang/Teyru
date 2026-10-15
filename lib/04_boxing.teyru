@@ -258,11 +258,22 @@ final class Integer extends Number implements Comparable<Integer> {
   public static final int SIZE = 32
   public static final int BYTES = 4
 
-  /* The value is the wrapper's whole state, and `valueOf` is the only thing
-     that fills it: no constructor is declared, so `new Integer()` and
-     `Class.newInstance()` build the same zero-valued wrapper they built when
-     the runtime owned the payload, and `valueOf` is the one factory. */
+  /* The value is the wrapper's whole state. The no-argument constructor is
+     still what `Class.newInstance()` and `Integer[]` allocation reach, so it
+     stays, and it is what the cache is filled with; `valueOf` is the one
+     factory an autoboxing site reaches. */
   private int value
+
+  /* Java's deprecated `Integer(int)`, which is still part of its API in JDK 21
+     and is the API a program translated from Java expects. It is a *fresh* box:
+     the cache answers `valueOf` and autoboxing, never the constructor, so
+     `new Integer(127) == Integer.valueOf(127)` is false even for a value the
+     cache holds. The JDK says the same in its own comment on the constructor
+     ("to be removed in a future release"), and the identity is the observable
+     part -- two boxes for one value is exactly what this has to reproduce. */
+  public Integer(int v) {
+    this.value = v
+  }
 
   public static int parseInt(String s) {
     return parseInt(s, 10)
@@ -297,9 +308,7 @@ final class Integer extends Number implements Comparable<Integer> {
   private static Integer[] fillCache() {
     Integer[] c = new Integer[256]
     for (int i = 0 : i < 256 : i++) {
-      Integer b = new Integer()
-      b.value = i - 128
-      c[i] = b
+      c[i] = new Integer(i - 128)
     }
     return c
   }
@@ -309,9 +318,7 @@ final class Integer extends Number implements Comparable<Integer> {
     if (v >= -128 && v <= 127) {
       return CACHE[v + 128]
     }
-    Integer b = new Integer()
-    b.value = v
-    return b
+    return new Integer(v)
   }
   public static Integer valueOf(String s) {
     return valueOf(parseInt(s))
@@ -1039,21 +1046,28 @@ final class Boolean extends Object implements Comparable<Boolean> {
      initializing. The version this replaces called valueOf(true) twice, and
      valueOf allocated a fresh box every time, so TRUE and FALSE were two
      objects nobody else ever got -- `Boolean a = true; Boolean b = true; a == b`
-     was false where Java's is true. The JDK writes the same two `new
-     Boolean(...)` constants for the same reason. */
+     was false where Java's is true. What the factory builds is one
+     `new Boolean(v)` each, which is what the JDK writes for the same two
+     constants. */
   private static Boolean make(boolean v) {
-    Boolean b = new Boolean()
-    b.value = v
-    return b
+    return new Boolean(v)
   }
   public static final Boolean TRUE = make(true)
   public static final Boolean FALSE = make(false)
 
-  /* The value is the wrapper's whole state, and `valueOf` is the only thing
-     that fills it: no constructor is declared, so `new Boolean()` and
-     `Class.newInstance()` build the same zero-valued wrapper they built when
-     the runtime owned the payload, and `valueOf` is the one factory. */
+  /* The value is the wrapper's whole state. The no-argument constructor is
+     still what `Class.newInstance()` and `Boolean[]` allocation reach, so it
+     stays; `valueOf` answers the two constants, never a fresh box. */
   private boolean value
+
+  /* Java's deprecated `Boolean(boolean)`, deprecated and marked for removal in
+     JDK 21 and still the API a program translated from Java expects. Like
+     `Integer(int)` it always makes a fresh box, so it is never identical to
+     TRUE or FALSE -- which is the observable difference from valueOf, and the
+     reason the constructor exists next to the constants. */
+  public Boolean(boolean v) {
+    this.value = v
+  }
 
   /* Java's parser is case-insensitive: only "true" in any case is true, and a
      null is false. */

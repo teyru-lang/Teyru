@@ -770,7 +770,7 @@ void *ty_class_newinst(int64_t cm) {
 void *ty_reflect_array_new(int64_t component, int32_t len) {
   tyclass *k = T(component);
   if (!k) ty_throw(builtin_ex(TY_NPE, "component type is null"));
-  if (len < 0) ty_throw(ty_negarr());
+  if (len < 0) ty_throw(ty_negarr(len));
   int64_t es = k->prim ? prim_size(k->prim) : (int64_t)sizeof(void *);
   tyarr *a = ty_array_new(len, es);
   a->refs = k->prim ? 0 : 1;

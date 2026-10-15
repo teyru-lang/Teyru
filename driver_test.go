@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -514,8 +515,61 @@ func TestNoJava(t *testing.T) {
 			t.Errorf("generated C mentions %q", bad)
 		}
 	}
-	if strings.Contains(data, ".class") {
+	// A class file is a path, and a path is what the product contract is about:
+	// the emitted C must not open a .class file, because nothing in this compiler
+	// reads or writes one. So the test looks for the extension the way a path
+	// spells it -- inside a quoted string, at the end of a name -- and not for the
+	// six characters anywhere in the text. The broader test is a false positive
+	// on `Annotation.classValue(String)`, which the helpful NullPointerException
+	// names in its message, and "the emitted source mentions a method whose name
+	// contains the word class" is not the product contract (AGENTS.md §0).
+	// TestClassFileRefShape is the check's own test: a pattern that stopped
+	// matching a real reference would make this quietly vacuous.
+	if classFileRef.MatchString(data) {
 		t.Error("generated C references class files")
+	}
+}
+
+// classFileRef matches a .class file as a path spells one: inside a quoted
+// string, at the end of a path element. Requiring the quotes is what keeps it
+// off a Java class literal, which the emitter renders bare (`int.class` becomes
+// `(tyobj*)&cls_int`), and requiring the name character before the extension is
+// what keeps it off an identifier that merely ends in "class".
+var classFileRef = regexp.MustCompile(`["'][^"']*[A-Za-z0-9_$-]\.class["']`)
+
+// TestClassFileRefShape is TestNoJava's pattern's own test. The pattern is
+// narrow on purpose -- the broad one tripped over a method name -- and a narrow
+// pattern that stopped matching anything would leave TestNoJava quietly
+// vacuous, which is the failure mode a regex test cannot report about itself.
+// So the shapes that must match and the shapes that must not are written down
+// here, and each one says why it is on its side of the line.
+func TestClassFileRefShape(t *testing.T) {
+	must := []string{
+		`fopen("Foo.class", "rb");`,
+		`const char *p = "lib/Foo.class";`,
+		`x = load("/a/b/Foo.class");`,
+		`"Mypkg$1.class"`,
+		`"a.class"`,
+	}
+	for _, s := range must {
+		if !classFileRef.MatchString(s) {
+			t.Errorf("a class file reference was not matched: %q", s)
+		}
+	}
+	mustNot := []string{
+		// the shape that broke the broad pattern: a method named classValue
+		`ty_npe_msg("invoke \"teyru.Annotation.classValue(String)\"", "\"<local6>\"");`,
+		`M_Annotation_classValue_0(teyru_Annotation*, tystr*);`,
+		// a Java class literal, which is a class, not a file
+		`int.class;`,
+		`cls_teyru_String.class;`,
+		`"myclass.name"`,
+		`"a.classValue"`,
+	}
+	for _, s := range mustNot {
+		if classFileRef.MatchString(s) {
+			t.Errorf("matched something that is not a class file: %q", s)
+		}
 	}
 }
 

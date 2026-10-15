@@ -16,7 +16,7 @@ package teyru
    they are as a code point. The constructors that take bytes decode them the
    way the JDK's UTF-8 decoder does, replacing anything ill-formed with U+FFFD,
    and getBytes encodes the way its UTF-8 encoder does. */
-class String extends Object implements Comparable<String> {
+class String extends Object implements Comparable<String>, CharSequence {
   public native String(String original)
   public native String(byte[] bytes)
   public native String(byte[] bytes, int offset, int length)
@@ -101,9 +101,9 @@ class String extends Object implements Comparable<String> {
     return Pattern.compile(re).split(this, limit)
   }
 
-  /* subSequence is Java's view of the string as a CharSequence. Teyru has no
-     CharSequence interface, so the return is spelled String -- which is what
-     Java's own subSequence answers too. */
+  /* subSequence is Java's view of the string as a CharSequence, and the return
+     is spelled String -- which is what Java's own subSequence answers, because a
+     CharSequence a String hands back is a String narrowed to the range. */
   public String subSequence(int from, int to) {
     return substring(from, to)
   }

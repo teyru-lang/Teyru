@@ -618,7 +618,11 @@ var nativeTable = map[string]nativeFn{
 }
 
 // nativeCall renders a call to a prelude native method.
-func (e *Emitter) nativeCall(m *ast.Method, recv string, args []ast.Expr) string {
+// `recvX` is the receiver as an AST node, for the same reason it is everywhere
+// else: the helpful NullPointerException names the expression the caller wrote,
+// and `recv` is a rendered string by now. A native method reads its receiver
+// without a test of its own, so the test is written here.
+func (e *Emitter) nativeCall(m *ast.Method, recv string, recvX ast.Expr, args []ast.Expr) string {
 	nf, ok := nativeTable[nativeKey(m)]
 	if !ok {
 		// A native method with no binding is this compiler's bug rather than
@@ -635,7 +639,38 @@ func (e *Emitter) nativeCall(m *ast.Method, recv string, args []ast.Expr) string
 		}
 		vals = append(vals, seqOperand{x: a, text: e.coerce(e.expr(a), a.GetType(), want)})
 	}
-	return e.nativeInlineCall(nf, m, seqOperand{text: recv}, vals)
+	if m.IsStatic() || recvX == nil {
+		return e.nativeInlineCall(nf, m, seqOperand{text: recv}, vals)
+	}
+	// The same shape the other call paths use: the receiver is tested, and a
+	// null one throws the NullPointerException Java throws -- with the message
+	// the JDK writes for this call.
+	npe := e.npeCall(e.npeInvokeSig(m), e.npeCauseOf(recvX))
+	rt := e.ctype(m.Result)
+	// The receiver is tested before the call, not through its result: a native
+	// helper's return value says nothing about whether the object was there
+	// (`String.length()` answers 0 for a null tystr* just as it does for ""), and
+	// Java reads the receiver before the callee does, so `obj.m()` on a null obj
+	// throws without having called anything.
+	//
+	// The receiver is bound to a temporary first and *both* the test and the call
+	// read that temporary. `recv` is an expression the caller has already
+	// rendered, and it can be a statement expression with effects of its own --
+	// `sb.append(x)` inside a builder chain is one. Writing it a second time for
+	// the test ran those effects twice, which is how `hex("nul_text", "a\0b")`
+	// printed its label twice (t196_string_bytes). Binding it once is also what
+	// JLS 15.12.4 requires: a receiver is evaluated once, before the arguments.
+	rn := e.tmpName()
+	vn := e.tmpName()
+	// The helper is rendered with the temporary rather than the expression, so
+	// the two readings above are one evaluation in the emitted C.
+	inner := e.nativeInlineCall(nf, m, seqOperand{text: rn}, vals)
+	if rt == "void" {
+		return "({ void* " + rn + " = (void*)(" + recv + "); " +
+			"if (!" + rn + ") " + npe + "; (void)(" + inner + "); })"
+	}
+	return "({ void* " + rn + " = (void*)(" + recv + "); " + rt + " " + vn + "; " +
+		"if (!" + rn + ") " + npe + "; " + vn + " = (" + rt + ")(" + inner + "); " + vn + "; })"
 }
 
 // nativeInlineCall renders the call to a bound helper: the receiver, then the

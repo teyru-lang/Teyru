@@ -50,8 +50,8 @@ func TestRuntimeProtos(t *testing.T) {
 		{"ty_make_ex", "ptr", []string{"ptr", "ptr"}},
 		{"ty_illegal_state", "ptr", []string{"ptr"}},
 		{"ty_assertfail", "ptr", []string{"ptr"}},
-		{"ty_arraystore", "ptr", nil},
-		{"ty_negarr", "ptr", nil},
+		{"ty_arraystore", "ptr", []string{"ptr"}},
+		{"ty_negarr", "ptr", []string{"i64"}},
 		{"ty_arith", "ptr", []string{"ptr"}},
 	}
 	for _, c := range cases {

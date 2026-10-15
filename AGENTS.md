@@ -742,8 +742,7 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   大小寫映射是 **locale-insensitive** 的（Java 的 `Locale.ROOT`）：土耳其／亞塞拜然／立陶宛
   的條件映射（`tr`／`az`／`lt`）沒有實作，因為沒有 locale。`StringBuilder` 沒有
   `codePointAt`／`codePointCount`（Java 的 AbstractStringBuilder 有），`capacity()` 的預設值
-  也不同（這裡 32 個 unit、Java 16 個字元）；`new Integer(int)` 與 `new Boolean(boolean)` 仍
-  沒有宣告（那是 boxing 那一項）。正則引擎逐 code unit 比對，所以
+  也不同（這裡 32 個 unit、Java 16 個字元）；正則引擎逐 code unit 比對，所以
   `"😀a".matches(".a")` 這裡是 false 而 JDK 是 true（Java 的 `.` 吃一個 code point），
   但 `Matcher` 報的位移已經是 unit 索引；`offsetByCodePoints` 越界時丟的是
   `StringIndexOutOfBoundsException`，JDK 丟父類別 `IndexOutOfBoundsException`（執行期沒有
@@ -752,7 +751,7 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   測試：`t250_string_utf16_builders`（`t249` 已被 W8 的 t249_probe_boxed_compound_shapes 用掉）
   與 `t251_unicode_tables`、`t252_character_api`（期望輸出由
   OpenJDK 21.0.11+10 跑 `.java.ref` 產生）。
-- **標準庫的快取與兩單元建置（W13 第 1、2 項已落地；第 3 項未做，見本條最後）**：一次建置原本把
+- **標準庫的快取與兩單元建置（W13 的第 1 項已落地；第 2、3 項未做，見本條最後）**：一次建置原本把
   標準庫與程式放進**同一個編譯單元**、整份一起最佳化。實測（本機 linux/amd64、AMD Ryzen 7 5700X 16 核、
   clang 22.1.8）hello 產生的 C 是 6,232,818 位元組，其中程式本身只有 1,530 位元組——也就是說每一次建置
   都在重編同一個標準庫，而 `-flto` 是那個把整份看進去的步驟：附錄 A.1 的 `web.teyru` 在本機 `-O2`
@@ -903,13 +902,17 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   `frame_map_ok` 先驗證字陣列落在該執行緒的堆疊範圍內，不成立就**不採信那筆記錄**（它的字
   照樣被保守掃描，所以不會少 root）。
 
-- **LLVM 後端不帶框架地圖（指名拒絕，TY-INT-0100）**：地圖是預設之後，LLVM 後端是唯一會產生
-  「收集器以為 roots 精確、後端卻從未說哪些字是參考」的程式的地方——它產自己的 IR，參考可能住在
-  SSA 暫存器或它自己選的 alloca 裡，失敗模式是幾天後才出現的 use-after-free。所以 `EmitLLVM`
-  在**預設**下**指名拒絕**（沿用既有的 TY-INT-0100 具名拒絕），訊息裡寫出開關：
-  `set TEYRU_NO_FRAME_MAPS=1 to build this program with the conservative collector instead`。
-  關掉地圖之後 LLVM 後端照常編譯與執行（實測 hello：拒絕訊息／`TEYRU_NO_FRAME_MAPS=1` 建置並
-  執行皆正確）。要真正支援只有兩條路：在 IR 裡把參考放進 alloca 並在每個安全點之前把 live 的
+- **LLVM 後端不帶框架地圖，於是跑保守的收集器（`llvm.go` 的 `EmitLLVM`，先前的指名拒絕已移除）**：
+  地圖是預設之後，LLVM 後端是唯一會產生「收集器以為 roots 精確、後端卻從未說哪些字是參考」
+  的程式的地方——它產自己的 IR，參考可能住在 SSA 暫存器或它自己選的 alloca 裡，失敗模式是
+  幾天後才出現的 use-after-free。**處理方式不是拒絕，而是讓這個後端建出來的程式用保守的
+  收集器**（`tyrt.h` 的 `ty_frame_map_ok` 對沒有地圖的框架回 false，於是那些字被保守掃描），
+  代價是**多留而不是少留**：`t245_dropped_reference` 在這個後端是 8、在 C 後端是 0，而
+  `scripts/backend-matrix-allow.txt` 就是為這一格存在的。先前這裡是**指名拒絕**
+  （`TY-INT-0100`），理由是「沒有地圖的後端會拿到它從未描述過的精確 roots」——**那個看法是
+  錯的**，而且拒絕每一支程式讓矩陣的一半無法測試。`internal/codegen/llvm.go` 的檔頭把這件事
+  （含那句自我更正）寫下來了；`AGENTS.md` 這一段先前仍寫著「預設指名拒絕」，是落後的敘述。
+  要讓這個後端也精確，只有兩條路：在 IR 裡把參考放進 alloca 並在每個安全點之前把 live 的
   SSA 值寫進去（本後端目前沒有 liveness 分析），或在該後端實作 stackmap。
   **尚未完成、要讀的人知道的事**：(1) 阻塞的包裝還不是安全點——`recv` 沒有被
   `ty_thread_stopped_begin/end` 包住（`tyrt_plat_posix.c` 的 `typlat_socket_recv` 是裸的
@@ -921,6 +924,52 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   產生器在每個安全點更新框架記錄裡的那個 id），以及**寫入屏障**（移動需要知道誰指向誰，現在的
   收集器完全沒有屏障的概念）。兩者都不是這個改動的一部分，而這個改動把它們需要的前置條件
   ——精確的、每個字都可指名的 root 集合——擺好了。
+
+- **JDK 21 的三條訊息與兩個裝箱建構子（已補，W6.4 與 W7 一起）**：`tests/programs/t281`
+  到 `t284` 是**先以紅測試的形式進來**的（`teyru-lang/tests` 的 `ab31460`），編譯器那一半
+  從來沒有寫過。測試的自查機制（`driver_test.go`）把「已列為 known failure 卻通過」當成
+  失敗，所以條目必須跟著刪。**四個探針的 `.expected` 全部由本機的 JDK
+  21.0.11+10 產出並在合入前重跑過**，不是手寫的。
+  - **負陣列長度從編譯錯誤變成執行期例外**。`sema/check.go` 的 `TY-TYP-0067` 刪了（那是
+    javac 不會擋的寫法）；執行期的 `ty_negarr` 現在**收長度**並把它放進訊息（`-1`），
+    呼叫端多了一個參數（`ty_alloc_arr`／`ty_sb_init`／`ty_reflect_array_new`）。順序照
+    JLS 15.10.2：每個寫出來的維度先由左至右求值，**再**由外而內逐一檢查——所以
+    `new int[0][-1]` 仍然拒絕內層的 -1（外層是空的，JDK 也拒絕），而 `new int[-1][-1]`
+    報外層那一個。**兩個後端都改了**（`emit_expr.go` 的 `newArrayDims` 與
+    `llvm_call.go` 的同名前段），因為 C 後端原本只測它所配置的那一層。
+  - **`ClassCastException` 帶上模組與載入器**。模組的判定是「名字以 `java.` 開頭」——
+    **這不是一條關於 java.lang 的規則**：實測 JDK 21，`java.lang.Integer`、
+    `java.lang.Comparable`、`java.lang.Runnable`、`java.lang.Thread`、
+    `java.lang.StringBuilder` 全部印全名，**只有 `java.lang.Object` 與
+    `java.lang.String` 印簡名**，而那是 JDK 自己的文字唯一對類名做的事。兩個在同一模組時
+    併成一個子句（`A and B are in ...`），不同則用分號。
+  - **`ArrayStoreException` 的訊息是放不進去的那個值的類別**（不是一句關於陣列的話），
+    所以 `ty_arraystore` 從無參數變成收那個值；參考元素陣列的 store 檢查本來就在
+    `tyrt.h` 的 `static inline` 裡，現在**產生器另外寫一次** null 測試（多一次已經載入過
+    的值比較），因為執行期拿得到指標、拿不到「程式寫的那個運算式」。
+  - **helpful `NullPointerException`（JEP 358）**。執行期新增 `ty_npe_msg(action, cause)`，
+    兩個半句都是編譯期常數，執行期只負責組句子。**因果那一半是 javac 的 bytecode slot**，
+    規則是量出來的而不是推出來的（`internal/codegen/npe.go` 的檔頭記著怎麼量的）：
+    靜態方法從 0 算參數、實例方法從 1（slot 0 是接收者），`long`／`double` 佔**兩格**
+    （實測 `static void f(long a, long b)` 的 b 在 slot 2），**離開宣告它的區塊就回收那格**
+    ——所以 JDK 自己的輸出裡一連串兄弟 try 區塊的區域變數**都是 `<local1>`**。
+    參數印成 `<parameterN>` 從 **1** 算起（slot 是 0），這兩件事不一致，是量出來的。
+    **版面是每個 method 一份地快取**（`npeSlots` 依 method 分層），因為一個 method 的版面
+    靠走它的本體算出來，共用一張 map 會讓後來的 method 蓋掉早先的那一份。
+  - **兩個裝箱建構子**：`new Integer(int)` 與 `new Boolean(boolean)` 是 JDK 21 仍然保留的
+    API（deprecated for removal），**而且永遠是新的箱子**——快取回答的是 `valueOf` 與自動
+    裝箱，不是建構子，所以 `new Integer(127) == Integer.valueOf(127)` 是 `false`，
+    連快取範圍內的值也是。`lib/04_boxing.teyru` 的 `fillCache`／`valueOf`／`Boolean.make`
+    順便改成呼叫新宣告的建構子（那正是 JDK 自己寫那两个常數的方式）。
+  - **`CharSequence` 補上了**（`lib/01_core.teyru`，`String` 宣告 `implements` 它）。它以前
+    不存在，`t282` 裡的 `new CharSequence[2]` 是編譯期就被擋下來的。
+  - **兩個 `.experr` 跟著 JDK 的文字改了**（`t80`／`t87` 的未捕捉 NPE）。舊的檔案記的是
+    執行期**以前印的**訊息，不是 Java 印的訊息；兩者都在 JDK 21.0.11+10 上跑過確認。
+  - **兩個後端的六格矩陣全綠**：`sh scripts/backend-matrix.sh` 的
+    `{C+clang, C+gcc, LLVM} × {-O0, -O2}` 四支探針 0 分歧、全部符合 `.expected`。
+  - **一個已知的取捨**：`ty_array_store_ref` 保留了自己的 null 測試（產生器那一次是額外的），
+    所以一個沒有走產生器路徑的 store（原生輔助、反射路徑）仍會被它擋住——只是訊息退回
+    舊的那句。反過來說，少寫一次就多一條可能漏掉的路徑。
 
 ## 11. 送出前檢查清單
 

@@ -106,7 +106,7 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 			e.refuse(c.GetPos(), "Iface.super.%s(): the llvm back end does not lower a call to a specific interface's default (it dispatches through the receiver, which would reach an override)", m.Name)
 		}
 		if c.Recv == nil {
-			return e.ifaceDispatch(f, m, value(e.selfOperand(f), e.refType()), e.callArgs(f, m, c, c.Args))
+			return e.ifaceDispatch(f, m, value(e.selfOperand(f), e.refType()), e.callArgs(f, m, c, c.Args), c)
 		}
 		// The receiver was evaluated above, before the arguments, which is the
 		// order Java evaluates them in. Evaluating c.Recv again here would run
@@ -115,7 +115,7 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 		// key iterator is written -- that call would happen twice and the first
 		// result be thrown away, so a walk over a collection would see every
 		// other element.
-		return e.ifaceDispatch(f, m, value(recv, c.Recv.GetType()), e.callArgs(f, m, c, c.Args))
+		return e.ifaceDispatch(f, m, value(recv, c.Recv.GetType()), e.callArgs(f, m, c, c.Args), c)
 	}
 	// A native method that is not overridable is the runtime helper itself; one
 	// that is goes through the receiver's vtable, because the override is what
@@ -141,16 +141,16 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 			// applied at this back end's call sites.
 			return e.directCall(f, m, recv, args)
 		}
-		return e.virtualCall(f, m, value(recv, e.refType()), args)
+		return e.virtualCall(f, m, value(recv, e.refType()), args, c)
 	case c.Recv != nil && m.VIndex >= 0 && !m.Mods.Has(ast.ModPrivate):
 		if directBind(m) {
 			// The test the vtable lookup would have made: the callee reads its
 			// own fields, so a null receiver has to raise NullPointerException
 			// here rather than dereference it.
-			e.nullCheck(f, recv)
+			e.nullCheck(f, recv, e.npeInvoke(m), e.npeCause(c.Recv))
 			return e.directCall(f, m, recv, args)
 		}
-		return e.virtualCall(f, m, value(recv, c.Recv.GetType()), args)
+		return e.virtualCall(f, m, value(recv, c.Recv.GetType()), args, c)
 	}
 	return e.directCall(f, m, recv, args)
 }
@@ -192,7 +192,7 @@ func (e *llvmEmitter) ifaceMethodFor(cl *ast.Class, name string, arity int) *ast
 
 // ifaceDispatch calls an interface method: the receiver's dynamic class decides
 // which implementation runs, and that class's interface map is what says which.
-func (e *llvmEmitter) ifaceDispatch(f *fb, im *ast.Method, recv lval, args []lval) lval {
+func (e *llvmEmitter) ifaceDispatch(f *fb, im *ast.Method, recv lval, args []lval, c *ast.Call) lval {
 	// The checker's selector is the one to use: it is what the interface map of
 	// every class that answers the interface was built from. The lookup by name
 	// is only a fallback for a method object that arrived without one, and it
@@ -216,7 +216,7 @@ func (e *llvmEmitter) ifaceDispatch(f *fb, im *ast.Method, recv lval, args []lva
 		}
 		vals = append(vals, argOperand(want, e.convertTo(f, a, want)))
 	}
-	e.nullCheck(f, recv.v)
+	e.nullCheck(f, recv.v, e.npeInvoke(im), callRecvCause(c))
 	fn := e.itabLookup(f, recv.v, sel)
 	if ret == "void" {
 		f.ins(fmt.Sprintf("call void %s(%s)", fn, strings.Join(vals, ", ")))
@@ -319,7 +319,7 @@ func (e *llvmEmitter) arrayMethod(f *fb, c *ast.Call) lval {
 		e.refuse(c.GetPos(), "the call %s: the llvm back end does not resolve it", c.Name)
 	}
 	recv := e.expr(f, c.Recv)
-	e.nullCheck(f, recv.v)
+	e.nullCheck(f, recv.v, arrayMethodAction(c), e.npeCause(c.Recv))
 	switch c.Name {
 	case "clone":
 		cl := e.useArray()
@@ -403,7 +403,7 @@ func (e *llvmEmitter) externalCall(f *fb, m *ast.Method, recv string, args []lva
 // virtualCall dispatches through the receiver's vtable. The slot index is the
 // one the C back end uses, and the slot is recorded so that every class that
 // can be the receiver answers it.
-func (e *llvmEmitter) virtualCall(f *fb, m *ast.Method, recv lval, args []lval) lval {
+func (e *llvmEmitter) virtualCall(f *fb, m *ast.Method, recv lval, args []lval, c *ast.Call) lval {
 	if m.Owner == nil || m.Owner.IsInterface() {
 		e.refuse(noPos, "the interface method %s: the llvm back end does not lower interface dispatch", m.Name)
 	}
@@ -423,7 +423,7 @@ func (e *llvmEmitter) virtualCall(f *fb, m *ast.Method, recv lval, args []lval) 
 		vals = append(vals, argOperand(want, e.convertTo(f, a, want)))
 	}
 	e.rtCtx = saved
-	e.nullCheck(f, recv.v)
+	e.nullCheck(f, recv.v, e.npeInvoke(m), callRecvCause(c))
 	cls := e.loadRaw(f, "ptr", recv.v, 8)
 	vtp := f.reg()
 	f.ins(fmt.Sprintf("%s = getelementptr inbounds %%tyclass, ptr %s, i32 0, i32 %d", vtp, cls, e.tyclassIdx["vtable"]))
@@ -508,6 +508,14 @@ func (e *llvmEmitter) packVarargs(f *fb, parts []lval, m *ast.Method) []lval {
 // and the stream-aware twins are the C back end's tables; what is done here is
 // the same call with the types the helper's own prototype declares.
 func (e *llvmEmitter) nativeCall(f *fb, m *ast.Method, nf nativeFn, recv string, c *ast.Call) lval {
+	// A bound helper reads its receiver without a test of its own, so the
+	// NullPointerException is raised here. It comes before the call because the
+	// helper's return value says nothing about whether the object was there --
+	// String.length() answers 0 for a null tystr* just as it does for "" -- and
+	// because Java reads the receiver before the callee does.
+	if !m.IsStatic() && recv != "" && recv != "null" {
+		e.nullCheck(f, recv, e.npeInvoke(m), callRecvCause(c))
+	}
 	return e.nativeInvoke(f, m, nf, recv, e.callArgs(f, m, c, c.Args), c.GetPos())
 }
 
@@ -763,6 +771,25 @@ func (e *llvmEmitter) newArrayDims(f *fb, elem ast.Type, dims []ast.Expr, result
 		n := f.reg()
 		f.ins(fmt.Sprintf("%s = sext i32 %s to i64", n, dim.v))
 		lens[i] = n
+	}
+	// Then each written dimension is tested, outermost first, and the first
+	// negative one is the exception -- the same order and the same reason as
+	// the C back end's newArrayDims. Testing where a level is allocated misses
+	// a dimension nothing is allocated for: `new int[0][-1]` never builds an
+	// inner level and the JDK still refuses the inner size.
+	for _, n := range lens {
+		e.markExn("TY_NEGARR", e.p.Builtins.NegArr)
+		ok := f.nextLabel("aneg_ok")
+		bad := f.nextLabel("aneg_bad")
+		neg := f.reg()
+		f.ins(fmt.Sprintf("%s = icmp slt i64 %s, 0", neg, n))
+		f.cbr(neg, bad, ok)
+		f.label(bad)
+		ex := e.rtCall(f, "ty_negarr", e.refType(), []lval{value(n, ast.TLong)})
+		e.decl("ty_throw", "void", []string{"ptr"}, " noreturn")
+		f.ins(fmt.Sprintf("call void @ty_throw(ptr %s)", ex.v))
+		f.unreachable()
+		f.label(ok)
 	}
 	return e.newArrayLevel(f, elem, lens, result)
 }

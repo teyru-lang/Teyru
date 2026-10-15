@@ -1192,9 +1192,9 @@ void ty_gc_init(void) {
 }
 
 void *ty_alloc_arr(int64_t len, size_t elemsize) {
-  if (len < 0) ty_throw((tyobj *)ty_negarr());
+  if (len < 0) ty_throw((tyobj *)ty_negarr(len));
   size_t bytes = (size_t)len * elemsize;
-  if (len != 0 && bytes / (size_t)len != elemsize) ty_throw((tyobj *)ty_negarr());
+  if (len != 0 && bytes / (size_t)len != elemsize) ty_throw((tyobj *)ty_negarr(len));
   tyarr *a = (tyarr *)ty_alloc(sizeof(tyarr) + bytes);
   a->obj.cls = array_class();
   a->len = len;
@@ -1271,6 +1271,31 @@ void *ty_npe(void) {
   ty_throw(ty_make_ex(TY_NPE, "null"));
   return m;
 }
+
+/* The helpful NullPointerException (JEP 358, JDK 15 and later). A site that
+   knows what was attempted and what the null was builds that sentence itself --
+   the words are compile-time constants, so the shape is
+   `Cannot <what> because <the null> is null` and the two halves arrive
+   assembled. The form the JDK falls back to when it cannot name either is the
+   bare "null", which is what ty_npe above throws, so a site that has nothing to
+   say still prints what it printed before.
+
+   The result is a non-NULL poison value of the right type, because the call
+   site is an expression that has to hand something back on the path that
+   throws: the string "null" is what the old code returned here and is what a
+   program that catches this and never looks at the value sees. */
+void *ty_npe_msg(const char *action, const char *cause) {
+  char buf[512];
+  if (action && cause) {
+    snprintf(buf, sizeof buf, "Cannot %s because %s is null", action, cause);
+  } else if (action) {
+    snprintf(buf, sizeof buf, "Cannot %s", action);
+  } else {
+    snprintf(buf, sizeof buf, "null");
+  }
+  ty_throw(ty_make_ex(TY_NPE, buf));
+  return ty_str_intern("null");
+}
 void *ty_aioobe(int64_t idx, int64_t len) {
   char buf[128];
   snprintf(buf, sizeof buf, "Index %lld out of bounds for length %lld", (long long)idx, (long long)len);
@@ -1291,18 +1316,57 @@ void *ty_arith(const char *msg) {
   ty_throw(ty_make_ex(TY_ARITH, msg));
   return NULL;
 }
+/* The JDK's ClassCastException message names both classes and then says where
+   they live: `class A cannot be cast to class B (A and B are in module
+   java.base of loader 'bootstrap')`, with the two folded into one clause when
+   they are in the same place and split with a semicolon when they are not. A
+   class that came from the standard library is in java.base on the bootstrap
+   loader; a class the program declared is in the unnamed module of the
+   application loader, which is what makes the mixed case read the way it does
+   (t282 is the JDK's own output for both shapes).
+
+   A JDK class is one this runtime stands in for: it is named java.* (jname is
+   the name Class.getName reports, so the two agree), because Teyru's own
+   classes are not in a module system at all and claiming they were would name
+   a loader that does not exist. */
+static const char *cce_module(const tyclass *k) {
+  const char *n = ty_class_jname(k);
+  return n && strncmp(n, "java.", 5) == 0 ? "module java.base of loader 'bootstrap'"
+                                         : "unnamed module of loader 'app'";
+}
+
 void *ty_cce(tyclass *from, tyclass *to) {
-  char buf[256];
-  snprintf(buf, sizeof buf, "class %s cannot be cast to class %s", from ? from->name : "?", to ? to->name : "?");
+  const char *fn = ty_class_jname(from), *tn = ty_class_jname(to);
+  const char *fm = cce_module(from), *tm = cce_module(to);
+  char buf[512];
+  if (strcmp(fm, tm) == 0) {
+    snprintf(buf, sizeof buf, "class %s cannot be cast to class %s (%s and %s are in %s)",
+             fn, tn, fn, tn, fm);
+  } else {
+    snprintf(buf, sizeof buf, "class %s cannot be cast to class %s (%s is in %s; %s is in %s)",
+             fn, tn, fn, fm, tn, tm);
+  }
   ty_throw(ty_make_ex(TY_CCE, buf));
   return NULL;
 }
-void *ty_arraystore(void) {
-  ty_throw(ty_make_ex(TY_ARRAYSTORE, "array element type mismatch"));
+void *ty_arraystore(void *v) {
+  /* Java's message is the class of the value that did not fit, not a sentence
+     about the array: storing an Object into a String[] answers
+     "java.lang.Object" (t282 is the JDK's own output). The value is what the
+     store site has in hand, so it is the argument; a site with no value to
+     name (arraycopy's own mismatch, which has two arrays rather than one
+     value) says so rather than inventing a class. */
+  ty_throw(ty_make_ex(TY_ARRAYSTORE, v ? ty_class_jname(((tyobj *)v)->cls) : "value"));
   return NULL;
 }
-void *ty_negarr(void) {
-  ty_throw(ty_make_ex(TY_NEGARR, "Negative array size"));
+void *ty_negarr(int64_t len) {
+  /* Java's message is the length that was refused, not a sentence about the
+     array: `new int[-1]` answers "-1". The overflow guard passes 0 because the
+     JDK does not report a size there either -- a request too large for the
+     heap is an OutOfMemoryError, which is a different question. */
+  char buf[32];
+  snprintf(buf, sizeof buf, "%lld", (long long)len);
+  ty_throw(ty_make_ex(TY_NEGARR, buf));
   return NULL;
 }
 void *ty_assertfail(const char *msg) {
@@ -4266,7 +4330,7 @@ tystr *ty_str_interned(tystr *s) {
 void *ty_sb_init(void *p, int64_t cap) {
   tySB *sb = (tySB *)p;
   if (!sb) ty_npe();
-  if (cap < 0) ty_throw((tyobj *)ty_negarr());
+  if (cap < 0) ty_throw((tyobj *)ty_negarr(cap));
   if (sb->buf) return p;
   sb->cap = cap > 0 ? cap : 1;
   sb->buf = (uint16_t *)malloc((size_t)sb->cap * sizeof(uint16_t));
