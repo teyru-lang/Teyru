@@ -3,10 +3,8 @@
 package driver
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -282,51 +280,59 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	// * -1` printed 2147483648 and `-Long.MIN_VALUE` printed 0, because the
 	// optimiser answered a question the language says has an answer. Telling the
 	// compiler that signed overflow wraps is the same rule Java states.
-	base := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir, cfile}
-	base = append(base, strings.Fields(rtC)...)
-	base = append(base, opts.Native...)
-	base = append(base, tgt.cflags...)
+	//
+	// The units of this build are the program -- the standard library and the
+	// program in one translation unit (see codegen.Emit), which is what this
+	// path keeps the whole-program view for -- the runtime, and whatever native
+	// sources implement the program's native methods. They are independent of
+	// one another, so the driver compiles them one at a time each and in
+	// parallel with each other (see cc.go), and links the objects once: what one
+	// `cc` command line used to do in one process, one file at a time.
+	srcs := append([]string{cfile}, strings.Fields(rtC)...)
+	srcs = append(srcs, opts.Native...)
+	units, err := objectsFor(filepath.Join(rtDir, "obj"), srcs)
+	if err != nil {
+		return res, err
+	}
+	// What every unit is compiled with, and what the objects are linked with.
+	// The link names the objects where the compile named the sources, and the
+	// libraries come after them, which is the order a static link needs.
+	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
+	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, opts.ExtraCC...)
+	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
+	ldflags = append(ldflags, tgt.cflags...)
 	// The target's own flags, before the libraries: -static has to be seen
 	// before the -l that follows it, or the library it is meant to apply to is
 	// taken from the dynamic import library instead and the program needs a
 	// DLL beside it. ws2_32 is the other one that matters here: the socket
 	// layer calls Winsock, and a program that links it without that library
 	// does not link at all.
-	base = append(base, tgt.ldflags...)
-	base = append(base, "-o", exe, "-lm", "-lpthread")
+	ldflags = append(ldflags, tgt.ldflags...)
+	ldflags = append(ldflags, objectList(units)...)
+	ldflags = append(ldflags, "-o", exe, "-lm", "-lpthread")
 	// OpenSSL, and only for a program that can reach the TLS layer. checkTLS
 	// above has already refused the program when the target has none, so
 	// tlsLibs is the target's own list here and never an empty one.
 	if link.TLS {
-		base = append(base, tgt.tlsLibs...)
+		ldflags = append(ldflags, tgt.tlsLibs...)
 	}
-	base = append(base, opts.Link...)
-	base = append(base, opts.ExtraCC...)
-	args := append([]string{}, base...)
+	ldflags = append(ldflags, opts.Link...)
+	ldflags = append(ldflags, opts.ExtraCC...)
 	// Link-time optimisation lets clang inline runtime helpers (string ops, the
 	// allocation fast path) into the generated program. It is on by default and
-	// retried without it when the toolchain has no LTO support: only the link
-	// flags differ between the two attempts, so a retry is a successful build
-	// like any other.
-	if !opts.NoLTO {
-		args = append([]string{"-flto"}, base...)
-	}
-	if opts.Verbose {
-		fmt.Fprintf(os.Stderr, "teyru: %s %s\n", cc, strings.Join(args, " "))
-	}
-	cmd := exec.Command(cc, args...)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	// retried without it when the toolchain has no LTO support: only the flags
+	// differ between the two attempts, so a retry is a successful build like
+	// any other.
+	if err := compileAndLink(cc, cflags, ldflags, units, !opts.NoLTO, opts.Verbose); err != nil {
 		if opts.NoLTO {
-			return res, fmt.Errorf("C backend failed: %w", err)
+			return res, err
 		}
 		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, "teyru: retrying without -flto")
 		}
-		retry := exec.Command(cc, base...)
-		retry.Stderr = os.Stderr
-		if err2 := retry.Run(); err2 != nil {
-			return res, fmt.Errorf("C backend failed: %w", err)
+		if err2 := compileAndLink(cc, cflags, ldflags, units, false, opts.Verbose); err2 != nil {
+			return res, err
 		}
 	}
 	res.Exe = exe
@@ -432,23 +438,49 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	// linked whole -- every definition in it is a symbol the program may name,
 	// so none of them is file-local -- and a hello world would carry the
 	// standard library.
-	base := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
-		"-ffunction-sections", "-fdata-sections", "-I", rtDir, cfile, libObj}
-	base = append(base, strings.Fields(rtC)...)
-	base = append(base, opts.Native...)
-	base = append(base, tgt.cflags...)
-	base = append(base, tgt.ldflags...)
-	base = append(base, gcSectionsFlag(tgt)...)
-	base = append(base, "-o", exe, "-lm", "-lpthread")
+	//
+	// The units are the program's own (the standard library's is prelude.o,
+	// which the cache supplied), the runtime, and whatever native sources
+	// implement the program's native methods. They are compiled one at a time
+	// each and in parallel with each other (see cc.go), and the objects are
+	// linked with the standard library's once. The linker's half of the
+	// paragraph above stays on the link: it is the linker that drops the
+	// sections.
+	srcs := append([]string{cfile}, strings.Fields(rtC)...)
+	srcs = append(srcs, opts.Native...)
+	units, err := objectsFor(filepath.Join(rtDir, "obj"), srcs)
+	if err != nil {
+		return res, err
+	}
+	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
+		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
+	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, opts.ExtraCC...)
+	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
+	ldflags = append(ldflags, tgt.cflags...)
+	ldflags = append(ldflags, tgt.ldflags...)
+	ldflags = append(ldflags, gcSectionsFlag(tgt)...)
+	// The objects in the order the sources were named in before the driver
+	// compiled them itself: the program's unit, the standard library's object,
+	// then the runtime's. The linker lays the kept sections out in that order,
+	// so it is what makes this build produce the same bytes as the one that
+	// handed the sources to one `cc`.
+	objs := objectList(units)
+	ldflags = append(ldflags, objs[0], libObj)
+	ldflags = append(ldflags, objs[1:]...)
+	ldflags = append(ldflags, "-o", exe, "-lm", "-lpthread")
 	if link.TLS {
-		base = append(base, tgt.tlsLibs...)
+		ldflags = append(ldflags, tgt.tlsLibs...)
 	}
-	base = append(base, opts.Link...)
-	base = append(base, opts.ExtraCC...)
+	ldflags = append(ldflags, opts.Link...)
+	ldflags = append(ldflags, opts.ExtraCC...)
+	if err := compileUnits(cc, cflags, units, opts.Verbose); err != nil {
+		return res, fmt.Errorf("C backend failed: %w", err)
+	}
 	if opts.Verbose {
-		fmt.Fprintf(os.Stderr, "teyru: %s %s\n", cc, strings.Join(base, " "))
+		fmt.Fprintf(os.Stderr, "teyru: %s %s\n", cc, strings.Join(ldflags, " "))
 	}
-	cmd := exec.Command(cc, base...)
+	cmd := exec.Command(cc, ldflags...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return res, fmt.Errorf("C backend failed: %w", err)
@@ -510,14 +542,14 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	}
 	objFile := filepath.Join(rtDir, "prelude.o")
 	args := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
-		"-ffunction-sections", "-fdata-sections", "-I", rtDir, srcFile, "-c", "-o", objFile}
+		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
 	args = append(args, tgt.cflags...)
-	cmd := exec.Command(cc, args...)
-	// The compiler's own diagnostics are the only thing that says what is wrong
-	// with the generated C, and they are what the whole-program path prints
-	// too: without this a failure here reports an exit status and nothing else.
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	// One unit, compiled through the same path the program's own units take, so
+	// that there is one place in the driver that runs a C compiler on generated
+	// C -- and so that the compiler's own diagnostics reach stderr, which is
+	// what says what is wrong with the generated C rather than an exit status
+	// and nothing else.
+	if err := compileUnits(cc, args, []cUnit{{src: srcFile, obj: objFile}}, false); err != nil {
 		return "", "", fmt.Errorf("the standard library's C backend failed: %w", err)
 	}
 	// A cache that cannot be written is not an error -- nor is there being no
@@ -724,54 +756,68 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 	}
 	// -fwrapv and -fno-strict-aliasing are the runtime's, not the program's: the
 	// generated module states its own wrapping arithmetic and its own loads.
-	// -x ir names the module as IR whatever it was called, and -x none ends that
-	// so the runtime is still read as C.
-	base := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir,
-		"-x", "ir", mfile, "-x", "none"}
-	base = append(base, strings.Fields(rtC)...)
-	base = append(base, opts.Native...)
-	base = append(base, tgt.cflags...)
-	base = append(base, tgt.ldflags...)
+	//
+	// The units are the module and the runtime, compiled the way the C back
+	// end's are -- one at a time each, in parallel with each other, then linked
+	// once (see cc.go). The module is IR whatever the caller named the file, so
+	// its own unit says so; the runtime beside it is C, which its extension
+	// already says.
+	srcs := append([]string{mfile}, strings.Fields(rtC)...)
+	srcs = append(srcs, opts.Native...)
+	units, err := objectsFor(filepath.Join(rtDir, "obj"), srcs)
+	if err != nil {
+		return res, err
+	}
+	units[0].lead = []string{"-x", "ir"}
 	exe := opts.Out
 	if tgt.suffix != "" && !strings.HasSuffix(exe, tgt.suffix) {
 		exe += tgt.suffix
 	}
-	base = append(base, "-o", exe, "-lm", "-lpthread")
+	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
+	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, opts.ExtraCC...)
+	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
+	ldflags = append(ldflags, tgt.cflags...)
+	ldflags = append(ldflags, tgt.ldflags...)
+	ldflags = append(ldflags, objectList(units)...)
+	ldflags = append(ldflags, "-o", exe, "-lm", "-lpthread")
 	if link.TLS {
-		base = append(base, tgt.tlsLibs...)
+		ldflags = append(ldflags, tgt.tlsLibs...)
 	}
-	base = append(base, opts.Link...)
-	base = append(base, opts.ExtraCC...)
-	args := append([]string{}, base...)
+	ldflags = append(ldflags, opts.Link...)
+	ldflags = append(ldflags, opts.ExtraCC...)
 	// Link-time optimisation lets clang inline the runtime's helpers (the
 	// allocation fast path's slow half, the string operations) into the module,
 	// which is what the C backend's build gets. It is retried without it when
-	// the toolchain has no LTO support: only the link flags differ.
-	if !opts.NoLTO {
-		args = append([]string{"-flto"}, base...)
+	// the toolchain has no LTO support: only the flags differ.
+	build := func(lto bool) error {
+		cf, ld := cflags, ldflags
+		if lto {
+			cf = append([]string{"-flto"}, cflags...)
+			ld = append([]string{"-flto"}, ldflags...)
+		}
+		if err := compileUnits(cc, cf, units, opts.Verbose); err != nil {
+			return err
+		}
+		if opts.Verbose {
+			fmt.Fprintf(os.Stderr, "teyru: llvm backend: %s %s\n", cc, strings.Join(ld, " "))
+		}
+		cmd := exec.Command(cc, ld...)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("llvm backend failed: %w", err)
+		}
+		return nil
 	}
-	if opts.Verbose {
-		fmt.Fprintf(os.Stderr, "teyru: llvm backend: %s %s\n", cc, strings.Join(args, " "))
-	}
-	// The compiler's stderr is read rather than streamed, because a module the
-	// back end emitted that does not verify is this compiler's bug and has to be
-	// reported as one: otherwise the program's author sees a parse error in a
-	// file they never wrote and cannot tell it apart from a limit of the back
-	// end.
-	var errOut bytes.Buffer
-	cmd := exec.Command(cc, args...)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &errOut)
-	if err := cmd.Run(); err != nil {
+	if err := build(!opts.NoLTO); err != nil {
 		if opts.NoLTO {
-			return res, backendFailure(errOut.String(), mfile, err)
+			return res, backendFailure(err, mfile)
 		}
 		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, "teyru: retrying without -flto")
 		}
-		retry := exec.Command(cc, base...)
-		retry.Stderr = os.Stderr
-		if err2 := retry.Run(); err2 != nil {
-			return res, backendFailure(errOut.String(), mfile, err)
+		if err2 := build(false); err2 != nil {
+			return res, backendFailure(err, mfile)
 		}
 	}
 	res.Exe = exe
@@ -782,10 +828,18 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 // LLVM parser rejects is a defect in the back end, so it is named as one: the
 // diagnostic says which line did not verify, and says that the file is the
 // compiler's output rather than the program.
-func backendFailure(errText, mfile string, err error) error {
-	if strings.Contains(errText, mfile) {
+func backendFailure(err error, mfile string) error {
+	// The compiler's own words are what tell the two apart, and they are kept
+	// for every unit: a parse error in the module this compiler wrote reads as
+	// an error in a file the program's author never wrote.
+	var said string
+	var fail *ccFailure
+	if errors.As(err, &fail) {
+		said = fail.Text
+	}
+	if strings.Contains(said, mfile) {
 		line := ""
-		for _, l := range strings.Split(errText, "\n") {
+		for _, l := range strings.Split(said, "\n") {
 			if strings.HasPrefix(l, mfile) {
 				line = l
 				break
