@@ -563,8 +563,26 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   **仍未驗證或未涵蓋**：呼叫端的守衛是普通載入，release 那一半沒有對應的 acquire，弱記憶體模型的
   目標（arm64）沒驗證；初始化區塊整段持有類別監視器，所以兩個互相碰到對方類別的初始化區塊可以
   死鎖（Java 在同樣兩把監視器上也會）；初始化區塊丟出例外的類別之後會被重跑，而 Java 是 erroneous
-  一次、之後每次拒絕，這個差異**沒有測試盯著**。測試 `tests/programs/t217_class_initializer_race`
+  一次、之後每次拒絕。測試 `tests/programs/t217_class_initializer_race`
   （八條執行緒同時當六個程式庫類別的第一次使用者；期望輸出由 JDK 21 產生）。
+
+- **類別初始化失敗的兩半，與另一半為什麼還看不到（`TY_CLS_ERR`）**：JLS 12.4.2 說初始化區塊丟出時，
+  那一**次**使用看到的是包起來的失敗（丟的是 `Error` 就原樣重丟，否則用
+  `ExceptionInInitializerError` 包住並把原因放進 `cause`），而那之後**每一次**使用都以
+  `NoClassDefFoundError`（訊息 `Could not initialize class X`）拒絕，不再重跑。兩半都實作了
+  （`tyrt2.c` 的 `ty_clinit`：`TY_CLS_ERR` 在類別自己的監視器下發布，讀也在那裡；
+  `ty_eiie`／`ty_ncdfe` 是兩個新的執行期建構子，`LinkageError`／`ExceptionInInitializerError`／
+  `NoClassDefFoundError` 三個類別跟著補上，`Error` 也補了 Java 的 `(String, Throwable)` 與
+  `(Throwable)` 兩個建構子）。
+  **但只有前半在今天的樹上觀測得到，而這是 startup 順序的結果不是疏漏**：這個編譯器把**程式自己的
+  類別**在 `main` 之前跑完（見上一條），所以一個初始化區塊會丟的程式類別在 startup 就死了、`main`
+  根本沒跑到——因此「之後每次拒絕」需要的是**編譯器留給第一次使用**的類別，也就是標準庫的類別，
+  而標準庫裡**沒有任何一個類別的初始化區塊會丟**（`grep -rn "static {" lib/*.teyru` 是空的）。
+  觀測得到的那一半有測試：`tests/programs/t286_class_init_failure`（`.experr` 的第一行是 JDK 21
+  對同一支程式印的那一行 `Exception in thread "main" java.lang.ExceptionInInitializerError`，
+  而改動前它印的是原始的 `java.lang.RuntimeException: init failed`；JDK 差分也同意：
+  `TestJDKDiff/t286` 是 translated 且 agreed）。後半那條路徑因此**沒有測試盯著**，而它會在
+  任何一個「編譯器留給第一次使用、而初始化會失敗」的類別出現的那一天變成活的。
 
 ---
 

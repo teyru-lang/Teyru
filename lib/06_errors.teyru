@@ -221,6 +221,12 @@ class Error extends Throwable {
   public Error(String message) {
     super(message)
   }
+  public Error(String message, Throwable cause) {
+    super(message, cause)
+  }
+  public Error(Throwable cause) {
+    super(cause)
+  }
 }
 
 /* The parent Java gives the errors the virtual machine raises when a resource
@@ -229,6 +235,42 @@ class VirtualMachineError extends Error {
   public VirtualMachineError() {
   }
   public VirtualMachineError(String message) {
+    super(message)
+  }
+}
+
+/* The errors that say a class could not be used rather than that the program's
+   logic failed. LinkageError is Java's parent for them, and the two this
+   runtime raises are both about a class initializer: ExceptionInInitializerError
+   is what the first use that ran the initializer sees, and NoClassDefFoundError
+   is what every use after that sees, because JLS 12.4.2 leaves such a class
+   erroneous rather than letting it be initialised again. */
+class LinkageError extends Error {
+  public LinkageError() {
+  }
+  public LinkageError(String message) {
+    super(message)
+  }
+  public LinkageError(String message, Throwable cause) {
+    super(message, cause)
+  }
+}
+
+class ExceptionInInitializerError extends LinkageError {
+  public ExceptionInInitializerError() {
+  }
+  public ExceptionInInitializerError(String message) {
+    super(message)
+  }
+  public ExceptionInInitializerError(Throwable cause) {
+    super(null, cause)
+  }
+}
+
+class NoClassDefFoundError extends LinkageError {
+  public NoClassDefFoundError() {
+  }
+  public NoClassDefFoundError(String message) {
     super(message)
   }
 }

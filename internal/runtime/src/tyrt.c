@@ -27,6 +27,9 @@ tyclass *TY_OBJECT = NULL;
 tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT;
 tyclass *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE;
 tyclass *TY_ILLMON;
+/* The class-initializer errors and the Error class the initializer path tests
+   a throwable against (tyrt2.c's ty_clinit). */
+tyclass *TY_EIIE, *TY_NCDFE, *TY_ERROR;
 /* StackOverflowError, which the runtime throws from a prologue check rather
    than from a call site: it is installed by the generated startup like the rest
    of them. */

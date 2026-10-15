@@ -34,6 +34,7 @@ func init() {
 		"NumberFormatException", "IllegalStateException", "IllegalMonitorStateException",
 		"NegativeArraySizeException", "AssertionError",
 		"ArrayStoreException", "UnsupportedOperationException", "StackOverflowError",
+		"LinkageError", "ExceptionInInitializerError", "NoClassDefFoundError",
 		"OutOfMemoryError", "Class", "Number", "Integer", "Long", "Short", "Byte",
 		"Character", "Double", "Float", "Boolean", "Void", "Cloneable",
 		"Comparable", "AutoCloseable", "Iterable", "Runnable", "Thread", "Enum",

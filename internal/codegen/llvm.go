@@ -435,6 +435,7 @@ func (e *llvmEmitter) run() {
 		e.p.Builtins.NegArr, e.p.Builtins.Assertion, e.p.Builtins.IllArg,
 		e.p.Builtins.IllState, e.p.Builtins.NoSuchElem, e.p.Builtins.Unsup,
 		e.p.Builtins.IllMon, e.p.Builtins.ArrayStore, e.p.Builtins.SOE,
+		e.p.Builtins.EIIE, e.p.Builtins.NCDFE, e.p.Builtins.Err,
 	} {
 		if cl != nil {
 			e.instantiate(cl)
@@ -1656,6 +1657,8 @@ func (e *llvmEmitter) entry() {
 		{"TY_NPE", e.p.Builtins.NPE}, {"TY_AIOOBE", e.p.Builtins.AIOOBE},
 		{"TY_SIOOBE", e.p.Builtins.SIOOBE},
 		{"TY_SOE", e.p.Builtins.SOE},
+		{"TY_EIIE", e.p.Builtins.EIIE}, {"TY_NCDFE", e.p.Builtins.NCDFE},
+		{"TY_ERROR", e.p.Builtins.Err},
 		{"TY_ARITH", e.p.Builtins.Arith}, {"TY_CCE", e.p.Builtins.CCE},
 		{"TY_NEGARR", e.p.Builtins.NegArr}, {"TY_ASSERT", e.p.Builtins.Assertion},
 		{"TY_ILLARG", e.p.Builtins.IllArg}, {"TY_ILLSTATE", e.p.Builtins.IllState},
