@@ -777,8 +777,9 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   快取把「標準庫的語意檢查與產生的 C」變成每個程式共用的一次工作：`internal/driver` 的 `compileSplit`
   先產生程式的單元（它會說出程式是否到得了反射，那決定標準庫單元要不要帶成員表），再用
   `internal/cache` 的 key 找 `$XDG_CACHE_HOME/teyru/prelude/<key>/`（`TEYRU_CACHE_DIR` 可改位置、
-  `TEYRU_NOCACHE=1` 關掉）。key 是（編譯器版本＋Go buildinfo 的 `vcs.revision`／`vcs.modified`、
-  runtime 原始碼與標頭的 hash、`lib/*.teyru` 的 hash、目標、優化級別、後端、反射變體、C 編譯器名）；
+  `TEYRU_NOCACHE=1` 關掉）。key 是（編譯器版本＋Go buildinfo 的 `vcs.revision`／`vcs.modified`＋
+  **編譯器執行檔自己的 hash**、runtime 原始碼與標頭的 hash、`lib/*.teyru` 的 hash、目標、優化級別、
+  後端、反射變體、C 編譯器名）；
   `internal/codegen` 的 `EmitLibrary` 只吐標準庫的單元、`EmitProgram` 只吐程式的單元，兩者共用一個標頭，
   每個字串字面值以內容雜湊命名、由擁有它的那個單元定義（`==` 是參考比較，一文字只能有一個物件）。
   vtable 陣列留在**程式的**單元：`prune.go` 靠程式的分派點決定哪些槽留著，那是快取單元不能帶的決定；
@@ -796,7 +797,20 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   106,856 → 139,752 位元組，+31%），因為跨單元的符號是外部的、vtable 也搬到了程式的單元；③在這台 16 核
   機器上單次建置的差距不大（`--no-lto` 的單一單元 `web.teyru` 1.27 s 對暖快取 1.24 s），快取的價值在慢
   機器與大量建置（測試套件每個程式都是 `-O0`／`-O1`，正好是這條路）。
-  快取失效的論證：key 覆蓋上面每一項，任一根改了就是不同目錄；寫入是 `CreateTemp` ＋ `rename`，讀者只會
+  快取失效的論證：key 覆蓋上面每一項，任一根改了就是不同目錄。**編譯器自己的位元組是後來才補上的那一根**，
+  而它補的是一個真實的漏洞：`vcs.revision` ＋ `vcs.modified` 說的是「這個 commit 的某棵髒樹」，不是「哪一棵」
+  ——同一個 commit 的兩棵樹各自改了不同的東西，revision 與 dirty 完全相同、產生的 C 可以不同，於是其中一棵
+  的建置會讀到另一棵吐出的 prelude。這不是假想的狀態：這個倉庫的常態就是每個工作項一個 worktree，而實測
+  兩棵這樣的樹在補上之前**共用同一個 entry**（`101d2b09…`），補上之後是兩個（`internal/cache/cache_test.go`
+  的 `TestTwoDirtyCompilersOfOneCommitAreDifferentCompilers` 與 `TestBuildNamesTheRunningCompiler`，兩個在
+  沒有那一根時都是紅的）。**而在這台機器上，實測比「兩棵髒樹」更糟**：`go version -m` 對這裡建出來的二進位
+  檔**一個 `vcs.*` 設定都沒有**（三棵樹、含 `-trimpath` 與 `-buildvcs=true` 都試過），所以 `cache.Build` 的
+  revision 那一段是空的，Compiler 欄位就是 `0.4.1 go1.26.5-X:nodwarf5 linux amd64`——**每一棵樹的每一個
+  建置都是同一個**。同一台機器上稍早建的那支 `teyru` **有** `vcs.revision=d7fde38`，所以蓋章不是永遠不會
+  發生；一個要靠它才正確的 key 就是一個會安靜地錯的 key，而現在補的這一根不依賴 buildinfo。代價是**任何**
+  改動編譯器原始碼的編輯都會讓 prelude 冷一次——包括改一個註解、
+  或改測試檔（`go test` 的測試二進位檔就是那個「執行檔」）——所以這是保守的一根，而保守的方向是「多編一次」
+  而不是「讀到別人的產物」。寫入是 `CreateTemp` ＋ `rename`，讀者只會
   看到完整檔，`Has()` 把 0 位元組當未命中；標頭、原始碼、物件共用一個 entry，不會混用不同建置的產物；
   兩個單元之間只有標頭宣告、`ty_prelude_install()`、`ty_prog_forname()` 與程式單元定義的 vtable 四個介面，
   而 driver 會檢查兩邊「哪些字面值由標準庫定義」必須完全相同，不同就以內部錯誤中止。`make cache`

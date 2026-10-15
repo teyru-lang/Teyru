@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // EnvDir moves the cache, and EnvOff turns it off. A build with the cache off
@@ -373,7 +374,23 @@ type Named struct {
 // different code for the same prelude -- does not answer with the previous
 // compiler's artifacts. A build with no revision to report (a `go run`, or a
 // binary built outside a repository) falls back to the version alone.
+//
+// The revision is not enough on its own, which is what the compiler's own
+// bytes are here for: "dirty" says that a working tree was built from, not
+// which one. Two worktrees of the same commit with different edits in them --
+// the ordinary state of this repository, where every work item gets a worktree
+// -- report the same revision and the same dirty flag, so a build of one would
+// otherwise read a prelude another emitted. Two compilers cannot be told apart
+// by anything but themselves, so the running executable is hashed into the key:
+// any edit that can change the C a build emits changes the binary that made it.
 func Build(version string) string {
+	return buildFor(version, selfHash())
+}
+
+// buildFor is Build with the compiler's own identity passed in rather than
+// measured, which is what makes the rule testable: the running executable
+// cannot be swapped under a test, but two strings can be compared.
+func buildFor(version, self string) string {
 	parts := []string{version, runtime.Version(), runtime.GOOS, runtime.GOARCH}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range info.Settings {
@@ -383,5 +400,36 @@ func Build(version string) string {
 			}
 		}
 	}
+	parts = append(parts, "self="+self)
 	return strings.Join(parts, " ")
+}
+
+// selfHash is the running compiler's own bytes, hashed once per process. It is
+// the contents and not the path, so a compiler copied somewhere else is still
+// the same compiler and one rebuilt in place is not.
+//
+// A compiler that cannot name its own executable -- os.Executable failed, or
+// the file is already gone from under a `go run` -- answers "unknown" rather
+// than answering nothing, so that every such build shares one key instead of
+// each getting a key of its own.
+var (
+	selfOnce sync.Once
+	selfSum  string
+)
+
+func selfHash() string {
+	selfOnce.Do(func() {
+		exe, err := os.Executable()
+		if err != nil {
+			selfSum = "unknown"
+			return
+		}
+		sum, err := sumOfFile(exe)
+		if err != nil {
+			selfSum = "unknown"
+			return
+		}
+		selfSum = sum[:16]
+	})
+	return selfSum
 }
