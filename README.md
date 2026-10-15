@@ -33,29 +33,33 @@ teyru run hello.teyru
 |---|---|---|
 | linux/amd64 | ✅ | ✅ 原生，整套測試都在這裡跑（`go test ./...`、`TEYRU=<編譯器> sh tests/run.sh`） |
 | windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉編譯；**碰得到 TLS 的程式除外**，那些是具名拒絕 | ✅ 在 Wine 下跑：當時 195 支測試程式有 179 支輸出逐位元組相同，差異的 16 支已逐一歸因（14 支在改動前的編譯器上用 gcc 也會失敗，2 支是 NTFS 檔名與 POSIX 路徑的事實） |
-| linux/arm64 | ❌ 這台機器有 `aarch64-linux-gnu-gcc`，但它的 sysroot 裡沒有 libc 標頭（`fatal error: stdint.h`），連編譯都過不去 | ❌ 沒有 aarch64 sysroot |
-| darwin/amd64、darwin/arm64 | ❌ 這裡沒有 macOS SDK，也沒有可用的交叉編譯器（`teyru: no C compiler for darwin/amd64 on a linux/amd64 host`） | ❌ 這裡沒有 macOS |
+| linux/arm64 | ✅ 需一支指向 arm64 sysroot 的編譯器（`CC=aarch64-linux-gnu-gcc` ＋ `QEMU_LD_PREFIX`，做法寫在 `AGENTS.md` §10） | ✅ 在 qemu 下跑：整套 **250 項全過、0 項不符**（222 支程式＋3 個套件＋23 個診斷＋2 個原生），量於 2026-09-17 |
+| darwin/amd64、darwin/arm64 | ✅ 以 `--cc <zig cc -target <arch>-macos>`（`resolveTarget` 現在看的是這次真的會用的那支編譯器） | ❌ 這裡沒有 macOS：**沒有任何一行程式在它上面執行過**，只到「編譯並連結」 |
 
 建置那一欄量的是八支代表性程式——sealed switch（`t84_sealed_switch`）、arrow blocks
 （`t133_arrow_blocks`）、反射（`t146_reflect`）、執行緒（`t159_threads`）、時區
 （`t188_timezone`）、Spring 形狀的那一層（`t102_web`）、TLS（`t163_https_roundtrip`）與
-Gson（`t101_gson`）——各以 `teyru build --no-lto --target <os>/<arch>` 編五個目標，判定看
-的是編譯器自己的結束碼：**40 次裡 12 次成功**（linux/amd64 八支全過、windows/amd64 四支
-過），其餘 28 次是上面那兩種「這台機器做不到」，加上 windows 上那一種「這個目標沒有
-TLS」。
+Gson（`t101_gson`）——各以 `teyru build --no-lto --target <os>/<arch>` 編四個可達的目標。
+**上表每一列的證據是那一次真正量到的東西**（linux/amd64 整套測試、arm64 在 qemu 下整套、
+windows 在 Wine 下 179 支），不是一次跨編譯探針的比例；先前這裡寫過的「40 次裡 12 次成功」
+是 arm64 sysroot 與 macOS SDK 都還沒準備好時的舊探針，兩件事都不是同一件事，量到 arm64
+之後它就該被刪掉而不是留著當現況。
 
-**五個目標都實作了，但這台機器只能演練其中兩個。** 交叉編譯到 linux/arm64 需要那個目標的
-sysroot，到 macOS 需要一份 SDK，兩者都不在這台機器上——那三個目標是「實作了、**沒有任何人
-跑過**」，不是「編得出來但沒測」。真正被驗證過的是另外兩個：linux/amd64 原生跑整套測試，
-windows/amd64 在 Wine 下跑（上面那 179 支）。
+**四個目標都能編譯，但這台機器只能執行其中兩個。** 交叉編譯到 linux/arm64 需要那個目標的
+sysroot、到 macOS 需要一份 SDK，兩者都不在這台機器上；macOS 那一格是「編得出來、
+**沒有任何人跑過**」，不是「編得出來但沒測」。真正被驗證過的是三個：linux/amd64 原生跑整套
+測試、linux/arm64 在 qemu 下跑整套、windows/amd64 在 Wine 下跑（上面那 179 支）。
 
 執行期把平台相依集中在 `internal/runtime/src/tyrt_plat.h` 後面（POSIX 與 Windows 各一份），
 `--target <os>/<arch>` 選擇編譯器、旗標與輸出檔名。TLS 是執行期唯一連結外部函式庫
-（OpenSSL）的部分：它自己是一個檔案，只有程式的可達程式碼碰得到它時才編譯與連結，而沒有
+（OpenSSL）的部分：它自己是一個檔案，只有程式的**可達程式碼**碰得到它時才編譯與連結，而沒有
 OpenSSL 的目標（windows、macOS）對它是**指名拒絕**——在寫出任何輸出檔之前，不是連結階段
-失敗。要注意「碰得到」算的是**可達性**：會用反射的程式會連帶碰得到 TLS（反射帶著一份指名
-每個類別的表格），所以 Gson 與 Spring 形狀的那一層在 windows 與 macOS 上是拒絕，而不用
-反射也不用 TLS 的程式完全不受影響。
+失敗。「可達」指的是**程式自己的程式碼到得了哪裡**，反射的表格不算：反射那條路徑在產生的 C
+裡帶一個標記，可達性分析跑兩次，一次跟著反射的參考（vtable 剪裁要的就是那一次），一次不跟
+（TLS 的連結決策讀的是後者）。所以一個只會反射、不碰 TLS 的程式**不連** OpenSSL——
+`tests/programs/t241_reflect_tls_unlinked` 與 `link_test.go` 的 `TestTLSReachability`
+盯著這一格；反射真的在執行期叫到 TLS 方法時，拿到的是執行期 weak stub 的指名失敗，不是
+跳到 NULL。
 
 目前**沒有 CI**——沒有任何 GitHub Actions：這份表上的每一列都是在這一台 linux/amd64 機器上
 跑出來的，所以「編得出來」與「跑得起來」在這裡是兩個問題。

@@ -1324,12 +1324,18 @@ func writeRuntime(dir string, tgt *target, link codegen.Link) string {
 // message that names a symbol in a library the program's author never mentioned.
 // The message below names the target, the feature, the reason and a way out.
 //
-// "Can reach" is the emitted C's own reachability (see codegen.Link), and it is
-// a superset of what the program will run: a program that reflects carries the
-// table that names every class, so a reflecting program reaches the TLS layer
-// whether or not it means to. Saying so here rather than linking and failing at
-// run time is the same choice the rest of this compiler makes -- the language
-// refuses what it cannot do, rather than doing something else (AGENTS.md §5).
+// "Can reach" is the emitted C's own reachability (see codegen.Link), and it is a
+// superset of what the program will run. It used to be a much larger superset:
+// a program that reflects carries the member table that names every class, and
+// every TLS method body was live through it, so a reflecting program reached the
+// TLS layer whether or not it meant to. The emitter now marks the statements
+// that only reflection walks (codegen.reflectOnly) and the reachability pass
+// computes this answer twice, once following those references and once not --
+// so a program that merely reflects no longer pulls in OpenSSL, and one that
+// really calls a TLS entry point still does. Saying so here rather than linking
+// and failing at run time is the same choice the rest of this compiler makes --
+// the language refuses what it cannot do, rather than doing something else
+// (AGENTS.md §5).
 func checkTLS(tgt *target, link codegen.Link) error {
 	if !link.TLS || tgt.tlsLibs != nil {
 		return nil
