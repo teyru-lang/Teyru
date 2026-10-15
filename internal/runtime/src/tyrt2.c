@@ -380,24 +380,14 @@ void *ty_make_ex(tyclass *c, const char *msg) {
   return o;
 }
 
-/* An exception with no message at all, which is not the same as an empty one:
-   Java's getMessage answers null and Throwable.toString prints the class name
-   alone. ExceptionInInitializerError is the one this runtime raises that way --
-   the JDK's own answer for it is "java.lang.ExceptionInInitializerError", with
-   no colon and no text. */
-static void *ty_make_ex_nomsg(tyclass *c) {
-  tyobj *o = (tyobj *)ty_alloc(sizeof(tyobj) + 2 * sizeof(void *));
-  o->cls = c;
-  ((void **)((char *)o + sizeof(tyobj)))[0] = NULL;
-  ((void **)((char *)o + sizeof(tyobj)))[1] = NULL;
-  return o;
-}
-
 /* The failure of a class initializer. The JDK's ExceptionInInitializerError
    carries the throwable that stopped the initializer and no message of its own,
-   and getCause answers that throwable. */
+   and getCause answers that throwable -- which is why the message is a null
+   pointer and not an empty string: Java's getMessage answers null and
+   Throwable.toString prints the class name alone, where an empty string would
+   print "java.lang.ExceptionInInitializerError: ". */
 void *ty_eiie(void *cause) {
-  tyobj *o = (tyobj *)ty_make_ex_nomsg(TY_EIIE);
+  tyobj *o = (tyobj *)ty_make_ex(TY_EIIE, NULL);
   ((void **)((char *)o + sizeof(tyobj)))[1] = cause;
   return o;
 }
