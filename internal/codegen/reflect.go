@@ -510,32 +510,33 @@ func (e *Emitter) emitConstTable(cl *ast.Class) string {
 	return name
 }
 
-// emitClassRegistry writes the table Class.forName searches. It holds every
-// class of the program: the set of names a program can be asked for is known
-// when it is compiled, and the table costs one pointer per class.
 // forNameTable writes the program's class table inside the function that
 // searches it, and returns the C name and the count.
 //
 // It is a function-local static rather than a global on purpose. An array at
-// file scope that names every class is a root: it pins every class, its
+// file scope that names classes is a root: it pins every class it names, its
 // vtable, its interface table and its member tables into every executable,
 // including one that never loads a class by name. Written here, link-time
 // optimisation drops the table along with the function -- and the function is
 // reachable only from a call site that asked for forName.
+//
+// What the table holds is the set of names a program can ask for, which the
+// reachability scan answers (see reflectset.go): a name written as a constant,
+// wherever the call is, and -- when a name the compiler cannot read can reach
+// this table at all -- every class, because a name it cannot read is a name it
+// cannot rule out.
 func (e *Emitter) forNameTable() (string, int) {
 	names := make([]string, 0, len(e.prog.Classes))
 	for _, cl := range e.prog.Classes {
-		if cl == nil {
+		if cl == nil || !e.namesCover(cl) {
 			continue
 		}
-		// Every class, including the ones whose struct is a runtime typedef: a
-		// program loads teyru.String by name as readily as its own types.
+		// Every class the scan kept, including the ones whose struct is a
+		// runtime typedef: a program loads teyru.String by name as readily as
+		// its own types.
 		names = append(names, "&cls_"+mangle(cl.Full))
 	}
 	sort.Strings(names)
-	if len(names) == 0 {
-		return "NULL", 0
-	}
 	name := "forname_all"
 	if e.split {
 		// The table is searched by Class.forName, whose body the library's unit
@@ -547,11 +548,22 @@ func (e *Emitter) forNameTable() (string, int) {
 		if e.forName == nil {
 			// the library's unit: the program's unit defines it
 			e.headerDecls += "\nvoid* ty_prog_forname(tystr* name, tyclass* clscls);\n"
+			return "ty_prog_forname", 0
+		}
+		if len(names) == 0 {
+			// No name can be loaded, and the function is still defined: the
+			// library's Class.forNameOf reaches it through a call, and a call
+			// to a function that is not there is a link error rather than an
+			// empty answer.
+			fmt.Fprintf(e.forName, "\nvoid* ty_prog_forname(tystr* name, tyclass* clscls) {\n  return ty_class_forname_in(name, NULL, 0, clscls);\n}\n")
 		} else {
 			fmt.Fprintf(e.forName, "\nvoid* ty_prog_forname(tystr* name, tyclass* clscls) {\n  static tyclass* %s[%d] = {%s}; %s\n  return ty_class_forname_in(name, %s, %d, clscls);\n}\n",
 				name, len(names), strings.Join(names, ", "), reflectOnly, name, len(names))
 		}
 		return "ty_prog_forname", 0
+	}
+	if len(names) == 0 {
+		return "NULL", 0
 	}
 	// The table is marked reflectOnly for the same reason an attachment is: it
 	// names every class of the program, and it does so for the reflective call
@@ -573,25 +585,11 @@ func (e *Emitter) forNameTable() (string, int) {
 func (e *Emitter) attach(cl *ast.Class, field, table, elem string, n int, count string) {
 	line := fmt.Sprintf("cls_%s.%s = (%s*)%s; cls_%s.%s = %d; %s",
 		mangle(cl.Full), field, elem, table, mangle(cl.Full), count, n, reflectOnly)
-	// A prelude class's tables are defined by the library's unit in a split
-	// build, so they are attached by the library's install function; the
-	// program's own classes are attached by its entry point.
-	if e.split && cl.Prelude() {
-		e.libMeta = append(e.libMeta, line)
-		return
-	}
+	// The program's entry point attaches every table, whatever unit the class
+	// belongs to: in a split build the tables are all written into the program's
+	// unit (see enterTables), so the program is what knows which of them it
+	// has.
 	e.metaInit = append(e.metaInit, line)
-}
-
-// reflectMethodCount is how many entries a class's method table holds: every
-// method by name, then its constructors, in the order emitMethodTable writes
-// them.
-func (e *Emitter) reflectMethodCount(cl *ast.Class) int {
-	n := 0
-	for _, name := range mangleOrder(cl) {
-		n += len(cl.Methods[name])
-	}
-	return n + len(cl.Ctors)
 }
 
 // reflectClassMembers are the Class methods whose answers come from a class's
