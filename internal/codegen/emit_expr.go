@@ -1040,11 +1040,20 @@ func (e *Emitter) nativeIsFinal(m *ast.Method) bool {
 // Java's lazy class initialization. The initialized flag is tested inline, so
 // the common case is a load and a branch instead of a call, and a class whose
 // hierarchy has no initializer at all needs no code.
+//
+// The load is an acquire load, and it has to be: ty_clinit publishes the flag
+// with a release store, and a release with no matching acquire is not a
+// synchronises-with -- a thread that sees the flag is then allowed to see the
+// static fields the initializer wrote *before* it as the nulls they used to be,
+// which is the failure the whole mechanism exists to prevent. On x86-64 the
+// acquire is the plain load it always was; on a weakly ordered target it is the
+// one instruction that makes the release mean something.
 func (e *Emitter) clinitCall(cl *ast.Class) string {
 	if cl == nil || cl == e.prog.Builtins.Object || !needsClinit(cl, map[*ast.Class]bool{}) {
 		return ""
 	}
-	return "(void)((cls_" + mangle(cl.Full) + ".flags & TY_CLS_INIT) ? 0 : ty_clinit(&cls_" + mangle(cl.Full) + ")), "
+	n := mangle(cl.Full)
+	return "(void)((__atomic_load_n(&cls_" + n + ".flags, __ATOMIC_ACQUIRE) & TY_CLS_INIT) ? 0 : ty_clinit(&cls_" + n + ")), "
 }
 
 // clinitStmt is clinitCall as a statement, for the places that initialise a
@@ -1054,7 +1063,7 @@ func (e *Emitter) clinitStmt(cl *ast.Class) string {
 		return ""
 	}
 	n := mangle(cl.Full)
-	return "if (!(cls_" + n + ".flags & TY_CLS_INIT)) ty_clinit(&cls_" + n + ");\n"
+	return "if (!(__atomic_load_n(&cls_" + n + ".flags, __ATOMIC_ACQUIRE) & TY_CLS_INIT)) ty_clinit(&cls_" + n + ");\n"
 }
 
 // needsClinit reports whether a class or any class it extends starts with a
