@@ -484,7 +484,13 @@ func (e *llvmEmitter) clinitIfNeeded(f *fb, cl *ast.Class) {
 	done := f.nextLabel("clinit_done")
 	call := f.nextLabel("clinit_call")
 	cls := "@cls_" + util.Mangle(cl.Full)
-	flags := e.loadRaw(f, "i32", e.gepBytes(f, cls, 12), 4)
+	// The flag is published by a release store in ty_clinit, so the read has to
+	// be an acquire: a release with no matching acquire is not a
+	// synchronises-with, and a thread that saw the flag could then read the
+	// static fields as the nulls the initializer was about to overwrite. The C
+	// back end's guard says the same thing.
+	flags := f.reg()
+	f.ins(fmt.Sprintf("%s = load atomic i32, ptr %s acquire, align 4", flags, e.gepBytes(f, cls, 12)))
 	and := f.reg()
 	f.ins(fmt.Sprintf("%s = and i32 %s, 8", and, flags))
 	c := f.reg()
