@@ -830,7 +830,7 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   的範圍由 `char[]` 改 `int[]` 並按 code point 比對、`LitNode`／`AnyNode`／`ClassNode` 的推進改
   `Character.charCount`、parser 讀字面值與類別成員時走 `String.codePointAt`）；測試
   `t276_regex_codepoints`。
-- **標準庫的快取與兩單元建置（W13 的第 1、2 項已落地；第 3 項未做，見本條最後）**：一次建置原本把
+- **標準庫的快取、反射中繼資料的裁剪與平行編譯（W13 的第 1、2、3 項都已落地）**：一次建置原本把
   標準庫與程式放進**同一個編譯單元**、整份一起最佳化。實測（本機 linux/amd64、AMD Ryzen 7 5700X 16 核、
   clang 22.1.8）hello 產生的 C 是 6,232,818 位元組，其中程式本身只有 1,530 位元組——也就是說每一次建置
   都在重編同一個標準庫，而 `-flto` 是那個把整份看進去的步驟：附錄 A.1 的 `web.teyru` 在本機 `-O2`
@@ -902,6 +902,38 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   `ConnectionTask`，於是 `String` 也會進閉包，每個程式都退回不剪。
   驗證是 `reflect_test.go` 的 `TestReflectReach`（產生的 C 帶哪些表、程式跑出來的答案）與
   `TestReflectReachFallsBack`（界算不出來時每張表都留著），加上 `go test ./...`。
+  **W13.3「生成的 C 拆成多個編譯單元、按 CPU 數平行編譯」已落地**：`internal/driver/cc.go` 把「一次
+  `cc` 帶著一整串來源、在一個行程裡一個檔一個檔編」換成「每個單元一次 `cc -c`、同時最多
+  `runtime.NumCPU()` 個、再一次連結」，兩個路徑都走它。單元是：`-O2` 的**程式整個編譯單元**
+  （`codegen.Emit`，標準庫在裡面）、執行期的七個檔案（能到 TLS 是八個）、`--native` 的來源；debug
+  另外是程式自己的單元（`EmitProgram`），標準庫是快取裡的 `prelude.o`（冷快取時它自己先編一次，
+  那是單一單元，本來就沒得平行）。**連結順序刻意保持原樣**（程式的單元、`prelude.o`、執行期），
+  所以同一支程式同一級別的執行檔**逐位元組相同**。
+  **LLVM 後端那條路也改了**：`compileLLVM` 的 `cc` 一樣是「一個行程編一整串來源」（模組＋執行期），
+  現在同樣是每個單元一次 `-c`、同時跑、再一次連結；模組那個單元帶 `-x ir`（呼叫端可以把檔案命名成
+  任何名字），而「模組不驗證」的診斷靠新的 `ccFailure` 把該單元自己的 stderr 帶回來才分得出來，
+  所以那條訊息沒有變。hello 的 LLVM 執行檔（`-O0` 81,728 B、`-O2` 59,760 B）前後逐位元組相同；
+  `scripts/backend-matrix.sh` 對 t146_reflect／t196_string_bytes／t84_sealed_switch／t133_arrow_blocks／
+  t260_eval_order 跑六格：0 分歧、0 非指名建置失敗（三格是 LLVM 既有的 TY-INT-0100 指名拒絕）。
+  **`-O2` 不拆生成的那一個單元**：webapp `-O2` 用會記錄起訖的 `cc` 包裝量到，63.9 s 裡 **LTO 連結
+  50.6 s**、整個程式那個單元自己 **12.7 s**、其餘七個執行期單元 0.06～0.51 s（八個同時起跑）；
+  拆那個單元只會動到那 12.7 s，而 LTO 連結要處理的 IR 一個位元組都不會少，所以政策不變
+  （單一單元＋LTO）。hello `-O2` 同一個量法：2.39 s 裡整個程式那個單元 1.39 s、LTO 連結 0.27 s。
+  **debug 變快**（本機 linux/amd64、Ryzen 7 5700X 16 執行緒、clang 22.1.8、暖快取、`/usr/bin/time -v`
+  量 `teyru build`、前後**交錯**各三次；這台機器同時被別的 agent 壓到 load 10～30，所以中位數只當方向，
+  不是精確值）：hello `-O0` 1.14→**0.76 s**、`-O1` 2.92→**2.13 s**；webapp `-O0` 1.69→**1.32 s**、
+  `-O1` 4.09→**3.07 s**；t146 `-O0` 1.87→**1.54 s**、`-O1` 5.35→**3.42 s**。分階段（同一支 hello
+  `-O0`，load 4～8）：`cc` 那一段 685→394 ms（同一台機器用 `/bin/true` 當 `cc` 量到的非編譯部分是
+  68 ms），總牆鐘 1109→655 ms。
+  **release 沒有回退**：九格（三支程式 × `-O0`／`-O1`／`-O2`）的執行檔**逐位元組相同**、大小一格沒變
+  （hello 151,976／128,216／80,000、webapp 8,567,064／7,264,576／9,079,856、t146 8,784,800／
+  7,425,104／9,694,296）。`-O2` 的牆鐘在 load 10～30 之下前後分不開（webapp 中位數 144.06 對
+  134.69 s、t146 87.60 對 72.06 s，兩邊都跨過雜訊），而**結構上沒有回退的機制**：那一格裡 80% 是
+  沒有改動的 LTO 連結，`-O2` 的執行檔也逐位元組相同。
+  **有測試盯著單元數與平行度**（先前一個都沒有）：`internal/driver/cc_test.go` 用一支只記錄起訖、
+  不編譯任何東西的假 C 編譯器量「同時幾個在跑」（`TestCompileUnitsParallel`，單元數取 4×CPU 以盯住
+  上限），並在真的建置裡盯住「每個單元恰好一次 `-c`、連結恰好一次、連結拿到的是目的檔而不是來源」
+  （`TestBuildCompilesEveryUnitSeparately`，`-O0` 與 `-O2` 各一次）。
   **重上之後的重量（本機 linux/amd64、16 核、`/usr/bin/time -v` 量 `teyru build`、三次取中位數，
   括號是當時的 load average）**：webapp `-O0` 暖 **1.85 s**（load 6.9；十秒目標達成）、`-O1` 暖 2.39 s；
   `-O2` **30.30 s** 對照不帶本支的 31.26 s、執行檔**逐位元組相同**（hello 67,240 B、webapp 5,399,568 B），
