@@ -432,6 +432,7 @@ func (e *llvmEmitter) run() {
 	// naming it is one whose vtable has to be real.
 	for _, cl := range []*ast.Class{
 		e.p.Builtins.NPE, e.p.Builtins.AIOOBE, e.p.Builtins.SIOOBE, e.p.Builtins.Arith, e.p.Builtins.CCE,
+		e.p.Builtins.IOOBE,
 		e.p.Builtins.NegArr, e.p.Builtins.Assertion, e.p.Builtins.IllArg,
 		e.p.Builtins.IllState, e.p.Builtins.NoSuchElem, e.p.Builtins.Unsup,
 		e.p.Builtins.IllMon, e.p.Builtins.ArrayStore, e.p.Builtins.SOE,
@@ -1656,6 +1657,7 @@ func (e *llvmEmitter) entry() {
 	}{
 		{"TY_NPE", e.p.Builtins.NPE}, {"TY_AIOOBE", e.p.Builtins.AIOOBE},
 		{"TY_SIOOBE", e.p.Builtins.SIOOBE},
+		{"TY_IOOBE", e.p.Builtins.IOOBE},
 		{"TY_SOE", e.p.Builtins.SOE},
 		{"TY_EIIE", e.p.Builtins.EIIE}, {"TY_NCDFE", e.p.Builtins.NCDFE},
 		{"TY_ERROR", e.p.Builtins.Err},

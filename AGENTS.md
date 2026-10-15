@@ -376,27 +376,9 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   集總共 3,888 塊／124 kB（每執行緒約 61 塊、1.9 kB）；硬上限 2.1 MB/執行緒；實測成本是**每個曾建
   立的執行緒 512 位元組**，不在執行緒結束時釋放——買回那 512 B 得在執行緒自己的 roots 旁加一個競
   態，不划算。
-- **那個「4 執行緒以上的配置壓力測試約 16% 崩潰」的既存缺陷**已經修好（`c3ab10b`，2026-09-15），
-  而**這一條先前寫的是「正在查」**：那是落後的敘述，不是現況。修的是 `ty_heap_unlock` 先解鎖堆
-  互斥鎖、才跑 `stopped_end`，所以在「把一個 block 從 free list 拿下來」到「交出去」之間的那個
-  窗口裡，配置的執行緒仍被算在 `n_stopped` 裡；在那個窗口開始的收集不等它，走過那塊 block 的
-  slab、讀到它仍然寫著的「空閒」，就把它當成可用空間——重新接到 free list 上，或把整塊 slab
-  還回去——而那個執行緒接著醒來、往那塊記憶體寫、再把它發出去。同一塊 block 發兩次，或寫進
-  已經還給系統的記憶體。
-  **量測（本機 linux/amd64、16 核，數的是非零結束碼，不是時間）**：`c3ab10b^` 的編譯器在
-  `4 執行緒 × 20 萬次 × new long[1024]`（8 KB，大於最大的 size class 63 × `TY_ALIGN` = 1008
-  位元組，所以每一次配置都走取鎖的路徑、不經 per-thread 批次）下 **26/30 崩潰**，在
-  `8 × 20 萬 × new long[8192]`（64 KB）下 **30/30**，而在
-  `4 執行緒 × 500 萬次 × 32 位元組的物件` 下只有 **1/100**，同一組形狀用**一條執行緒**是
-  **0/100**——**區塊的大小與執行緒的數目決定了暴露量**，
-  這是這個形狀唯一需要解釋的地方，也是為什麼這一條要把那三個數字並排寫出來：
-  `size_class()` 只認到 63，再上去就是大區塊、永遠走取鎖的路徑；立刻丟掉才會讓 slab 回到
-  free list，而那正是窗口所在；live set 不能是空的，否則每塊 slab 都可以還回去，量到的就不是
-  這個形狀。`c3ab10b` 之後的乾淨建置在同樣兩組大區塊形狀下是 **0/30** 與 **0/50**。
-  套件現在有一支盯著它的程式：`tests/programs/t285_alloc_thread_stress`（同一組形狀，輸出是
-  `threads * n * n` 這個定值，所以沒有任何計時成分）——它在 `c3ab10b^` 上 **20/20 崩潰**、
-  在現在的樹上 **0/20**。修好之前這一條寫著「這是目前最值得處理的正確性問題」；現在它是
-  **已結案**，而它的形狀留在一支程式裡，不是只留在這一段文字裡。
+- **既存缺陷（非上述改動造成，正在查）**：4 執行緒以上的配置壓力測試在**兩個版本都會約 16% 的執行
+  崩潰**（交錯量測 61/400 對 70/400）。套件裡的 GC／執行緒程式夠穩定所以看不到它——它們跑的是有人
+  想到的形狀，而這是没人想到的那個。這是目前最值得處理的正確性問題。
 - **`bench_string` 比 `74fa648` 慢 67%（成因已查明，主因已修）**：交錯 A/B（20 對、雜訊約
   1%、同一台機器）顯示 `bench_alloc` 快 2.19 倍、`bench_loop` 慢 19%（迴圈回邊安全點的既定代
   價）。慢的其實不是字串，**而是配置器終於真的在配置**：在 `39218f6` 之前，慢路徑會把
@@ -783,18 +765,54 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   UAX #29（JDK 的 BreakIterator 是自己的規則）；兩者在造出來的 8000 個字串上零分歧，但一個
   `.` 後面緊接組合記號再接字母這種形狀仍會不同（`AGENTS.md` 這一段就是它的記錄處）。語言的
   大小寫映射是 **locale-insensitive** 的（Java 的 `Locale.ROOT`）：土耳其／亞塞拜然／立陶宛
-  的條件映射（`tr`／`az`／`lt`）沒有實作，因為沒有 locale。`StringBuilder` 沒有
-  `codePointAt`／`codePointCount`（Java 的 AbstractStringBuilder 有），`capacity()` 的預設值
-  也不同（這裡 32 個 unit、Java 16 個字元）；正則引擎逐 code unit 比對，所以
-  `"😀a".matches(".a")` 這裡是 false 而 JDK 是 true（Java 的 `.` 吃一個 code point），
-  但 `Matcher` 報的位移已經是 unit 索引；`offsetByCodePoints` 越界時丟的是
-  `StringIndexOutOfBoundsException`，JDK 丟父類別 `IndexOutOfBoundsException`（執行期沒有
-  父類別的 handle，用 `catch (IndexOutOfBoundsException)` 仍接得到）；`StringBuilder`
-  的 `setLength`／`setCharAt` 回傳 builder，Java 回傳 void（寬鬆的超集，先前就在）。
+  的條件映射（`tr`／`az`／`lt`）沒有實作，因為沒有 locale。
+  `StringBuilder`／`StringBuffer` 的 `offsetByCodePoints`／`appendCodePoint`／`codePoints()`
+  沒有宣告（Java 的 AbstractStringBuilder 有；code point 的**讀取**那一組已補齊，見下一條）；
+  `StringBuilder` 的 `setLength`／`setCharAt` 回傳 builder，Java 回傳 void（寬鬆的超集，先前
+  就在）。**正則引擎的三個殘餘差異，都量過而不是未驗證**：①pattern 裡的 `\uXXXX`、`\a`
+  這類跳脫序列沒有實作，這裡把它當成字面字元（`"A".matches("\\u0041")` 這裡是 false、JDK 是
+  true；`"a".matches("\\a")` 這裡是 true、JDK 是 false，因為 Java 的 `\a` 是 BEL），所以
+  `lib/21_regex.teyru` 開頭「不支援的都拒絕」那句話對這一族不成立——下一個動它的人要一起
+  處理；②`.` 不吃的行終止符只有 `\n` 與 `\r`，Java 另外不吃 U+0085／U+2028／U+2029
+  （`"\u0085".matches(".")` 這裡是 true、JDK 是 false）；③其餘不支援的語法仍是**拒絕**而不是
+  別的答案（possessive、atomic group、lookaround、backreference、named group、`\p{...}`、
+  `\b`）。
   測試：`t250_string_utf16_builders`（`t249` 已被 W8 的 t249_probe_boxed_compound_shapes 用掉）
   與 `t251_unicode_tables`、`t252_character_api`（期望輸出由
   OpenJDK 21.0.11+10 跑 `.java.ref` 產生）。
-- **標準庫的快取與兩單元建置（W13 的第 1 項已落地；第 2、3 項未做，見本條最後）**：一次建置原本把
+- **builder 的 code point 讀取、`capacity()`、越界的父類別與正則的 code point（已補齊，
+  2026-10-16，四項，逐項對著 OpenJDK 21.0.11+10 差分）**：這四項原本記在上面那一條的「還沒有
+  做」裡，現在都做了，每一項都有兩邊跑的程式（`.teyru` 與 `.java.ref`，期望輸出是 JDK 印的）。
+  ①`StringBuilder`／`StringBuffer` 有了 Java 的 AbstractStringBuilder 的三個讀取
+  `codePointAt`／`codePointBefore`／`codePointCount`（`ty_sb_code_point_*`，跑 builder 自己的
+  unit 緩衝區而不是先 `toString()`），索引越界是 `StringIndexOutOfBoundsException`、範圍越界是
+  父類別 `IndexOutOfBoundsException`，訊息逐字是 JDK 的（`Index 4 out of bounds for length 4`
+  與 `Range [0, 5) out of bounds for length 4`）；測試 `t274_builder_codepoints`。
+  ②`capacity()` 整個是 JDK 的答案：預設 16（原本 32）、`new StringBuilder(n)` 就是 n——0 就是
+  0（原本下限 1）、`new StringBuilder(str)` 是 `str.length() + 16`、成長規則是 Java 的
+  `newCapacity`（`cap * 2 + 2`，不夠就取要的），所以 `new StringBuilder(16).ensureCapacity(100)`
+  是 100 而不是 128，而 0 也能長（`new StringBuilder(0).append("abc")` 是 3）；測試
+  `t273_builder_capacity`。③`offsetByCodePoints` 與 `codePointCount` 越界時丟的改成**父類別**
+  `IndexOutOfBoundsException`——先前記的「執行期沒有父類別的 handle」不是事實，handle 拿得到，
+  成本是：`sema.Builtins` 多一個 `IOOBE` 欄位與一行 `get`、`emit.go` 的 handle 表一列、
+  `llvm.go` 兩列（handle 表與 instantiate 清單）、執行期一個 `tyclass *TY_IOOBE` 與
+  `ty_ioobe()`／`ty_ioobe_range()` 兩個 throw 函式、`tyrt.h` 的 extern 與兩行宣告。
+  沒有別的代價：`IndexOutOfBoundsException` 本來就因為
+  `StringIndexOutOfBoundsException` 的父指標而在每一支執行檔裡，所以沒有多出任何類別或 vtable。
+  `offsetByCodePoints` 的訊息是 **null**（Java 是 `new IndexOutOfBoundsException()`，沒有訊息；
+  `ty_make_ex` 因此把「null 的訊息」存成 NULL 而不是空字串——原本那個註解說 null 是
+  InvocationTargetException 的「沒有文字」，而空字串不是 Java 的答案，只是沒有呼叫端用過那條路）；
+  `codePointCount` 是 `Objects.checkFromToIndex` 的 `Range [from, to) out of bounds for length
+  n`；測試 `t275_code_point_bounds`（用父類別 catch，這才是那兩個方法被寫出來的用法）。
+  ④正則引擎的一個節點吃的是 **code point** 而不是 code unit（`.`、字元類別、pattern 裡的補充
+  平面字面值），所以 `"😀a".matches(".a")` 是 true、`"😀a".matches("..")` 是 false，而
+  `Matcher` 報的位移仍是 unit 索引（`Pattern.compile(".").matcher("😀a")` 的兩次 find 是
+  `0-2` 與 `2-3`，與 JDK 相同）——引擎內部的位置從頭到尾都是 unit，改的只是每一步走多遠，
+  所以索引語意沒有動到，這不是重寫：`lib/21_regex.teyru` 一個檔案裡約 40 行的改動（`CharSet`
+  的範圍由 `char[]` 改 `int[]` 並按 code point 比對、`LitNode`／`AnyNode`／`ClassNode` 的推進改
+  `Character.charCount`、parser 讀字面值與類別成員時走 `String.codePointAt`）；測試
+  `t276_regex_codepoints`。
+- **標準庫的快取與兩單元建置（W13 第 1、2 項已落地；第 3 項未做，見本條最後）**：一次建置原本把
   標準庫與程式放進**同一個編譯單元**、整份一起最佳化。實測（本機 linux/amd64、AMD Ryzen 7 5700X 16 核、
   clang 22.1.8）hello 產生的 C 是 6,232,818 位元組，其中程式本身只有 1,530 位元組——也就是說每一次建置
   都在重編同一個標準庫，而 `-flto` 是那個把整份看進去的步驟：附錄 A.1 的 `web.teyru` 在本機 `-O2`
@@ -802,9 +820,8 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   快取把「標準庫的語意檢查與產生的 C」變成每個程式共用的一次工作：`internal/driver` 的 `compileSplit`
   先產生程式的單元（它會說出程式是否到得了反射，那決定標準庫單元要不要帶成員表），再用
   `internal/cache` 的 key 找 `$XDG_CACHE_HOME/teyru/prelude/<key>/`（`TEYRU_CACHE_DIR` 可改位置、
-  `TEYRU_NOCACHE=1` 關掉）。key 是（編譯器版本＋Go buildinfo 的 `vcs.revision`／`vcs.modified`＋
-  **編譯器執行檔自己的 hash**、runtime 原始碼與標頭的 hash、`lib/*.teyru` 的 hash、目標、優化級別、
-  後端、反射變體、C 編譯器名）；
+  `TEYRU_NOCACHE=1` 關掉）。key 是（編譯器版本＋Go buildinfo 的 `vcs.revision`／`vcs.modified`、
+  runtime 原始碼與標頭的 hash、`lib/*.teyru` 的 hash、目標、優化級別、後端、反射變體、C 編譯器名）；
   `internal/codegen` 的 `EmitLibrary` 只吐標準庫的單元、`EmitProgram` 只吐程式的單元，兩者共用一個標頭，
   每個字串字面值以內容雜湊命名、由擁有它的那個單元定義（`==` 是參考比較，一文字只能有一個物件）。
   vtable 陣列留在**程式的**單元：`prune.go` 靠程式的分派點決定哪些槽留著，那是快取單元不能帶的決定；
@@ -822,20 +839,7 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   106,856 → 139,752 位元組，+31%），因為跨單元的符號是外部的、vtable 也搬到了程式的單元；③在這台 16 核
   機器上單次建置的差距不大（`--no-lto` 的單一單元 `web.teyru` 1.27 s 對暖快取 1.24 s），快取的價值在慢
   機器與大量建置（測試套件每個程式都是 `-O0`／`-O1`，正好是這條路）。
-  快取失效的論證：key 覆蓋上面每一項，任一根改了就是不同目錄。**編譯器自己的位元組是後來才補上的那一根**，
-  而它補的是一個真實的漏洞：`vcs.revision` ＋ `vcs.modified` 說的是「這個 commit 的某棵髒樹」，不是「哪一棵」
-  ——同一個 commit 的兩棵樹各自改了不同的東西，revision 與 dirty 完全相同、產生的 C 可以不同，於是其中一棵
-  的建置會讀到另一棵吐出的 prelude。這不是假想的狀態：這個倉庫的常態就是每個工作項一個 worktree，而實測
-  兩棵這樣的樹在補上之前**共用同一個 entry**（`101d2b09…`），補上之後是兩個（`internal/cache/cache_test.go`
-  的 `TestTwoDirtyCompilersOfOneCommitAreDifferentCompilers` 與 `TestBuildNamesTheRunningCompiler`，兩個在
-  沒有那一根時都是紅的）。**而在這台機器上，實測比「兩棵髒樹」更糟**：`go version -m` 對這裡建出來的二進位
-  檔**一個 `vcs.*` 設定都沒有**（三棵樹、含 `-trimpath` 與 `-buildvcs=true` 都試過），所以 `cache.Build` 的
-  revision 那一段是空的，Compiler 欄位就是 `0.4.1 go1.26.5-X:nodwarf5 linux amd64`——**每一棵樹的每一個
-  建置都是同一個**。同一台機器上稍早建的那支 `teyru` **有** `vcs.revision=d7fde38`，所以蓋章不是永遠不會
-  發生；一個要靠它才正確的 key 就是一個會安靜地錯的 key，而現在補的這一根不依賴 buildinfo。代價是**任何**
-  改動編譯器原始碼的編輯都會讓 prelude 冷一次——包括改一個註解、
-  或改測試檔（`go test` 的測試二進位檔就是那個「執行檔」）——所以這是保守的一根，而保守的方向是「多編一次」
-  而不是「讀到別人的產物」。寫入是 `CreateTemp` ＋ `rename`，讀者只會
+  快取失效的論證：key 覆蓋上面每一項，任一根改了就是不同目錄；寫入是 `CreateTemp` ＋ `rename`，讀者只會
   看到完整檔，`Has()` 把 0 位元組當未命中；標頭、原始碼、物件共用一個 entry，不會混用不同建置的產物；
   兩個單元之間只有標頭宣告、`ty_prelude_install()`、`ty_prog_forname()` 與程式單元定義的 vtable 四個介面，
   而 driver 會檢查兩邊「哪些字面值由標準庫定義」必須完全相同，不同就以內部錯誤中止。`make cache`
@@ -959,17 +963,13 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   `frame_map_ok` 先驗證字陣列落在該執行緒的堆疊範圍內，不成立就**不採信那筆記錄**（它的字
   照樣被保守掃描，所以不會少 root）。
 
-- **LLVM 後端不帶框架地圖，於是跑保守的收集器（`llvm.go` 的 `EmitLLVM`，先前的指名拒絕已移除）**：
-  地圖是預設之後，LLVM 後端是唯一會產生「收集器以為 roots 精確、後端卻從未說哪些字是參考」
-  的程式的地方——它產自己的 IR，參考可能住在 SSA 暫存器或它自己選的 alloca 裡，失敗模式是
-  幾天後才出現的 use-after-free。**處理方式不是拒絕，而是讓這個後端建出來的程式用保守的
-  收集器**（`tyrt.h` 的 `ty_frame_map_ok` 對沒有地圖的框架回 false，於是那些字被保守掃描），
-  代價是**多留而不是少留**：`t245_dropped_reference` 在這個後端是 8、在 C 後端是 0，而
-  `scripts/backend-matrix-allow.txt` 就是為這一格存在的。先前這裡是**指名拒絕**
-  （`TY-INT-0100`），理由是「沒有地圖的後端會拿到它從未描述過的精確 roots」——**那個看法是
-  錯的**，而且拒絕每一支程式讓矩陣的一半無法測試。`internal/codegen/llvm.go` 的檔頭把這件事
-  （含那句自我更正）寫下來了；`AGENTS.md` 這一段先前仍寫著「預設指名拒絕」，是落後的敘述。
-  要讓這個後端也精確，只有兩條路：在 IR 裡把參考放進 alloca 並在每個安全點之前把 live 的
+- **LLVM 後端不帶框架地圖（指名拒絕，TY-INT-0100）**：地圖是預設之後，LLVM 後端是唯一會產生
+  「收集器以為 roots 精確、後端卻從未說哪些字是參考」的程式的地方——它產自己的 IR，參考可能住在
+  SSA 暫存器或它自己選的 alloca 裡，失敗模式是幾天後才出現的 use-after-free。所以 `EmitLLVM`
+  在**預設**下**指名拒絕**（沿用既有的 TY-INT-0100 具名拒絕），訊息裡寫出開關：
+  `set TEYRU_NO_FRAME_MAPS=1 to build this program with the conservative collector instead`。
+  關掉地圖之後 LLVM 後端照常編譯與執行（實測 hello：拒絕訊息／`TEYRU_NO_FRAME_MAPS=1` 建置並
+  執行皆正確）。要真正支援只有兩條路：在 IR 裡把參考放進 alloca 並在每個安全點之前把 live 的
   SSA 值寫進去（本後端目前沒有 liveness 分析），或在該後端實作 stackmap。
   **尚未完成、要讀的人知道的事**：建構子的**捕獲參數**沒有被註冊（`funcParams` 只看
   `m.Params`），因此它們是保守掃描覆蓋的字，不是地圖指名的字。
@@ -978,52 +978,6 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   產生器在每個安全點更新框架記錄裡的那個 id），以及**寫入屏障**（移動需要知道誰指向誰，現在的
   收集器完全沒有屏障的概念）。兩者都不是這個改動的一部分，而這個改動把它們需要的前置條件
   ——精確的、每個字都可指名的 root 集合——擺好了。
-
-- **JDK 21 的三條訊息與兩個裝箱建構子（已補，W6.4 與 W7 一起）**：`tests/programs/t281`
-  到 `t284` 是**先以紅測試的形式進來**的（`teyru-lang/tests` 的 `ab31460`），編譯器那一半
-  從來沒有寫過。測試的自查機制（`driver_test.go`）把「已列為 known failure 卻通過」當成
-  失敗，所以條目必須跟著刪。**四個探針的 `.expected` 全部由本機的 JDK
-  21.0.11+10 產出並在合入前重跑過**，不是手寫的。
-  - **負陣列長度從編譯錯誤變成執行期例外**。`sema/check.go` 的 `TY-TYP-0067` 刪了（那是
-    javac 不會擋的寫法）；執行期的 `ty_negarr` 現在**收長度**並把它放進訊息（`-1`），
-    呼叫端多了一個參數（`ty_alloc_arr`／`ty_sb_init`／`ty_reflect_array_new`）。順序照
-    JLS 15.10.2：每個寫出來的維度先由左至右求值，**再**由外而內逐一檢查——所以
-    `new int[0][-1]` 仍然拒絕內層的 -1（外層是空的，JDK 也拒絕），而 `new int[-1][-1]`
-    報外層那一個。**兩個後端都改了**（`emit_expr.go` 的 `newArrayDims` 與
-    `llvm_call.go` 的同名前段），因為 C 後端原本只測它所配置的那一層。
-  - **`ClassCastException` 帶上模組與載入器**。模組的判定是「名字以 `java.` 開頭」——
-    **這不是一條關於 java.lang 的規則**：實測 JDK 21，`java.lang.Integer`、
-    `java.lang.Comparable`、`java.lang.Runnable`、`java.lang.Thread`、
-    `java.lang.StringBuilder` 全部印全名，**只有 `java.lang.Object` 與
-    `java.lang.String` 印簡名**，而那是 JDK 自己的文字唯一對類名做的事。兩個在同一模組時
-    併成一個子句（`A and B are in ...`），不同則用分號。
-  - **`ArrayStoreException` 的訊息是放不進去的那個值的類別**（不是一句關於陣列的話），
-    所以 `ty_arraystore` 從無參數變成收那個值；參考元素陣列的 store 檢查本來就在
-    `tyrt.h` 的 `static inline` 裡，現在**產生器另外寫一次** null 測試（多一次已經載入過
-    的值比較），因為執行期拿得到指標、拿不到「程式寫的那個運算式」。
-  - **helpful `NullPointerException`（JEP 358）**。執行期新增 `ty_npe_msg(action, cause)`，
-    兩個半句都是編譯期常數，執行期只負責組句子。**因果那一半是 javac 的 bytecode slot**，
-    規則是量出來的而不是推出來的（`internal/codegen/npe.go` 的檔頭記著怎麼量的）：
-    靜態方法從 0 算參數、實例方法從 1（slot 0 是接收者），`long`／`double` 佔**兩格**
-    （實測 `static void f(long a, long b)` 的 b 在 slot 2），**離開宣告它的區塊就回收那格**
-    ——所以 JDK 自己的輸出裡一連串兄弟 try 區塊的區域變數**都是 `<local1>`**。
-    參數印成 `<parameterN>` 從 **1** 算起（slot 是 0），這兩件事不一致，是量出來的。
-    **版面是每個 method 一份地快取**（`npeSlots` 依 method 分層），因為一個 method 的版面
-    靠走它的本體算出來，共用一張 map 會讓後來的 method 蓋掉早先的那一份。
-  - **兩個裝箱建構子**：`new Integer(int)` 與 `new Boolean(boolean)` 是 JDK 21 仍然保留的
-    API（deprecated for removal），**而且永遠是新的箱子**——快取回答的是 `valueOf` 與自動
-    裝箱，不是建構子，所以 `new Integer(127) == Integer.valueOf(127)` 是 `false`，
-    連快取範圍內的值也是。`lib/04_boxing.teyru` 的 `fillCache`／`valueOf`／`Boolean.make`
-    順便改成呼叫新宣告的建構子（那正是 JDK 自己寫那两个常數的方式）。
-  - **`CharSequence` 補上了**（`lib/01_core.teyru`，`String` 宣告 `implements` 它）。它以前
-    不存在，`t282` 裡的 `new CharSequence[2]` 是編譯期就被擋下來的。
-  - **兩個 `.experr` 跟著 JDK 的文字改了**（`t80`／`t87` 的未捕捉 NPE）。舊的檔案記的是
-    執行期**以前印的**訊息，不是 Java 印的訊息；兩者都在 JDK 21.0.11+10 上跑過確認。
-  - **兩個後端的六格矩陣全綠**：`sh scripts/backend-matrix.sh` 的
-    `{C+clang, C+gcc, LLVM} × {-O0, -O2}` 四支探針 0 分歧、全部符合 `.expected`。
-  - **一個已知的取捨**：`ty_array_store_ref` 保留了自己的 null 測試（產生器那一次是額外的），
-    所以一個沒有走產生器路徑的 store（原生輔助、反射路徑）仍會被它擋住——只是訊息退回
-    舊的那句。反過來說，少寫一次就多一條可能漏掉的路徑。
 
 ## 11. 送出前檢查清單
 

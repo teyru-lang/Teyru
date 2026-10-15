@@ -37,6 +37,11 @@ type Builtins struct {
 	// IndexOutOfBoundsExceptions, and neither is the other. The runtime throws
 	// it, so it is a builtin rather than just a prelude class.
 	SIOOBE *ast.Class
+	// IndexOutOfBoundsException, the parent of the two above: String's
+	// offsetByCodePoints and codePointCount throw it rather than the string
+	// subclass, and the runtime builds the object, so it is a builtin for the
+	// same reason SIOOBE is.
+	IOOBE *ast.Class
 	// StackOverflowError: what the prologue check every generated function
 	// begins with throws when the frame it is about to run is past the thread's
 	// stack limit. The runtime builds the object, so it is a builtin like the
@@ -504,6 +509,7 @@ func (c *Checker) initBuiltins() {
 		ArrayStore: get("ArrayStoreException"),
 		NPE:        get("NullPointerException"), AIOOBE: get("ArrayIndexOutOfBoundsException"),
 		SIOOBE:        get("StringIndexOutOfBoundsException"),
+		IOOBE:         get("IndexOutOfBoundsException"),
 		SOE:           get("StackOverflowError"),
 		EIIE:          get("ExceptionInInitializerError"),
 		NCDFE:         get("NoClassDefFoundError"),

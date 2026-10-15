@@ -366,13 +366,16 @@ void *ty_illegal_state(const char *msg) { return ty_make_ex(TY_ILLSTATE, msg); }
 
 /* ---- exceptions with a message ----------------------------------------- */
 
+/* The class, a message, and a cause. A null message stays null rather than
+   becoming the empty string: Java's no-argument constructor leaves the field
+   alone and getMessage answers null for it, which is what an exception the
+   runtime throws with nothing to say -- String.offsetByCodePoints' index check
+   is one -- has to answer too. */
 void *ty_make_ex(tyclass *c, const char *msg) {
   tyobj *o = (tyobj *)ty_alloc(sizeof(tyobj) + 2 * sizeof(void *));
   o->cls = c;
-  /* A null message is a message: java.lang.reflect's InvocationTargetException
-     carries the cause and no text of its own, and Java's getMessage answers
-     null for it. ty_str_new treats a null byte string as an empty one. */
-  ((void **)((char *)o + sizeof(tyobj)))[0] = ty_str_new(msg, msg ? (int64_t)strlen(msg) : 0);
+  ((void **)((char *)o + sizeof(tyobj)))[0] =
+      msg ? ty_str_new(msg, (int64_t)strlen(msg)) : NULL;
   ((void **)((char *)o + sizeof(tyobj)))[1] = NULL;
   return o;
 }
@@ -424,23 +427,34 @@ int32_t ty_enum_compare(void *a, void *b) { return ty_enum_ordinal(a) - ty_enum_
 /* ---- StringBuilder ----------------------------------------------------- */
 
 /* The builder's buffer holds code units (tyrt.h says why), so `len` counts
-   units, `cap` is a capacity in units, and growing doubles it. Java's
-   default capacity is 16; this one starts at 32 units, four times the bytes
-   the old byte buffer held and the same number of characters. */
+   units and `cap` is a capacity in units. Java's default capacity is 16,
+   which is what `new StringBuilder().capacity()` answers. */
 void *ty_sb_new(void) {
   tySB *sb = (tySB *)ty_alloc(sizeof(tySB));
   sb->len = 0;
-  sb->cap = 32;
+  sb->cap = 16;
   sb->buf = (uint16_t *)malloc((size_t)sb->cap * sizeof(uint16_t));
   return sb;
 }
 
 /* Room for `extra` more units. Every mutator in both files grows through this
-   one, so the doubling rule and the size it is applied to are in one place. */
+   one, so the growth rule and the size it is applied to are in one place. The
+   rule is Java's newCapacity: double the capacity and add two, or take the
+   size that was asked for when the doubling is not enough. Both halves are
+   observable through capacity() -- the `+ 2` is what lets a builder that
+   started at zero grow at all, and "take the ask" is what makes
+   `new StringBuilder(16).ensureCapacity(100)` answer 100 and not 128. The
+   doubling is done unsigned because a capacity large enough to wrap it is one
+   no allocation could have produced; a wrapped value is simply not larger
+   than the ask, so the ask wins and the arithmetic stays defined. */
+static int64_t sb_grown(int64_t cap, int64_t want) {
+  int64_t grown = (int64_t)((uint64_t)cap * 2 + 2);
+  return grown > want ? grown : want;
+}
 void ty_sb_reserve(void *p, int64_t extra) {
   tySB *sb = (tySB *)p;
   if (extra <= 0 || sb->len + extra <= sb->cap) return;
-  while (sb->len + extra > sb->cap) sb->cap *= 2;
+  sb->cap = sb_grown(sb->cap, sb->len + extra);
   sb->buf = (uint16_t *)realloc(sb->buf, (size_t)sb->cap * sizeof(uint16_t));
 }
 
