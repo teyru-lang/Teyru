@@ -55,7 +55,6 @@ type Emitter struct {
 	sideLib  bool     // whether the class being emitted belongs to the prelude
 	lib      bool     // whether this emitter is the library's unit
 	metaInit []string // the assignments that attach them at startup
-	libMeta  []string // the same, for the prelude classes, in the library unit
 	// vts collects the vtable arrays of a split build (see emitClassMeta), and
 	// forName the class table Class.forName searches (see forNameTable). Both
 	// belong to the program's unit whatever class they name, so they are
@@ -74,6 +73,15 @@ type Emitter struct {
 	litPrelude  map[string]bool
 	libLiterals []string
 	reflectUsed bool // whether any call site asks for reflection
+	// reflTables and reflNames are the classes the member tables and the class
+	// table Class.forName searches have to cover, from the reachability scan in
+	// reflectset.go. A nil set is every class, which is what a path that never
+	// ran the scan -- the llvm back end's one-off emitter -- gets.
+	reflTables *reflectSet
+	reflNames  *reflectSet
+	// noTables suppresses both tables entirely, for the standard library's own
+	// unit: in a split build every table is the program's (see enterTables).
+	noTables    bool
 	fnTry       bool // whether the function being emitted contains a try statement
 	strings     map[string]int
 	strOrder    []string
@@ -241,15 +249,6 @@ type Library struct {
 	Literals []string
 }
 
-// LibraryOptions are what the prelude's translation unit depends on besides
-// the prelude itself.
-type LibraryOptions struct {
-	// Reflect is whether the program can reach reflection: a program that can
-	// needs the standard library's member tables, which are the bulk of a
-	// reflecting build, and one that cannot must not pay for them.
-	Reflect bool
-}
-
 // PreludeHeader is the name the library's header and unit are given.
 const preludeHeader = "typrelude.h"
 
@@ -257,16 +256,22 @@ const preludeHeader = "typrelude.h"
 // must be a program whose files are all standard library files (the driver
 // checks the prelude alone; see internal/driver).
 //
-// What comes out depends on the prelude, the options, and nothing else: an
-// executable's behaviour does not depend on the program's own classes except
-// through the declarations the program's unit makes, and the point of this
-// function is that the same bytes come out for every program that shares a
-// prelude. That is what makes caching it sound, so it is a property to keep:
-// nothing here may read anything the program contributed.
-func EmitLibrary(p *sema.Program, o LibraryOptions) Library {
+// What comes out depends on the prelude and nothing else: an executable's
+// behaviour does not depend on the program's own classes except through the
+// declarations the program's unit makes, and the point of this function is that
+// the same bytes come out for every program that shares a prelude. That is what
+// makes caching it sound, so it is a property to keep: nothing here may read
+// anything the program contributed. Reflection does not break it: neither table
+// is written here (see below).
+func EmitLibrary(p *sema.Program) Library {
 	e := newEmitter(p, &unit{}, true)
 	e.lib = true
-	e.reflectUsed = o.Reflect
+	// Neither table is written here, whatever class it belongs to. A member
+	// table names the class's methods -- its invokers call them -- and the class
+	// table Class.forName searches names classes the program declares, so both
+	// belong to the program that reflects, and this unit is compiled once and
+	// shared by every program (see enterTables and reflectset.go).
+	e.noTables = true
 	e.runFull()
 	sort.Strings(e.libLiterals)
 	return Library{
@@ -293,11 +298,7 @@ func Prune(library, program string) (string, Link) {
 // what the standard library's unit has to be built with for it.
 type Program struct {
 	Source string
-	// Reflect is whether the program can reach reflection. A program that can
-	// needs the standard library's member tables, which are the bulk of a
-	// reflecting build, and one that cannot must not carry them.
-	Reflect bool
-	Link    Link
+	Link   Link
 	// PreludeLiterals are the string literals the standard library's bodies use,
 	// and so the ones its unit defines (see strLit). The program's unit refers
 	// to them and defines the rest, which is what keeps one literal one object
@@ -306,9 +307,12 @@ type Program struct {
 }
 
 // EmitProgram emits a program's own translation unit: the program's classes, the
-// vtables of every class, the class table Class.forName searches, and the entry
-// point. It is compiled against a library emitted by EmitLibrary for the same
-// prelude.
+// vtables of every class, the member tables and the class table Class.forName
+// searches -- for the classes the reflection reachability scan kept, and for the
+// standard library's classes as well as the program's own, since a unit
+// compiled once cannot carry a table only a reflecting program needs (see
+// reflectset.go) -- and the entry point. It is compiled against a library
+// emitted by EmitLibrary for the same prelude.
 //
 // The unit includes the library's header, so everything the standard library
 // defines is visible to it, and the standard library's own definitions are in
@@ -322,7 +326,7 @@ func EmitProgram(p *sema.Program) Program {
 	out.WriteString("/* generated by the Teyru compiler: the program */\n#include \"" + preludeHeader + "\"\n\n")
 	out.WriteString(e.unitText(e.own, true))
 	sort.Strings(e.libLiterals)
-	return Program{Source: out.String(), Reflect: e.reflectUsed, Link: e.linkForProgram(), PreludeLiterals: e.libLiterals}
+	return Program{Source: out.String(), Link: e.linkForProgram(), PreludeLiterals: e.libLiterals}
 }
 
 // linkForProgram answers what linking the program needs, which is the question
@@ -472,6 +476,12 @@ func (e *Emitter) runFull() {
 		e.enter(cl)
 		e.declareClass(cl)
 	}
+	// Which classes the reflection tables have to cover, before any of them is
+	// written: the scan reads the whole tree, and a table the scan leaves out
+	// is never emitted (see reflectset.go).
+	if !e.noTables {
+		e.reflTables, e.reflNames = e.reflectionReach()
+	}
 	// A class's object is named by the tables of other classes -- a field's
 	// type, a method's return type, the interface list of a subclass -- so
 	// every one of them is declared before any of them is defined. Two
@@ -528,10 +538,12 @@ func (e *Emitter) runFull() {
 }
 
 // emitLibraryInstall writes the function that wires the standard library into a
-// split build's startup: the collector roots its static fields hold, and the
-// member tables its classes are handed. The program's entry point calls it,
-// which is what makes the library's unit independent of the program it is
-// linked into: nothing here names anything the program contributed.
+// split build's startup: the collector roots its static fields hold. The
+// program's entry point calls it, which is what makes the library's unit
+// independent of the program it is linked into: nothing here names anything the
+// program contributed. The member tables are not here -- a table is the
+// program's whatever class it belongs to (see enterTables), and the program's
+// entry point attaches the ones it has.
 func (e *Emitter) emitLibraryInstall() {
 	if !e.lib {
 		return
@@ -539,11 +551,6 @@ func (e *Emitter) emitLibraryInstall() {
 	var b strings.Builder
 	b.WriteString("\nvoid ty_prelude_install(void) {\n")
 	b.WriteString(e.clinitRefs(true))
-	if e.reflectUsed {
-		for _, line := range e.libMeta {
-			b.WriteString("  " + line + "\n")
-		}
-	}
 	b.WriteString("}\n")
 	e.own.code.WriteString(b.String())
 	e.headerDecls += "\nvoid ty_prelude_install(void);\n"
@@ -902,16 +909,25 @@ func (e *Emitter) emitClassMeta(cl *ast.Class) {
 	}
 	// The reflection tables, which is what java.lang.reflect reads. They are
 	// written here, with the class, because a reader of the generated C should
-	// find a class's metadata in one place.
+	// find a class's metadata in one place -- and only for the classes the
+	// reflection reachability scan kept, which is every class the program's
+	// reflection can actually ask for (see reflectset.go). A class the scan
+	// dropped keeps the null table its record was written with.
 	// The class's own annotations go to the startup-attached group with the
 	// member tables: an annotation names its type, so naming one in the class
 	// object would pin that type's object into every program.
-	annsTbl, nannos := e.emitAnnoTable(mangle(cl.Full), annoListOf(cl))
-	if annsTbl != "NULL" {
-		e.attach(cl, "annos", annsTbl, "tyannotation", nannos, "nannos")
+	annsTbl, fieldsTbl, methodsTbl := "NULL", "NULL", "NULL"
+	nannos := 0
+	if e.covers(cl) {
+		restore := e.enterTables()
+		annsTbl, nannos = e.emitAnnoTable(mangle(cl.Full), annoListOf(cl))
+		if annsTbl != "NULL" {
+			e.attach(cl, "annos", annsTbl, "tyannotation", nannos, "nannos")
+		}
+		fieldsTbl = e.emitFieldTable(cl)
+		methodsTbl = e.emitMethodTable(cl)
+		restore()
 	}
-	fieldsTbl := e.emitFieldTable(cl)
-	methodsTbl := e.emitMethodTable(cl)
 	constsTbl := e.emitConstTable(cl)
 	flagsExpr := fmt.Sprint(flags)
 	if cl.Decl != nil && cl.Decl.Kind == ast.KindRecord {

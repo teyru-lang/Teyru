@@ -369,12 +369,12 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	if !opts.KeptTemp {
 		defer os.RemoveAll(rtDir)
 	}
-	// The program's unit first: what it asks for -- reflection, above all --
-	// is what the standard library's unit has to carry, and the cache entry is
-	// keyed by it.
+	// The program's unit first: it is where the reflection tables go, whatever
+	// class they belong to, and both units have to agree on which of them
+	// defines a string literal, which is what the second argument is for.
 	start := time.Now()
 	unit := codegen.EmitProgram(prog)
-	entry := preludeEntry(tgt, opt, cc, unit.Reflect)
+	entry := preludeEntry(tgt, opt, cc)
 	if opts.Verbose {
 		fmt.Fprintf(os.Stderr, "teyru: the program's unit: %s\n", time.Since(start).Round(time.Millisecond))
 		start = time.Now()
@@ -494,7 +494,7 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	if diags.HasErrors() {
 		return "", "", fmt.Errorf("the standard library does not check on its own: %s", diags.String())
 	}
-	lib := codegen.EmitLibrary(pa, codegen.LibraryOptions{Reflect: unit.Reflect})
+	lib := codegen.EmitLibrary(pa)
 	if !sameStrings(lib.Literals, unit.PreludeLiterals) {
 		return "", "", fmt.Errorf("internal error: the standard library's string literals and the program's unit disagree "+
 			"(%d against %d); a literal is one object only if both agree which unit defines it. This is a compiler bug",
@@ -551,7 +551,7 @@ const preludeHeader = "typrelude.h"
 
 // preludeEntry is the cache entry the standard library's unit and object live
 // in for one build's settings.
-func preludeEntry(tgt *target, opt, cc string, reflect bool) *cache.Entry {
+func preludeEntry(tgt *target, opt, cc string) *cache.Entry {
 	return cache.Open().Lookup(cache.Key{
 		Compiler: cache.Build(version),
 		Runtime:  runtimeHash(tgt),
@@ -559,11 +559,12 @@ func preludeEntry(tgt *target, opt, cc string, reflect bool) *cache.Entry {
 		Target:   tgt.name,
 		Opt:      opt,
 		Backend:  BackendC,
-		// What the artifact depends on that is not in the sources: whether the
-		// program can reach reflection, which decides whether the member tables
-		// ship, and which C compiler built it, because two compilers produce
-		// different objects from the same source.
-		Variant: fmt.Sprintf("reflect=%v cc=%s", reflect, filepath.Base(cc)),
+		// What the artifact depends on that is not in the sources: which C
+		// compiler built it, because two compilers produce different objects
+		// from the same source. Reflection is not one of them any more: neither
+		// reflection table is written into the library's unit, so one entry
+		// serves every program (see codegen.EmitLibrary).
+		Variant: fmt.Sprintf("cc=%s", filepath.Base(cc)),
 	})
 }
 

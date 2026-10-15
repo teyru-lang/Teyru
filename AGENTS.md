@@ -830,7 +830,7 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   的範圍由 `char[]` 改 `int[]` 並按 code point 比對、`LitNode`／`AnyNode`／`ClassNode` 的推進改
   `Character.charCount`、parser 讀字面值與類別成員時走 `String.codePointAt`）；測試
   `t276_regex_codepoints`。
-- **標準庫的快取與兩單元建置（W13 的第 1 項已落地；第 2、3 項未做，見本條最後）**：一次建置原本把
+- **標準庫的快取與兩單元建置（W13 的第 1、2 項已落地；第 3 項未做，見本條最後）**：一次建置原本把
   標準庫與程式放進**同一個編譯單元**、整份一起最佳化。實測（本機 linux/amd64、AMD Ryzen 7 5700X 16 核、
   clang 22.1.8）hello 產生的 C 是 6,232,818 位元組，其中程式本身只有 1,530 位元組——也就是說每一次建置
   都在重編同一個標準庫，而 `-flto` 是那個把整份看進去的步驟：附錄 A.1 的 `web.teyru` 在本機 `-O2`
@@ -840,7 +840,8 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   `internal/cache` 的 key 找 `$XDG_CACHE_HOME/teyru/prelude/<key>/`（`TEYRU_CACHE_DIR` 可改位置、
   `TEYRU_NOCACHE=1` 關掉）。key 是（編譯器版本＋Go buildinfo 的 `vcs.revision`／`vcs.modified`＋
   **編譯器執行檔自己的 hash**、runtime 原始碼與標頭的 hash、`lib/*.teyru` 的 hash、目標、優化級別、
-  後端、反射變體、C 編譯器名）；
+  後端、C 編譯器名）；`reflect=` 這個維度**在 W13.2 之後拿掉了**，理由見下面那一條：標準庫的單元
+  不再隨程式是否反射分岔，所以一個 entry 服務每一個程式。
   `internal/codegen` 的 `EmitLibrary` 只吐標準庫的單元、`EmitProgram` 只吐程式的單元，兩者共用一個標頭，
   每個字串字面值以內容雜湊命名、由擁有它的那個單元定義（`==` 是參考比較，一文字只能有一個物件）。
   vtable 陣列留在**程式的**單元：`prune.go` 靠程式的分派點決定哪些槽留著，那是快取單元不能帶的決定；
@@ -876,10 +877,31 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   兩個單元之間只有標頭宣告、`ty_prelude_install()`、`ty_prog_forname()` 與程式單元定義的 vtable 四個介面，
   而 driver 會檢查兩邊「哪些字面值由標準庫定義」必須完全相同，不同就以內部錯誤中止。`make cache`
   （`scripts/cache-check.sh`）把這些變成可執行的檢查，release workflow 會呼叫它。
-  **未做**：第 3 項「反射中繼資料只給實際需要的類別」——今天只要 `reflectUsed` 就為全部類別（含 665 個
-  標準庫類別與 lambda）產生成員表，反射程式的 C 因此從 6.2 MB 漲到 11.4 MB：實測 `tests/programs/t146_reflect`
-  的執行檔 `-O2` 是 5,272,032 位元組、`-O0` 是 5,441,904 位元組（hello 是 66,808）。縮減需要「反射可達
-  類別」的種子＋閉包分析（`Class.forName` 會讓所有類別可達，是這件事真正難的地方），留給下一輪。
+  **W13.2「反射中繼資料只給實際需要的類別」已落地**（`internal/codegen/reflectset.go`）：成員表（`fds_*`／
+  `mds_*`／每個方法一支 invoker）與 `Class.forName` 的類別表只為「反射真的到得了」的類別產生，其餘完全不寫。
+  一張沒寫的表不是小一點的執行檔而是錯的答案——那個類別會答空的成員表——所以這份分析必須是**上近似**：
+  形狀看不透就放大成「所有類別」，不是給一個小集合。兩個表都由**程式單元**持有（`enterTables`），標準庫的
+  單元一張都不帶，所以快取的標準庫不再隨「程式是否反射」分岔：cache key 的 `reflect=` 維度因此拿掉，
+  同一個 entry 服務所有程式。實測（本機 linux/amd64、clang 22.1.8）：`tests/programs/t146_reflect` 的執行檔
+  `-O2` **9,694,296 → 1,626,232** 位元組、`-O0` **8,784,800 → 1,215,592**（hello `-O2` 80,000 不變）；
+  t146 產生的 C 由 18,057,763 降到 12,618,776 位元組，其中 `mds_*` 由 663 張降到 9 張、`forname_all` 由
+  671 個類別降到 2 個。
+  分析怎麼做（`reflectset.go` 的檔頭有完整論證）：查詢點是會讀表的呼叫（`Class` 的成員存取子、`Field`／
+  `Method`／`Constructor`／`Parameter`／`Annotation` 的每個方法、`Class.forName`），接收者可能的類別由一套
+  來源規則算——類別字面值指名一個類別、`getClass()` 指到靜態型別與它底下所有子類別、`Class` 變數取所有被寫入的
+  值、反射存取子（`getType`／`getReturnType`／`getParameterTypes`／`getSuperclass`／`getDeclaringClass`…）
+  往它出來的類別追；**跟不下去的一律放大成所有類別**。`Class.forName` 的引數只認編譯期讀得出來的名字
+  （字面值、`static final String`、兩者的串接）：讀不出來的名字等於排除不掉任何類別，類別表保持全部。
+  標準庫自己的反射（`Validation`、`Gson`／`JsonBinding`、`ApplicationContext`、`RouteScanner`、`HttpServer`…）
+  才是真正難的地方——它們反射的類別是程式交給它們的，自己的原始碼裡看不到。做法是把它們當「反射使用者」，
+  取**靜態呼叫邊**（含建構呼叫）的閉包往上找誰會呼叫到它們，得到 31 個類別；程式自己的程式碼**提到**其中
+  任何一個（型別、呼叫擁有者、字面值、`new`、轉型…），兩張表就都保持全部。
+  **分派不是這裡的邊，兩個方向都不是**：一次分派需要的*實例*是由指名它那個類別的程式碼建出來的，而那是
+  靜態呼叫，所以建它的類別（以及任何到得了那個類別的類別）本來就在上面那個閉包裡。改成分派的話整個標準庫
+  都會進閉包——`lib/22_stream.teyru` 的 `closers.get(i).run()` 到得了每一個 `Runnable`，其中一個是網頁伺服器的
+  `ConnectionTask`，於是 `String` 也會進閉包，每個程式都退回不剪。
+  驗證是 `reflect_test.go` 的 `TestReflectReach`（產生的 C 帶哪些表、程式跑出來的答案）與
+  `TestReflectReachFallsBack`（界算不出來時每張表都留著），加上 `go test ./...`。
   **重上之後的重量（本機 linux/amd64、16 核、`/usr/bin/time -v` 量 `teyru build`、三次取中位數，
   括號是當時的 load average）**：webapp `-O0` 暖 **1.85 s**（load 6.9；十秒目標達成）、`-O1` 暖 2.39 s；
   `-O2` **30.30 s** 對照不帶本支的 31.26 s、執行檔**逐位元組相同**（hello 67,240 B、webapp 5,399,568 B），
