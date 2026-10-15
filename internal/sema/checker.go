@@ -42,6 +42,18 @@ type Builtins struct {
 	// stack limit. The runtime builds the object, so it is a builtin like the
 	// rest of the ones the runtime throws.
 	SOE *ast.Class
+	// The two errors a class initializer produces. ExceptionInInitializerError
+	// is what the use that ran the initializer sees when it throws;
+	// NoClassDefFoundError is what every use after it sees, because JLS 12.4.2
+	// leaves the class erroneous rather than letting it be initialised again.
+	// The runtime throws both, so they are builtins like the rest.
+	EIIE, NCDFE *ast.Class
+	// Error: the class JLS 12.4.2 asks the initializer path to tell apart from
+	// everything else, because an initializer that throws an Error has that
+	// Error rethrown where anything else is wrapped in
+	// ExceptionInInitializerError. The runtime walks a throwable's superclass
+	// chain to it, so it is installed like the rest.
+	Err *ast.Class
 	// java.lang.reflect's checked exceptions. Teyru does not check them --
 	// nothing here is checked -- but they are the classes the runtime throws
 	// and a program catches, so they are named like the rest.
@@ -493,6 +505,9 @@ func (c *Checker) initBuiltins() {
 		NPE:        get("NullPointerException"), AIOOBE: get("ArrayIndexOutOfBoundsException"),
 		SIOOBE:        get("StringIndexOutOfBoundsException"),
 		SOE:           get("StackOverflowError"),
+		EIIE:          get("ExceptionInInitializerError"),
+		NCDFE:         get("NoClassDefFoundError"),
+		Err:           get("Error"),
 		ClassNotFound: get("ClassNotFoundException"), NoSuchField: get("NoSuchFieldException"),
 		NoSuchMethod: get("NoSuchMethodException"), IllAccess: get("IllegalAccessException"),
 		Invocation: get("InvocationTargetException"), Instantiation: get("InstantiationException"),

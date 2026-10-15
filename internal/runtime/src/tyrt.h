@@ -258,7 +258,7 @@ void ty_uncaught(void *e) __attribute__((noreturn));
 /* Preallocated exception classes (filled by generated code at startup). */
 extern tyclass *TY_NPE, *TY_AIOOBE, *TY_SIOOBE, *TY_ARITH, *TY_CCE, *TY_NEGARR, *TY_ASSERT,
     *TY_ILLARG, *TY_ILLSTATE, *TY_NOSUCHELEM, *TY_UNSUP, *TY_ARRAYSTORE,
-    *TY_ILLMON, *TY_SOE;
+    *TY_ILLMON, *TY_SOE, *TY_EIIE, *TY_NCDFE, *TY_ERROR;
 
 /* The exceptions java.lang.reflect throws by name. A program that never
    reflects never names one, and the generated startup leaves the pointer NULL
@@ -274,6 +274,8 @@ void *ty_arith(const char *msg);
 void *ty_cce(tyclass *from, tyclass *to);
 void *ty_negarr(int64_t len);
 void *ty_arraystore(void *v);
+void *ty_eiie(void *cause);
+void *ty_ncdfe(const char *name);
 void *ty_assertfail(const char *msg);
 
 /* ---- the stack limit --------------------------------------------------
@@ -351,6 +353,13 @@ static inline __attribute__((always_inline)) void ty_stack_check(void) {
    initializes. The bit TY_CLS_INIT means "finished", and it is published only
    once the initializer has returned; this one means "running". */
 #define TY_CLS_BUSY 32
+/* the class's initializer threw. JLS 12.4.2 calls such a class erroneous: the
+   first use that ran the initializer sees the failure, and every use after it
+   is refused with NoClassDefFoundError rather than running the initializer
+   again. Published under the class's own monitor, like TY_CLS_INIT, and read
+   under it -- the flag is never the only thing standing between a thread and a
+   half-built class. */
+#define TY_CLS_ERR 64
 /* the class describes an array: its payload is a tyarr whose element slots the
    collector has to trace when the array holds references */
 #define TY_CLS_ARRAY 2

@@ -1461,6 +1461,8 @@ func (e *Emitter) entry() string {
 		{"TY_NPE", e.prog.Builtins.NPE}, {"TY_AIOOBE", e.prog.Builtins.AIOOBE},
 		{"TY_SIOOBE", e.prog.Builtins.SIOOBE},
 		{"TY_SOE", e.prog.Builtins.SOE},
+		{"TY_EIIE", e.prog.Builtins.EIIE}, {"TY_NCDFE", e.prog.Builtins.NCDFE},
+		{"TY_ERROR", e.prog.Builtins.Err},
 		{"TY_ARITH", e.prog.Builtins.Arith}, {"TY_CCE", e.prog.Builtins.CCE},
 		{"TY_NEGARR", e.prog.Builtins.NegArr}, {"TY_ASSERT", e.prog.Builtins.Assertion},
 		{"TY_ILLARG", e.prog.Builtins.IllArg}, {"TY_ILLSTATE", e.prog.Builtins.IllState},

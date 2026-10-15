@@ -54,12 +54,37 @@ void ty_unimplemented(const char *what) {
    (04_boxing.teyru), finds the bit its own thread set and proceeds, where
    waiting for it would be waiting for itself.
 
+   An initializer that throws leaves the class erroneous (JLS 12.4.2): the
+   thread that ran it sees the failure, and every use after that is refused with
+   NoClassDefFoundError rather than running the initializer again. TY_CLS_ERR is
+   that state, set under the same monitor as the other two.
+
    A tyclass is static data, so it cannot move and the monitors' address key is
    stable for it. Two initializers that reach each other's classes can deadlock
    here, as they can in Java, where the same two monitors would be held. */
+/* Whether a throwable is an Error, which is the one thing JLS 12.4.2 asks this
+   path to tell apart: an initializer that throws an Error has that Error
+   rethrown, and anything else is wrapped. The test is the class chain and not a
+   name, and TY_ERROR is NULL in a program with no Error class, in which case
+   nothing can be one. */
+static int is_error(void *ex) {
+  if (!ex) return 0;
+  for (tyclass *k = ((tyobj *)ex)->cls; k; k = k->super) {
+    if (k == TY_ERROR) return 1;
+  }
+  return 0;
+}
+
 void ty_clinit(tyclass *c) {
   if (!c || (__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & TY_CLS_INIT)) return;
   ty_sync_enter(c);
+  /* Erroneous: refuse the use rather than run the initializer again. The flag
+     is read under the monitor that publishes it, so a thread arriving while
+     another one fails waits here and then sees it. */
+  if (c->flags & TY_CLS_ERR) {
+    ty_sync_exit(c);
+    ty_throw(ty_ncdfe(ty_class_jname(c)));
+  }
   if (!(c->flags & TY_CLS_INIT) && !(c->flags & TY_CLS_BUSY)) {
     c->flags |= TY_CLS_BUSY;
     /* An initializer is program code, so it can throw. The frame is the one
@@ -79,15 +104,17 @@ void ty_clinit(tyclass *c) {
       __atomic_fetch_and(&c->flags, ~TY_CLS_BUSY, __ATOMIC_RELAXED);
       __atomic_fetch_or(&c->flags, TY_CLS_INIT, __ATOMIC_RELEASE);
     } else {
-      /* An initializer that threw leaves the class uninitialized rather than
-         half built, and the next thread to use it runs the initializer itself.
-         Java calls such a class erroneous and throws NoClassDefFoundError for
-         every later use; there is no bit here for "erroneous", and running it
-         again is the answer that never hands a half-built class over. */
+      /* The initializer threw, so the class is erroneous from here on. Java
+         wraps what is not an Error in an ExceptionInInitializerError and
+         rethrows an Error as it is; either way this is the one use that sees
+         the failure itself, and every later one is refused at the top of this
+         function. The class stays uninitialized rather than half built. */
       ty_cur_catch = frame.prev;
-      c->flags &= ~TY_CLS_BUSY;
+      __atomic_fetch_and(&c->flags, ~TY_CLS_BUSY, __ATOMIC_RELAXED);
+      __atomic_fetch_or(&c->flags, TY_CLS_ERR, __ATOMIC_RELEASE);
       ty_sync_exit(c);
-      ty_throw(frame.ex);
+      void *ex = frame.ex;
+      ty_throw(is_error(ex) ? ex : ty_eiie(ex));
     }
   }
   ty_sync_exit(c);
@@ -348,6 +375,36 @@ void *ty_make_ex(tyclass *c, const char *msg) {
   ((void **)((char *)o + sizeof(tyobj)))[0] = ty_str_new(msg, msg ? (int64_t)strlen(msg) : 0);
   ((void **)((char *)o + sizeof(tyobj)))[1] = NULL;
   return o;
+}
+
+/* An exception with no message at all, which is not the same as an empty one:
+   Java's getMessage answers null and Throwable.toString prints the class name
+   alone. ExceptionInInitializerError is the one this runtime raises that way --
+   the JDK's own answer for it is "java.lang.ExceptionInInitializerError", with
+   no colon and no text. */
+static void *ty_make_ex_nomsg(tyclass *c) {
+  tyobj *o = (tyobj *)ty_alloc(sizeof(tyobj) + 2 * sizeof(void *));
+  o->cls = c;
+  ((void **)((char *)o + sizeof(tyobj)))[0] = NULL;
+  ((void **)((char *)o + sizeof(tyobj)))[1] = NULL;
+  return o;
+}
+
+/* The failure of a class initializer. The JDK's ExceptionInInitializerError
+   carries the throwable that stopped the initializer and no message of its own,
+   and getCause answers that throwable. */
+void *ty_eiie(void *cause) {
+  tyobj *o = (tyobj *)ty_make_ex_nomsg(TY_EIIE);
+  ((void **)((char *)o + sizeof(tyobj)))[1] = cause;
+  return o;
+}
+
+/* Every use of a class whose initializer failed, after the first. JLS 12.4.2
+   leaves such a class erroneous, and the JDK's message names it. */
+void *ty_ncdfe(const char *name) {
+  char buf[256];
+  snprintf(buf, sizeof buf, "Could not initialize class %s", name ? name : "?");
+  return ty_make_ex(TY_NCDFE, buf);
 }
 
 /* ---- object equality --------------------------------------------------- */
