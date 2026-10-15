@@ -33,10 +33,11 @@
  *   - A thread reports that it has stopped by calling one of the stop points:
  *     a safepoint (ty_safepoint, which the generated code puts at the top of
  *     every loop body, and which the allocation slow path calls first), a call
- *     that blocks (sleep, join, a monitor wait), or the wait for the heap lock
- *     itself. All of them record where the thread stopped, spill the registers
- *     that would otherwise be invisible to a stack scan, and take themselves out
- *     of the set of threads the collector has to wait for.
+ *     that blocks (sleep, join, a monitor wait, a socket read or write, a file
+ *     or pipe read or write, a line from the console), or the wait for the heap
+ *     lock itself. All of them record where the thread stopped, spill the
+ *     registers that would otherwise be invisible to a stack scan, and take
+ *     themselves out of the set of threads the collector has to wait for.
  *   - They wait, and start running again, when the collector clears the request,
  *     which happens only after the trace and the sweep are done. So a thread
  *     that stopped is still while the collector walks its stack, and the write
@@ -48,15 +49,30 @@
  *
  *   - a safepoint: the top of every loop body in generated code; the allocation
  *     slow path (before it takes the heap lock); the wait for the heap lock;
- *     sleep, join, and every monitor wait; the start of a thread.
- *   - not a safepoint: a call that neither loops nor blocks nor allocates. A
- *     thread inside one -- a long computation in a native method, a blocking
- *     read() on a socket, a sleep inside libc -- does not reach a stop point
- *     until it comes back, and a collection waits for it. That is the price of
- *     cooperative safepoints: the collector cannot interrupt a thread that never
- *     cooperates. Every path in this runtime that blocks for a long time is a
- *     stop point for that reason; a native method that blocks outside the
- *     runtime would have to call ty_thread_stopped_begin/end around its wait.
+ *     sleep, join, and every monitor wait; the start of a thread; and every call
+ *     in the runtime that waits for data to arrive or to be accepted -- the
+ *     socket reads, writes, accept and connect waits, the TLS handshake and its
+ *     reads and writes, the file and pipe reads and writes, and a line from the
+ *     console. Each of those brackets its wait with ty_thread_stopped_begin and
+ *     ty_thread_stopped_end, and the ones that hold an object across the wait --
+ *     the byte array a read is filling or a write is draining, the string a
+ *     write is draining -- put it on the shadow stack for the whole of the wait,
+ *     because the runtime's pointer into it may live only in a register whose
+ *     spill is below the stop point, where the scan of a stopped thread does not
+ *     reach.
+ *   - not a safepoint: a call that neither loops nor allocates nor waits. A
+ *     thread inside one -- a long computation in a native method -- does not
+ *     reach a stop point until it comes back, and a collection waits for it.
+ *     That is the price of cooperative safepoints: the collector cannot
+ *     interrupt a thread that never cooperates. The same is true of the calls
+ *     that ask the kernel or the resolver a question and come back with an
+ *     answer -- open, stat, opendir, readdir, getaddrinfo, and the buffered
+ *     writes of the C library. Those are one call each and return on the
+ *     system's own schedule rather than when a peer or a device decides to move
+ *     data; a thread inside one stalls a collection for as long as the call
+ *     takes, which is the price of leaving them out and is not the unbounded
+ *     wait the calls above are. A native method that blocks on something of its
+ *     own would have to call ty_thread_stopped_begin/end around its wait.
  *
  * Registers. A stack scan sees what a thread has spilled, and a value a frame
  * holds only in a callee-saved register is not in any of that -- the register is
@@ -64,12 +80,14 @@
  * begins with __builtin_unwind_init(), which makes the compiler spill the
  * callee-saved registers into the frame that is about to stop, above the point
  * the thread records, where the scan finds them. The one place this cannot reach
- * is the frame of the function that blocks *inside the platform layer*
- * (typlat_cond_wait, typlat_sleep_ns): its saves are below the recorded point,
- * so the collector starts its scan a fixed margin lower (TY_PARK_MARGIN in
- * tyrt.c), scanning a few hundred extra bytes conservatively. Everything the
- * runtime itself holds across such a wait it holds on its shadow stack, which is
- * exact and needs none of this.
+ * is the frame of the function that blocks *below* the stop point -- the
+ * platform layer's own wait (typlat_cond_wait, typlat_sleep_ns), the recv or
+ * send under a socket call, and whatever a library between them is holding
+ * (OpenSSL, for a TLS call): its saves are below the recorded point, so the
+ * collector starts its scan a fixed margin lower (TY_PARK_MARGIN in tyrt.c),
+ * scanning a few hundred extra bytes conservatively. Everything the runtime
+ * itself holds across such a wait it holds on its shadow stack, which is exact
+ * and needs none of this.
  *
  * ---------------------------------------------------------------- monitors
  *
