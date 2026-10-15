@@ -312,7 +312,15 @@ static int ty_tls_is_bytes(tyarr *a) { return a && a->esize == 1; }
    carries MSG_NOSIGNAL the way every byte the socket layer sends does. The
    descriptor is the BIO's data and is *not* closed when the BIO is freed: it
    belongs to the Socket, and this layer only borrows it for as long as the
-   session lives. */
+   session lives.
+
+   These two are the transport's blocking calls, and the stop point that covers
+   them is the one around the SSL call that reached them (ty_tls_read,
+   ty_tls_write_all and the handshake below), not one here: OpenSSL is free to
+   hand the caller's own buffer straight to this write, so the object that has
+   to be a root across the wait is the array the SSL call was given, which only
+   the function that holds it can name. A stop here as well would record a
+   point below the frames that matter and add nothing. */
 static int ty_tls_bio_write(BIO *b, const char *buf, int len) {
   if (len <= 0) return 0;
   BIO_clear_retry_flags(b);
@@ -641,7 +649,14 @@ static int32_t ty_tls_handshake(int32_t ctx, int32_t fd, const char *host, int s
      frees it once when the two are the same. */
   SSL_set_bio(ssl, bio, bio);
   ty_tls_bio_err = 0;
+  /* The handshake is a wait on the peer -- a peer that connects and then says
+     nothing waits forever -- so it is a stop point, the same way every other
+     blocking call in the runtime is (tyrt_thread.c). Nothing here holds a
+     Teyru object across it: the host name was copied into OpenSSL's own memory
+     by ty_tls_set_host before this point. */
+  ty_thread_stopped_begin();
   int r = server ? SSL_accept(ssl) : SSL_connect(ssl);
+  ty_thread_stopped_end();
   if (r != 1) {
     int32_t code = ty_tls_failed(ssl, r);
     SSL_free(ssl);
@@ -681,7 +696,18 @@ int32_t ty_tls_read(int32_t session, tyarr *buf, int32_t off, int32_t len) {
   ERR_clear_error();
   for (;;) {
     ty_tls_bio_err = 0;
-    int n = SSL_read(ssl, buf->data + off, len);
+    /* A TLS read is the socket read underneath it plus the decryption, and the
+       read underneath it is a wait with no deadline of its own. So this is a
+       stop point, and the array is a root for the whole of the wait for the
+       same reason it is in ty_net_read: the bytes land in it, and OpenSSL may
+       hold the pointer into it in a frame below the point the thread stops
+       at. */
+    char *p = buf->data + off;
+    TY_ROOT_PUSH(buf);
+    ty_thread_stopped_begin();
+    int n = SSL_read(ssl, p, len);
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n > 0) return n; /* short is not an error: it is the answer */
     int e = SSL_get_error(ssl, n);
     switch (e) {
@@ -729,7 +755,14 @@ int32_t ty_tls_write_all(int32_t session, tyarr *buf, int32_t off, int32_t len) 
   ERR_clear_error();
   while (done < len) {
     ty_tls_bio_err = 0;
+    /* A send waits whenever the peer has stopped reading, which is what this
+       loop is for, so it is a stop point like the read above -- with the same
+       root, and for the same reason: the bytes go out of this array. */
+    TY_ROOT_PUSH(buf);
+    ty_thread_stopped_begin();
     int n = SSL_write(ssl, p + done, len - done);
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n > 0) {
       done += n;
       continue;

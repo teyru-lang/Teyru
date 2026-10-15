@@ -614,12 +614,15 @@ void ty_safepoint_slow(void);
    blocks.
 
    What is *not* a safepoint, and what it costs: a thread inside a call that
-   neither loops nor blocks -- a long calculation, a read() on a socket, a sleep
-   inside libc -- never reaches one, and a collection waits for every running
-   thread to reach one. Such a thread therefore stalls the collector (and with
-   it every other thread that wants to allocate) until it comes back. This is
-   documented at the top of tyrt_thread.c together with the rest of the
-   protocol. */
+   neither loops nor allocates nor waits -- a long calculation in a native
+   method -- never reaches one, and a collection waits for every running thread
+   to reach one. Such a thread therefore stalls the collector (and with it every
+   other thread that wants to allocate) until it comes back. Every call in this
+   runtime that waits for data to arrive or to be accepted is a stop point, so
+   the waits a Teyru program can be held in -- a socket read or write, an
+   accept, a connect, a TLS call, a file or pipe read or write, a line from the
+   console, a sleep, a join, a monitor -- are not among them. This is documented
+   at the top of tyrt_thread.c together with the rest of the protocol. */
 static inline void ty_safepoint(void) {
   if (__atomic_load_n(&ty_stw_request, __ATOMIC_ACQUIRE)) ty_safepoint_slow();
 }

@@ -487,7 +487,20 @@ int32_t ty_sb_len(void *p) {
 
 tystr *ty_readln(void) {
   static char buf[4096];
-  if (!fgets(buf, (int)sizeof buf, stdin)) return NULL;
+  /* A line from the console is a wait with no deadline: it ends when somebody
+     types, which may be never, and it is the same wait a pipe or a terminal
+     holds a reader in. So it is a stop point like the socket and file calls in
+     tyrt_net.c (tyrt_thread.c), and nothing here holds a Teyru object across
+     it -- the buffer is this function's own and the string is made after.
+
+     The result is taken before the stop ends and the early return happens
+     after it: a thread that returned while it was still marked stopped would
+     never be waited for again, and every later collection would scan it while
+     it ran. */
+  ty_thread_stopped_begin();
+  char *line = fgets(buf, (int)sizeof buf, stdin);
+  ty_thread_stopped_end();
+  if (!line) return NULL;
   size_t n = strlen(buf);
   while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
   return ty_str_new(buf, (int64_t)n);

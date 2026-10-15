@@ -1,6 +1,11 @@
 /* tyrt_net.c - sockets and files.
  *
- * The language has no threads, so none of this is written for concurrency: a
+ * The language has threads, and this file is written for them in exactly one
+ * way: every call here that waits -- a socket read or write, an accept, the
+ * wait for a connection, a file or pipe read or write -- is a stop point for the
+ * collector (see the protocol at the top of tyrt_thread.c), so the object the
+ * kernel is reading from or writing into is on the shadow stack for the whole of
+ * the wait. Everything else is single-threaded the way it always was: a
  * descriptor is an int, a server is a loop, and every helper here is a
  * straight-line conversation with the kernel. What it is written for is being
  * correct under load, which for a socket layer means four things, all of them
@@ -187,7 +192,12 @@ static int32_t ty_connect_one(const struct addrinfo *r, int32_t timeout_ms) {
       return e;
     }
     for (;;) {
+      /* The wait for the connection to come up is a wait: bracketed as a stop
+         point, so a collection does not wait for a connect that is still in
+         flight -- and with no timeout that is a wait with no end. */
+      ty_thread_stopped_begin();
       int pr = typlat_socket_wait(fd, 1, timeout_ms < 0 ? -1 : timeout_ms);
+      ty_thread_stopped_end();
       if (pr < 0) {
         if (pr == -EINTR) continue; /* a signal is not a deadline */
         (void)typlat_socket_close(fd);
@@ -265,14 +275,25 @@ int32_t ty_net_accept(int32_t fd, int32_t timeout_ms) {
          is documented for reads and its effect on accept differs between
          kernels -- so the wait happens first and the accept is then known to
          return rather than block. */
+      /* Waiting for a connection is waiting, so it is a stop point like every
+         other call in this runtime that waits (tyrt_thread.c): a collection
+         asked for while this thread sits here must not wait for its deadline,
+         which without a timeout is never. */
+      ty_thread_stopped_begin();
       int pr = typlat_socket_wait(fd, 0, timeout_ms);
+      ty_thread_stopped_end();
       if (pr < 0) {
         if (pr == -EINTR) continue;
         return pr;
       }
       if (pr == 0) return TY_NET_TIMEOUT;
     }
+    /* And the accept itself: with no timeout it blocks until a connection
+       arrives, and with one it can still block if the readiness the poll saw
+       was taken by another thread. */
+    ty_thread_stopped_begin();
     int32_t c = typlat_socket_accept(fd);
+    ty_thread_stopped_end();
     if (c >= 0) return c;
     if (c == -EINTR) continue;
     /* A client that gave up between the poll and the accept is not a failure of
@@ -297,7 +318,26 @@ int32_t ty_net_read(int32_t fd, tyarr *buf, int32_t off, int32_t len) {
   if (len == 0) return 0; /* read(2) of nothing returns 0, which would read as
                              end of file: answer it here instead */
   for (;;) {
-    int64_t n = typlat_socket_recv(fd, buf->data + off, len);
+    /* A read is a wait, and a wait is a stop point (tyrt_thread.c): a thread
+       blocked in recv is not running generated code and holds nothing the
+       collector has to see, so a collection must not wait for it. Without this
+       the collector waits for the read's own deadline -- which for a socket
+       with no timeout is never -- and every other thread that wants to allocate
+       waits with it.
+
+       The array is a root for the whole of the wait. The kernel is filling it,
+       and the pointer into it this function walks may live only in a register
+       whose spill belongs to the frames below the stop point -- recv's own and
+       the platform layer's -- which the scan of a stopped thread does not
+       cover. The shadow stack is exact and needs none of that. The address is
+       taken before the thread stops because a stopped thread must not touch the
+       heap. */
+    char *p = buf->data + off;
+    TY_ROOT_PUSH(buf);
+    ty_thread_stopped_begin();
+    int64_t n = typlat_socket_recv(fd, p, len);
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n >= 0) return (int32_t)n; /* short is not an error: it is the answer */
     if (n == -EINTR) continue;
     return (int32_t)n; /* -EAGAIN when SO_RCVTIMEO fired, which the prelude
@@ -312,7 +352,15 @@ int32_t ty_net_write_all(int32_t fd, tyarr *buf, int32_t off, int32_t len) {
   const char *p = buf->data + off;
   int32_t done = 0;
   while (done < len) {
+    /* A send waits too, whenever the peer has stopped reading and the kernel's
+       send buffer is full, and that wait has no deadline at all. So this is a
+       stop point like the read above, with the same root and for the same
+       reason: the kernel is reading the bytes out of this array. */
+    TY_ROOT_PUSH(buf);
+    ty_thread_stopped_begin();
     int64_t n = typlat_socket_send(fd, p + done, len - done);
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n < 0) {
       if (n == -EINTR) continue;
       return (int32_t)n;
@@ -336,7 +384,13 @@ int32_t ty_net_write_str(int32_t fd, tystr *s) {
   const char *p = TY_STR_DATA(s);
   int32_t done = 0;
   while (done < (int32_t)len) {
+    /* The same stop point as ty_net_write_all, with the string as the root
+       instead of the array. */
+    TY_ROOT_PUSH(s);
+    ty_thread_stopped_begin();
     int64_t n = typlat_socket_send(fd, p + done, (int32_t)len - done);
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n < 0) {
       if (n == -EINTR) continue;
       return (int32_t)n;
@@ -654,7 +708,17 @@ tyarr *ty_file_read_bytes(tystr *path, tyarr *err) {
       buf = nb;
       cap *= 2;
     }
+    /* A file read is a wait on a device and not a short call: a pipe or a
+       FIFO has no data in it until somebody writes, which may be never, and a
+       disk can take as long as it likes. It is therefore a stop point like the
+       socket calls above. The buffer is malloc'd, so the collector has no
+       interest in it; the error array is not, and it is used after the loop
+       ends, so it goes on the shadow stack for the whole of it. */
+    TY_ROOT_PUSH(err);
+    ty_thread_stopped_begin();
     ssize_t n = read(fd, buf + len, cap - len);
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n < 0) {
       if (errno == EINTR) continue;
       int e = errno;
@@ -675,11 +739,22 @@ tyarr *ty_file_read_bytes(tystr *path, tyarr *err) {
 
 /* The write loop, over a raw buffer so that the bytes and the string entry
    points share it: a short write is the same bug whichever kind of data hit
-   it. */
-static int32_t ty_write_fd(int fd, const char *data, int64_t len) {
+   it. `owner` is the object the bytes come out of, which the kernel is reading
+   for the whole of the call and which the collector therefore has to keep: it
+   is the array or the string the caller passed, and the pointer this function
+   walks into it may live only in a register whose spill is below the stop
+   point, where the scan does not reach. */
+static int32_t ty_write_fd(int fd, const char *data, int64_t len, void *owner) {
   int64_t done = 0;
   while (done < len) {
+    /* A write waits for a device the same way a read does: a full disk, a
+       pipe nobody is draining, a file on a filesystem that has stopped
+       answering. It is a stop point for the same reason. */
+    TY_ROOT_PUSH(owner);
+    ty_thread_stopped_begin();
     ssize_t n = write(fd, data + done, (size_t)(len - done));
+    ty_thread_stopped_end();
+    TY_ROOT_POP();
     if (n < 0) {
       if (errno == EINTR) continue;
       return -errno;
@@ -701,7 +776,7 @@ int32_t ty_file_write_bytes(tystr *path, tyarr *buf, int32_t off, int32_t len,
      here that is not text. */
   int fd = typlat_open_write(p, append);
   if (fd < 0) return -errno;
-  int32_t r = ty_write_fd(fd, buf->data + off, len);
+  int32_t r = ty_write_fd(fd, buf->data + off, len, buf);
   if (r < 0) {
     int e = -r;
     (void)close(fd);
@@ -720,7 +795,7 @@ int32_t ty_file_write_str(tystr *path, tystr *s, int32_t append) {
   if (!s) return -EINVAL;
   int fd = typlat_open_write(p, append);
   if (fd < 0) return -errno;
-  int32_t r = ty_write_fd(fd, TY_STR_DATA(s), s->blen);
+  int32_t r = ty_write_fd(fd, TY_STR_DATA(s), s->blen, s);
   if (r < 0) {
     int e = -r;
     (void)close(fd);
