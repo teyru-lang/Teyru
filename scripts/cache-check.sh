@@ -105,7 +105,14 @@ check "the split build and the whole-program build agree" "$a" "$b"
 # build with half an object does not fail loudly, it fails as a program that
 # does something else, or as a link error at best. An entry records the size and
 # the hash of every file it holds, so damage of either shape is a miss.
-obj=$(find "$CACHE" -name prelude.o | head -1)
+#
+# The object damaged here is the one section 2 captured, and not a fresh
+# `find ... | head -1`: by now the cache holds two entries, the -O0 one and the
+# -O1 one section 4 added, and which of them `find` lists first is whichever
+# name the filesystem's directory order happens to put first -- not a thing this
+# check may depend on. Section 2 captured $obj when the -O0 build was the only
+# entry in the cache, which is exactly the entry the -O0 builds below use, and
+# section 5 left that path pointing at the object it rebuilt.
 size=$(stat -c '%s' "$obj")
 # One block, not one byte at a time: an object is megabytes.
 dd if="$obj" of="$WORK/half.o" bs=$((size / 2)) count=1 status=none
