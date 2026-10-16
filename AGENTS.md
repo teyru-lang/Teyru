@@ -235,6 +235,19 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
 `cname.vercel-dns.com`（不要開代理，憑證由 Vercel 簽）。要改成 push 自動部署，得先由 owner
 把 Vercel 的 GitHub App 授權給 `teyru-lang` 組織；在那之前一律手動，清單上就有這一步。
 
+**2026-10-16 複查，上面每一句都還成立**，而且這次是直接量到的：`docs` 的 PR #2 併進 `main`
+之後線上站**沒有動**——`vercel ls teyru-docs` 的最新一筆是 **29 天前**，頁面還是舊的
+（`grep -c "只讀位置形式"` 是 3、新字串是 2，兩者都不是 `main` 現在的數字）。所以「push 就會
+部署」是**錯的**，`main` 已經有內容而線上站落後，正是這一節警告的那件事。手動部署照上面做
+（新的 clone 要先 `vercel link --yes --project teyru-docs`），發佈後一分鐘內兩個 locale
+（`/docs/lombok` 與 `/en/docs/lombok`）都拿到新的列。
+
+**自動化還缺什麼，也量到了**：`vercel git connect https://github.com/teyru-lang/docs` 失敗，
+訊息是 `Make sure there aren't any typos and that you have access to the repository if it's
+private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上**的樣子（CLI 沒有辦法裝
+它，要在 Vercel 的 dashboard 按「Connect Git Repository」走一次授權）。裝好之後這一段就可以
+改成「push 就部署」，在那之前**每一次改完文件都要自己跑一次部署**，清單上那一步不能省。
+
 ---
 
 ## 10. 已知限制（不要當成已完成）
