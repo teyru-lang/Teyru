@@ -2900,15 +2900,7 @@ tystr *ty_getenv(tystr *name) {
 tystr *ty_get_property(tystr *key) {
   if (!key) ty_npe();
   const char *k = TY_STR_DATA(key);
-  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
-  if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
-  if (strcmp(k, "path.separator") == 0) return ty_str_intern(":");
   if (strcmp(k, "file.encoding") == 0) return ty_str_intern("UTF-8");
-  if (strcmp(k, "java.io.tmpdir") == 0) return ty_str_intern("/tmp");
-#ifdef _WIN32
-  return NULL;
-#else
-  if (strcmp(k, "os.name") == 0) return ty_str_intern("Linux");
   if (strcmp(k, "os.arch") == 0) return ty_str_intern(
 #ifdef __x86_64__
       "amd64"
@@ -2916,6 +2908,46 @@ tystr *ty_get_property(tystr *key) {
       "aarch64"
 #else
       ""
+#endif
+  );
+  /* The rest of the keys are the platform's, and the Windows half is not a
+     fallback: a program that asks for os.name there and gets "Linux", or for
+     user.dir and gets null -- which is what made File.getAbsolutePath return a
+     relative path, and t99_file_paths caught it -- is answered wrongly rather
+     than not answered. line.separator and file.separator are the platform's in
+     Java too, so they differ by design here; the standard library's own
+     File.separator is "/" on every platform, which every platform accepts. */
+#ifdef _WIN32
+  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\r\n");
+  if (strcmp(k, "file.separator") == 0) return ty_str_intern("\\");
+  if (strcmp(k, "path.separator") == 0) return ty_str_intern(";");
+  if (strcmp(k, "os.name") == 0) return ty_str_intern("Windows");
+  if (strcmp(k, "java.io.tmpdir") == 0) {
+    const char *t = getenv("TEMP");
+    if (!t) t = getenv("TMP");
+    return t ? ty_str_intern(t) : NULL;
+  }
+  {
+    const char *env = NULL;
+    if (strcmp(k, "user.name") == 0) env = getenv("USERNAME");
+    else if (strcmp(k, "user.home") == 0) env = getenv("USERPROFILE");
+    else if (strcmp(k, "user.dir") == 0) {
+      static char cwd[4096];
+      if (getcwd(cwd, sizeof cwd)) return ty_str_intern(cwd);
+      return NULL;
+    }
+    return env ? ty_str_intern(env) : NULL;
+  }
+#else
+  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
+  if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
+  if (strcmp(k, "path.separator") == 0) return ty_str_intern(":");
+  if (strcmp(k, "java.io.tmpdir") == 0) return ty_str_intern("/tmp");
+  if (strcmp(k, "os.name") == 0) return ty_str_intern(
+#if defined(__APPLE__)
+      "Mac OS X"
+#else
+      "Linux"
 #endif
   );
   {
