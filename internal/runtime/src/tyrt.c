@@ -2918,8 +2918,18 @@ tystr *ty_get_property(tystr *key) {
      Java too, so they differ by design here; the standard library's own
      File.separator is "/" on every platform, which every platform accepts. */
 #ifdef _WIN32
-  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\r\n");
-  if (strcmp(k, "file.separator") == 0) return ty_str_intern("\\");
+  /* line.separator and file.separator stay "\n" and "/" on Windows, which is
+     not what the JDK answers there and is deliberate: every line this language
+     writes is written with "\n" -- println, the stack traces, the exception
+     reports -- and every path the standard library builds is built with "/".
+     A line.separator of "\r\n" next to a println that writes "\n" is an
+     inconsistency a program cannot see coming, and it put "\r" into every
+     trace and broke seven cases on the windows run before it was reverted.
+     path.separator is a different thing (the separator in a *list* of paths,
+     like a classpath) and java.io.tmpdir is the machine's, so both are the
+     platform's. */
+  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
+  if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
   if (strcmp(k, "path.separator") == 0) return ty_str_intern(";");
   if (strcmp(k, "os.name") == 0) return ty_str_intern("Windows");
   if (strcmp(k, "java.io.tmpdir") == 0) {
