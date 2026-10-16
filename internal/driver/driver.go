@@ -310,7 +310,9 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	// does not link at all.
 	ldflags = append(ldflags, tgt.ldflags...)
 	ldflags = append(ldflags, objectList(units)...)
-	ldflags = append(ldflags, "-o", exe, "-lm", "-lpthread")
+	ldflags = append(ldflags, "-o", exe)
+	ldflags = append(ldflags, tgt.sysLibs...)
+	ldflags = append(ldflags, "-lm", "-lpthread")
 	// OpenSSL, and only for a program that can reach the TLS layer. checkTLS
 	// above has already refused the program when the target has none, so
 	// tlsLibs is the target's own list here and never an empty one.
@@ -468,7 +470,9 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	objs := objectList(units)
 	ldflags = append(ldflags, objs[0], libObj)
 	ldflags = append(ldflags, objs[1:]...)
-	ldflags = append(ldflags, "-o", exe, "-lm", "-lpthread")
+	ldflags = append(ldflags, "-o", exe)
+	ldflags = append(ldflags, tgt.sysLibs...)
+	ldflags = append(ldflags, "-lm", "-lpthread")
 	if link.TLS {
 		ldflags = append(ldflags, tgt.tlsLibs...)
 	}
@@ -1149,6 +1153,13 @@ type target struct {
 	// _WIN32 rather than by a define this table hands it.
 	cflags  []string
 	ldflags []string
+	// sysLibs are the libraries the target's own code calls, and they go
+	// *after* the objects: a static link resolves a library's symbols against
+	// what has already been seen, so a -l that comes before the object that
+	// needs it is a link that fails with an undefined reference to a symbol
+	// that is right there in the library. ldflags is for the mode flags
+	// (-static), which have to come before the libraries they apply to.
+	sysLibs []string
 	// tlsLibs are the libraries a build for this target links when the program
 	// can reach the TLS layer. Empty means this target has no TLS: a program
 	// that reaches it is refused by name (checkTLS below) instead of being
@@ -1193,11 +1204,15 @@ var targets = map[string]*target{
 		platSrc:  "tyrt_plat_win.c",
 		platText: tyrt.PlatWin,
 		suffix:   ".exe",
-		// -lws2_32 is Winsock, which the socket layer calls. -static is what
-		// makes the program stand alone: the threads are winpthreads, and
-		// without it every program this compiler produced would need
-		// libwinpthread-1.dll next to it.
-		ldflags: []string{"-lws2_32", "-static"},
+		// -static is what makes the program stand alone: the threads are
+		// winpthreads, and without it every program this compiler produced
+		// would need libwinpthread-1.dll next to it. -lws2_32 is Winsock,
+		// which the socket layer calls, and it is a library rather than a
+		// mode flag, so it goes after the objects (sysLibs): in ldflags it
+		// came first and the link failed with `undefined reference to
+		// __imp_WSAStartup`, which is what a -l before its user looks like.
+		ldflags: []string{"-static"},
+		sysLibs: []string{"-lws2_32"},
 		// mingw-w64 has no OpenSSL: there is no libssl.a or libssl.dll for the
 		// target, so the TLS layer cannot be built for it at all, and a program
 		// that can reach it is refused with this sentence rather than with an

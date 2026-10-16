@@ -8,6 +8,12 @@
 #include <float.h>
 #include <stdarg.h>
 
+#ifdef _WIN32
+/* _aligned_malloc and _aligned_free, which slab_alloc and slab_free use where
+   MinGW does not declare C11's aligned_alloc. */
+#include <malloc.h>
+#endif
+
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define TY_ASAN 1
@@ -96,6 +102,36 @@ static tyclass *array_class(void) {
 
 #define TY_HDR 16
 #define TY_CHUNK (1u << 18)
+
+/* A slab base has to be TY_ALIGN-aligned, and not for tidiness: valid_obj throws
+   away a candidate whose low bits are not zero, so a base that malloc only
+   aligned to 16 makes every payload of a TY_ALIGN=32 build invisible -- the mark
+   phase finds nothing live, the sweep frees the slabs that hold the live objects,
+   and the program walks into them. That is what W14 item 9's experiment hit, and
+   scripts/w14-analysis.md has the crash and its diagnosis.
+
+   malloc promises 16 bytes. C11's aligned_alloc promises what it is asked for,
+   but MinGW does not declare it (its UCRT only does under __STDC_VERSION__ >=
+   201112L, and the driver compiles with -std=gnu11), so the Windows side uses
+   _aligned_malloc, which pairs with _aligned_free rather than free. TY_CHUNK and
+   the rounded cap are both multiples of TY_ALIGN, which is what aligned_alloc
+   requires. */
+static void *slab_alloc(size_t cap) {
+#ifdef _WIN32
+  return _aligned_malloc(cap, TY_ALIGN);
+#else
+  return aligned_alloc(TY_ALIGN, cap);
+#endif
+}
+
+static void slab_free(void *p) {
+#ifdef _WIN32
+  _aligned_free(p);
+#else
+  free(p);
+#endif
+}
+
 #define TY_ALIGN 16
 
 typedef struct tychunk {
@@ -831,7 +867,7 @@ static void gc_collect(const char *trigger) {
           break;
         }
       }
-      free(c->mem);
+      slab_free(c->mem);
       free(c->starts);
       free(c);
       continue;
@@ -987,15 +1023,7 @@ static void *take_batch(int k) {
 static tychunk *chunk_new(size_t total) {
     size_t cap = total > TY_CHUNK ? ((total + TY_CHUNK - 1) & ~(size_t)(TY_CHUNK - 1)) : TY_CHUNK;
   tychunk *c = (tychunk *)malloc(sizeof(tychunk));
-    /* The slab base has to be TY_ALIGN-aligned, and not for tidiness: valid_obj
-       throws away a candidate whose low bits are not zero, so a base that malloc
-       only aligned to 16 makes every payload of a TY_ALIGN=32 build invisible --
-       the mark phase finds nothing live, the sweep frees the slabs that hold the
-       live objects, and the program walks into them. That is exactly what W14
-       item 9's experiment hit, and scripts/w14-analysis.md has the crash and its
-       diagnosis. malloc promises 16 bytes, aligned_alloc promises what it is
-       asked for, and TY_CHUNK is a multiple of both. */
-    c->mem = (char *)aligned_alloc(TY_ALIGN, (size_t)cap);
+    c->mem = (char *)slab_alloc(cap);
     c->starts = (uint8_t *)calloc(TY_START_BYTES(cap), 1);
     c->cap = cap;
     c->used = 0;

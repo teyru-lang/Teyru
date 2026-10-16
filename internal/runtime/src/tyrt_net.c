@@ -991,55 +991,70 @@ static void tls_absent(const char *sym) {
   ty_throw(ty_make_ex(TY_UNSUP, msg));
 }
 
-__attribute__((weak)) int32_t ty_tls_client_context(tystr *ca_pem) {
+/* Strong on a target that has no TLS at all, weak everywhere else. MinGW does
+   not implement __attribute__((weak)) for functions: it drops the symbol
+   entirely, so a windows/amd64 build links the stub as nothing and a debug build
+   -- the split one, where the standard library's dead TLS bodies survive because
+   --gc-sections does not drop them on PE -- ends in `undefined reference to
+   ty_tls_close` for a call the program cannot make. Strong is safe there because
+   that target never links tyrt_tls.c (it has no OpenSSL), so there is nothing
+   for the stub to be overridden by; on every other target the attribute stays,
+   and tyrt_tls.c's definition wins as it always has. */
+#ifdef _WIN32
+#define TY_TLS_STUB
+#else
+#define TY_TLS_STUB __attribute__((weak))
+#endif
+
+TY_TLS_STUB int32_t ty_tls_client_context(tystr *ca_pem) {
   (void)ca_pem;
   tls_absent("Net.tlsClientContext0");
 }
-__attribute__((weak)) int32_t ty_tls_server_context(tystr *cert_pem, tystr *key_pem) {
+TY_TLS_STUB int32_t ty_tls_server_context(tystr *cert_pem, tystr *key_pem) {
   (void)cert_pem;
   (void)key_pem;
   tls_absent("Net.tlsServerContext0");
 }
-__attribute__((weak)) int32_t ty_tls_context_free(int32_t ctx) {
+TY_TLS_STUB int32_t ty_tls_context_free(int32_t ctx) {
   (void)ctx;
   tls_absent("Net.tlsFreeContext0");
 }
-__attribute__((weak)) int32_t ty_tls_connect(int32_t ctx, int32_t fd, tystr *host) {
+TY_TLS_STUB int32_t ty_tls_connect(int32_t ctx, int32_t fd, tystr *host) {
   (void)ctx;
   (void)fd;
   (void)host;
   tls_absent("Net.tlsConnect0");
 }
-__attribute__((weak)) int32_t ty_tls_accept(int32_t ctx, int32_t fd) {
+TY_TLS_STUB int32_t ty_tls_accept(int32_t ctx, int32_t fd) {
   (void)ctx;
   (void)fd;
   tls_absent("Net.tlsAccept0");
 }
-__attribute__((weak)) int32_t ty_tls_read(int32_t session, tyarr *buf, int32_t off, int32_t len) {
+TY_TLS_STUB int32_t ty_tls_read(int32_t session, tyarr *buf, int32_t off, int32_t len) {
   (void)session;
   (void)buf;
   (void)off;
   (void)len;
   tls_absent("Net.tlsRead0");
 }
-__attribute__((weak)) int32_t ty_tls_write_all(int32_t session, tyarr *buf, int32_t off, int32_t len) {
+TY_TLS_STUB int32_t ty_tls_write_all(int32_t session, tyarr *buf, int32_t off, int32_t len) {
   (void)session;
   (void)buf;
   (void)off;
   (void)len;
   tls_absent("Net.tlsWrite0");
 }
-__attribute__((weak)) int32_t ty_tls_write_str(int32_t session, tystr *s) {
+TY_TLS_STUB int32_t ty_tls_write_str(int32_t session, tystr *s) {
   (void)session;
   (void)s;
   tls_absent("Net.tlsWriteStr0");
 }
-__attribute__((weak)) int32_t ty_tls_close(int32_t session) {
+TY_TLS_STUB int32_t ty_tls_close(int32_t session) {
   (void)session;
   tls_absent("Net.tlsClose0");
 }
-__attribute__((weak)) tystr *ty_tls_detail_text(void) { tls_absent("Net.tlsDetail0"); }
-__attribute__((weak)) int32_t ty_tls_kind(int32_t code) {
+TY_TLS_STUB tystr *ty_tls_detail_text(void) { tls_absent("Net.tlsDetail0"); }
+TY_TLS_STUB int32_t ty_tls_kind(int32_t code) {
   (void)code;
   tls_absent("Net.tlsKind0");
 }
