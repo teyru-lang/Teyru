@@ -32,7 +32,7 @@ teyru run hello.teyru
 | 目標 | 建置 | 執行 |
 |---|---|---|
 | linux/amd64 | ✅ | ✅ 原生，整套測試都在這裡跑（`go test ./...`、`TEYRU=<編譯器> sh tests/run.sh`） |
-| windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉編譯；**碰得到 TLS 的程式除外**，那些是具名拒絕 | ✅ 在 Wine 下跑：當時 195 支測試程式有 179 支輸出逐位元組相同，差異的 16 支已逐一歸因（14 支在改動前的編譯器上用 gcc 也會失敗，2 支是 NTFS 檔名與 POSIX 路徑的事實） |
+| windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉編譯；**碰得到 TLS 的程式除外**，那些是具名拒絕（mingw-w64 沒有 OpenSSL） | ✅ 在 Wine 下跑，2026-10-17 量 `tests/programs` 的 **302 支**：**290 支輸出（stdout、stderr、結束碼）逐位元組相同**、**11 支碰得到 TLS 而被具名拒絕**、**1 支（`t99_file_shell_meta`）因 NTFS 不能有那種檔名而跳過**——**0 支不符**。其中 16 支要用 `-O0` 建（mingw 的 `cc1` 在最大的幾支 `-O1` 上跑超過兩小時，`-O0` 十幾秒），那是工具鏈的建置時間，不是行為差異 |
 | linux/arm64 | ✅ 需一支指向 arm64 sysroot 的編譯器（`CC=aarch64-linux-gnu-gcc` ＋ `QEMU_LD_PREFIX`，做法寫在 `AGENTS.md` §10） | ✅ 在 qemu 下跑：整套 **250 項全過、0 項不符**（222 支程式＋3 個套件＋23 個診斷＋2 個原生），量於 2026-09-17 |
 | darwin/amd64、darwin/arm64 | ✅ 以 `--cc <zig cc -target <arch>-macos>`（`resolveTarget` 現在看的是這次真的會用的那支編譯器） | ❌ 這裡沒有 macOS：**沒有任何一行程式在它上面執行過**，只到「編譯並連結」 |
 
@@ -41,14 +41,14 @@ teyru run hello.teyru
 （`t188_timezone`）、Spring 形狀的那一層（`t102_web`）、TLS（`t163_https_roundtrip`）與
 Gson（`t101_gson`）——各以 `teyru build --no-lto --target <os>/<arch>` 編四個可達的目標。
 **上表每一列的證據是那一次真正量到的東西**（linux/amd64 整套測試、arm64 在 qemu 下整套、
-windows 在 Wine 下 179 支），不是一次跨編譯探針的比例；先前這裡寫過的「40 次裡 12 次成功」
+windows 在 Wine 下 302 支裡的 290 支），不是一次跨編譯探針的比例；先前這裡寫過的「40 次裡 12 次成功」
 是 arm64 sysroot 與 macOS SDK 都還沒準備好時的舊探針，兩件事都不是同一件事，量到 arm64
 之後它就該被刪掉而不是留著當現況。
 
 **四個目標都能編譯，但這台機器只能執行其中兩個。** 交叉編譯到 linux/arm64 需要那個目標的
 sysroot、到 macOS 需要一份 SDK，兩者都不在這台機器上；macOS 那一格是「編得出來、
 **沒有任何人跑過**」，不是「編得出來但沒測」。真正被驗證過的是三個：linux/amd64 原生跑整套
-測試、linux/arm64 在 qemu 下跑整套、windows/amd64 在 Wine 下跑（上面那 179 支）。
+測試、linux/arm64 在 qemu 下跑整套、windows/amd64 在 Wine 下跑（上面那 302 支）。
 
 執行期把平台相依集中在 `internal/runtime/src/tyrt_plat.h` 後面（POSIX 與 Windows 各一份），
 `--target <os>/<arch>` 選擇編譯器、旗標與輸出檔名。TLS 是執行期唯一連結外部函式庫
