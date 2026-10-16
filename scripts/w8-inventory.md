@@ -45,10 +45,17 @@
    量的是不同的程式）。
 
 前三項是「讓分叉不可能發生」，第四項是「讓量測可比」。**第一項（移位）與第三項（`promoteOf`）
-已經在 `internal/codegen/lower.go` 落地**；第二項（null 與越界檢查的產生）需要先回答一個這一輪
-沒有回答的問題：那兩個 lowering 各自把「先檢查 null 再檢查範圍」的**順序**寫在自己的呼叫端裡
-（`boundCheck` 與 `boundsCheck` 收到的都是已經求值好的字串／值），所以真正要共享的可能是那個
-順序，而不是檢查的產生——**這一點沒有驗**，寫在這裡而不是猜。
+已經在 `internal/codegen/lower.go` 落地**（六格矩陣 0 分歧加整套 `go test ./...`）。
+
+**第二項的順序問題後來驗了，兩個後端一致**：C 後端的 `indexExpr`（`emit_expr.go:1205`）把
+`e.expr(v.X)` 與 `e.expr(v.Index)` 交給 `boundCheck`，而 `boundCheck` 把它們綁成兩個**先後有序的
+敘述**（`tyarr* n = …; int64_t k = …;`），所以參考先於索引、null 檢查先於範圍檢查；LLVM 後端的
+`elemAddr`／`elemAddrOfIndex`（`llvm_expr.go:1426,1433`）一樣是 arr、idx、然後 `nullCheck` 再
+`boundsCheck`，而**儲存**那一條路（JLS 15.26.1 的「參考、索引、值、然後才檢查」，最容易寫錯的
+一條）兩邊也各自寫了同一句話、引同一條 JLS（`llvm_expr.go:1477` 的註解）。所以那一項要共享的
+**不是順序**——它已經一致——而是別的：兩份 emitter 本質上不可能共用程式碼（一個寫 C、一個寫
+IR），能共享的只有它們的**輸入**（訊息與 action，已經在 `npe.go`）與**時機**
+（上面驗過）。因此清單上剩下的實質工作是第四項（`constDivOp`）。
 
 ## 沒做的、沒看的
 
