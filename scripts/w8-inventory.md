@@ -25,7 +25,7 @@
 | 移位 | `shiftCount`（1906）遮罩成 `& 31`／`& 63`，並把遮罩後的值轉回有號 | `shift`（1190）：`and width-1` 之後 `shl`／`ashr`／`lshr` | **重複的規則**：遮罩寬度與「轉回有號」這件事兩邊各寫一次，而且兩邊的寫法不同（C 是 `(int32_t)((uint32_t)x & 31)`，LLVM 是一個 `and` 指令）。這是清單上第一件該共享的。 |
 | 整除與取餘 | 呼叫執行期的 `ty_div_int`／`ty_rem_int`（1622、2038、2054、2334），另有 `constDivOp`（2071）把常數除數折成乘法與移位 | `divide`（1152）、`remainder`（1169）：同樣呼叫那兩個執行期 helper，**沒有** `constDivOp` | **行為已共享**（同一個執行期 helper），**最佳化只有一邊有**：C 的常數除數折疊在 LLVM 上不存在。那不是語意分叉，是效能分叉——而它讓兩邊產生的程式差很多，所以任何跨後端的時序比較都量到不同的東西。 |
 | 字串拼接 | `concat`（2130）、`concatFrom`（2136）、`concatParts`（2150） | `concat`（1215）、`concatParts`（1232） | **規則已共享**：WTF-8 的合併規則在 `util.StrConcat`（編譯期折疊）與執行期 `ty_str_concat`；兩邊的 lowering 各一份，但都只是把運算元接起來交給那兩個地方。 |
-| 装箱與拆箱 | `boxCall`（177）、`unboxCall`（247）、`unboxAccessor`（279）、`boxKindOf`（1515） | `boxValue`（540）、`unboxValue`（561）、`unboxValueMsg`（567）、`asBox`（931） | **規則已共享**（快取與 `valueOf` 在 `lib/04_boxing.teyru`，檢查器決定哪裡要裝箱）；lowering 各一份，而且**各有一份「哪個 kind 用哪個 accessor」的表**。 |
+| 装箱與拆箱 | `boxCall`（177）、`unboxCall`（247）、`unboxAccessor`（279）、`boxKindOf`（1515） | `boxValue`（540）、`unboxValue`（561）、`unboxValueMsg`（567）、`asBox`（931） | **規則已共享**（快取與 `valueOf` 在 `lib/04_boxing.teyru`，檢查器決定哪裡要裝箱）；lowering 各一份，但**accessor 的表只有一份**——LLVM 後端呼叫 C 後端的 `unboxAccessor`（`llvm_expr.go:591`，而 `grep booleanValue internal/codegen/llvm*.go` 是 0）。 |
 | null 與越界檢查 | `boundCheck`（1196）把檢查與取值寫成一個敘述運算式、`npeCall`（`npe.go`）產生訊息 | `nullCheck`（438）、`boundsCheck`（1443）、`fieldAddr*`（350、357） | **兩邊各一份 lowering**，而且是最大的一份：`ty_npe`／`npeCall`／`nullCheck` 在三個檔案裡共 26 處（`grep -c`：C 10、LLVM 11、`llvm_call.go` 5）。訊息本身（JEP 358 的兩個半句）由 `npe.go` 的規則產生，那一半是共享的。 |
 
 ## 結論
@@ -40,16 +40,22 @@
 
 1. **移位遮罩**（兩邊各一份、寫法不同、而 C 的寫法要處理有號轉回）；
 2. **null／越界檢查的產生**（最大的一份，26 處）；
-3. **装箱／拆箱的 kind→accessor 表**（兩份）；
-4. **`promoteOf` 搬家**（它已經是共享的，只是住錯檔案）；
-5. **`constDivOp` 兩邊都有或兩邊都沒有**（現在只有 C 有，所以跨後端的時序比較在整數除法上
+3. **`promoteOf` 搬家**（它已經是共享的，只是住錯檔案）——**已做**；
+4. **`constDivOp` 兩邊都有或兩邊都沒有**（現在只有 C 有，所以跨後端的時序比較在整數除法上
    量的是不同的程式）。
 
-前四項是「讓分叉不可能發生」，第五項是「讓量測可比」。
+前三項是「讓分叉不可能發生」，第四項是「讓量測可比」。**第一項（移位）與第三項（`promoteOf`）
+已經在 `internal/codegen/lower.go` 落地**；第二項（null 與越界檢查的產生）需要先回答一個這一輪
+沒有回答的問題：那兩個 lowering 各自把「先檢查 null 再檢查範圍」的**順序**寫在自己的呼叫端裡
+（`boundCheck` 與 `boundsCheck` 收到的都是已經求值好的字串／值），所以真正要共享的可能是那個
+順序，而不是檢查的產生——**這一點沒有驗**，寫在這裡而不是猜。
 
 ## 沒做的、沒看的
 
-- **沒有動任何程式碼**：這一輪只交清單（計畫的 W8.2 第 2 步是「先做清單」，而第 3 步才是實作）。
+- **寫這份清單的那一輪沒有動程式碼**（計畫的 W8.2 第 2 步是「先做清單」，第 3 步才是實作）。
+  之後第一項與第三項已經落地：`internal/codegen/lower.go` 現在有 `shiftBits`（兩個後端都呼叫
+  它，取代 C 的 `5`／`6` 與 LLVM 自己推的 `width-1`）與搬過去的 `promoteOf`，驗證是六格矩陣
+  0 分歧加整套 `go test ./...`。
 - **沒有量**「共享之後每個後端少幾行」——那是實作那一步的事。
 - **只讀了 `emit*.go` 與 `llvm*.go` 的對應函式**，沒有逐一比對兩個 lowering 在每一個型別組合
   上的行為（那需要一份跨後端的差異測試，而 `scripts/backend-matrix.sh` 就是那個測試的雛形：
