@@ -622,6 +622,30 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   照舊涵蓋，而**一個框架自己的字在兩種版面上都在範圍裡**。驗證：`t245_dropped_reference`
   在 arm64 上 **8 → 0**（x86-64 仍是 0），`gcc`／`aarch64-linux-gnu-gcc -c -O2 -Wall -Wextra`
   對 `tyrt.c` 都是 0 警告，而 `TEYRU_GC_STRESS=1` 下 `t57_gc_pressure` 與 `t245` 都符合期望。
+- **windows/amd64 的平台表是 2026-10-17 重量的（Wine，302 支）**：**290 支**輸出（stdout、stderr、
+  結束碼）逐位元組相同、**11 支**碰得到 TLS 而被具名拒絕（mingw-w64 沒有 OpenSSL）、**1 支**
+  （`t99_file_shell_meta`）因 NTFS 不能有那種檔名而跳過、**0 支不符**。先前記的「195 支裡 179
+  支」是被取代的數字。**這一輪找到並修掉的 Windows 專屬缺陷**（每一項都是量到的，不是推論）：
+  ①`-lws2_32` 排在目的檔**之前**，靜態連結因此 `undefined reference to __imp_WSAStartup`
+  （目標表新增 `sysLibs`，排在目的檔之後）；②MinGW 不宣告 `aligned_alloc`（`-std=gnu11` 下），
+  slab 對齊修正因此讓整個目標編不過（`slab_alloc` 在 `_WIN32` 用 `_aligned_malloc`）；③MinGW
+  對函式**不實作** `__attribute__((weak))`（符號被整個丟掉），debug 建置的 TLS 弱定義因此變成
+  `undefined reference to ty_tls_close`；④`System.getProperty` 在 `_WIN32` 對 `os.name`／
+  `user.dir` 等一律回 null，`File.getAbsolutePath` 因此回**相對**路徑，而 `isAbsolutePath` 又不認
+  `C:\`；⑤**`longjmp` 在 x86-64 Windows 是展開式的**（`RtlUnwindEx` 從 throw 走回 setjmp 記下的
+  框架），而產生的 C 沒有任何 SEH 終止處理器可跑，所以那趟走訪只會出錯——在 Wine 下它**跑出
+  執行緒的堆疊**：執行緒死在 ntdll 裡（`virtual_setup_exception stack overflow 2496 bytes`），
+  行程卡住、該印的那行 `Exception in thread …` 永遠沒印（`t227_websocket_handler_error`，
+  失敗時 0/12、加上除錯輸出就恢復正常——典型的版面敏感）。修法是 Windows 目標的旗標
+  `-D__USE_MINGW_SETJMP_NON_SEH`，讓 `<setjmp.h>` 選 MinGW 自己的 `__mingw_setjmp`／
+  `__mingw_longjmp`（單純的暫存器存取）；修後同一個執行檔 **30/30** 通過。**這個缺陷沒有被任何
+  已存在的測試單獨釘住的原因**也寫在這裡：t216、最小的「執行緒內丟 Error」重現
+  （`try`／`finally`／`ThreadPool` 四種形狀）在展開式 `longjmp` 下全都通過，只有 ws 那條路
+  （`finally` 關 socket、worker 的 `catch (Throwable)` 重丟、替補執行緒同時啟動）會踩到。
+  **其中 16 支要用 `-O0` 建**：mingw 的 `cc1` 在最大的幾支 `-O1` 上跑超過兩小時（`-O0` 十幾秒）；
+  那是工具鏈的建置時間，不是行為差異。**另一個量測陷阱**：`WINEDEBUG` 沒設時 Wine 把自己的
+  版本橫幅與註冊表抱怨寫進 stderr，`.experr` 的比對因此失敗——`tests/run.sh` 現在預設
+  `WINEDEBUG=-all`。
 - **配置器的快速路徑從 null 造指標（已修），與它是怎麼被找到的**：`ty_alloc`（`tyrt.h`）與
   `ty_alloc_slow`（`tyrt.c`）都用 `p + total > me->bump_end` 判斷 slab 還有沒有空間，而
   `p = me->bump` 在**一個收集把這條執行緒的 slab 拆掉之後就是 NULL**——對一個 null 指標做
