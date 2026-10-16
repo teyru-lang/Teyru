@@ -1153,16 +1153,18 @@ func (e *llvmEmitter) divide(f *fb, b *ast.Binary) lval {
 	ot := b.OpType
 	x := e.operand(f, b.X, ot)
 	y := e.operand(f, b.Y, ot)
-	if ast.IsPrim(ot, ast.Long) {
-		e.markExn("TY_ARITH", e.p.Builtins.Arith)
-		return e.rtCall(f, "ty_div_long", b.GetType(), []lval{x, y})
-	}
 	if isFloating(ot) {
 		r := f.reg()
 		f.ins(fmt.Sprintf("%s = fdiv %s %s, %s", r, e.llvmType(ot), x.v, y.v))
 		return value(r, b.GetType())
 	}
+	if r, ok := e.constDivFold(f, b.Y, "/", ot, x); ok {
+		return e.coerce(f, r, b.GetType())
+	}
 	e.markExn("TY_ARITH", e.p.Builtins.Arith)
+	if ast.IsPrim(ot, ast.Long) {
+		return e.rtCall(f, "ty_div_long", b.GetType(), []lval{x, y})
+	}
 	return e.rtCall(f, "ty_div_int", b.GetType(), []lval{x, y})
 }
 
@@ -1170,17 +1172,56 @@ func (e *llvmEmitter) remainder(f *fb, b *ast.Binary) lval {
 	ot := b.OpType
 	x := e.operand(f, b.X, ot)
 	y := e.operand(f, b.Y, ot)
-	if ast.IsPrim(ot, ast.Long) {
-		e.markExn("TY_ARITH", e.p.Builtins.Arith)
-		return e.rtCall(f, "ty_rem_long", b.GetType(), []lval{x, y})
-	}
 	if isFloating(ot) {
 		r := f.reg()
 		f.ins(fmt.Sprintf("%s = frem %s %s, %s", r, e.llvmType(ot), x.v, y.v))
 		return value(r, b.GetType())
 	}
+	if r, ok := e.constDivFold(f, b.Y, "%", ot, x); ok {
+		return e.coerce(f, r, b.GetType())
+	}
 	e.markExn("TY_ARITH", e.p.Builtins.Arith)
+	if ast.IsPrim(ot, ast.Long) {
+		return e.rtCall(f, "ty_rem_long", b.GetType(), []lval{x, y})
+	}
 	return e.rtCall(f, "ty_rem_int", b.GetType(), []lval{x, y})
+}
+
+// constDivFold renders a division or a remainder whose divisor the checker
+// folded into a constant: the LLVM side of lower.go's divFold, and the reason
+// that rule lives in one place. The C back end folded these and this one did
+// not, so the same source became a helper call here and a bare division there,
+// and every cross-back-end timing measured two different programs.
+//
+// `x % 1`, `x % -1` and `x / 1` answer without an instruction; `x / -1` is a
+// `sub` from zero, the negation through an unsigned value that makes Java's
+// MIN / -1 == MIN come out right -- a plain negation of MIN is poison, which is
+// what LLVM calls undefined; any other constant is a bare `sdiv` or `srem`
+// whose divisor is not zero, so neither the call nor its exception mark is
+// needed. A constant zero is not folded here: it is the case that throws.
+func (e *llvmEmitter) constDivFold(f *fb, divisor ast.Expr, op string, ot ast.Type, x lval) (lval, bool) {
+	c, ok := intConstOf(e.p, divisor)
+	fold := foldDiv(c, ok)
+	if fold == divHelper {
+		return lval{}, false
+	}
+	if op == "%" && fold != divPlain {
+		return value("0", ot), true
+	}
+	if fold == divIdentity {
+		return value(x.v, ot), true
+	}
+	r := f.reg()
+	if fold == divNegate {
+		f.ins(fmt.Sprintf("%s = sub %s 0, %s", r, e.llvmType(ot), x.v))
+		return value(r, ot), true
+	}
+	ins := "sdiv"
+	if op == "%" {
+		ins = "srem"
+	}
+	f.ins(fmt.Sprintf("%s = %s %s %s, %d", r, ins, e.llvmType(ot), x.v, c))
+	return value(r, ot), true
 }
 
 // shift lowers <<, >> and >>>. JLS 15.19 leaves only the low five bits of an
@@ -1578,6 +1619,11 @@ func (e *llvmEmitter) compoundDiv(f *fb, a *ast.Assign, op string, cur lval, t a
 		}
 		f.ins(fmt.Sprintf("%s = %s %s %s, %s", r, ins, e.llvmType(ot), x.v, y.v))
 		return e.coerce(f, value(r, ot), t)
+	}
+	// The same fold the C back end's compoundOp applies, from the same rule in
+	// lower.go: a compound division by a constant is not a call on either side.
+	if r, ok := e.constDivFold(f, a.Y, op, ot, e.coerce(f, cur, ot)); ok {
+		return e.coerce(f, r, t)
 	}
 	e.markExn("TY_ARITH", e.p.Builtins.Arith)
 	fn := "ty_div_int"

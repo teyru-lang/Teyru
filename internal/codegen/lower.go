@@ -17,7 +17,10 @@ package codegen
  * The rules that are still written twice are listed in scripts/w8-inventory.md
  * with the risk each one carries; this file is where they are going. */
 
-import "github.com/teyru-lang/Teyru/internal/ast"
+import (
+	"github.com/teyru-lang/Teyru/internal/ast"
+	"github.com/teyru-lang/Teyru/internal/sema"
+)
 
 // promoteOf is the type a unary operator works in: JLS 5.6 promotes byte,
 // short and char to int and leaves the rest alone. It is sema's promoteUnary,
@@ -48,4 +51,69 @@ func shiftBits(t ast.Type) int {
 		return 6
 	}
 	return 5
+}
+
+// divFold is what a division or a remainder by a *constant* divisor is, which
+// Java answers without a call and which C and LLVM each get wrong in one case.
+// The two back ends render the answer in their own terms -- a C expression, an
+// instruction -- but the answer itself is one piece of code, because it is a
+// rule about Java and not about either back end.
+//
+// The cases that matter, all of them about the most negative value:
+//
+//   - `x % 1` and `x % -1` are 0. In C `x % -1` is undefined for the most
+//     negative x and in LLVM `srem` with -1 is poison, so folding is what keeps
+//     the program defined rather than an optimisation.
+//   - `x / 1` is x.
+//   - `x / -1` is the negation of x *through an unsigned value*, because Java
+//     answers MIN / -1 with MIN and a plain negation of MIN is undefined in C
+//     and poison in LLVM.
+//   - any other constant is a bare divide or remainder: the divisor is not zero,
+//     so neither the helper call nor its exception mark is needed.
+//   - a constant zero is *not* a fold. It is the case that throws, and the
+//     helper is the only thing that can.
+type divFold uint8
+
+const (
+	divHelper   divFold = iota // not a constant, or a constant zero
+	divIdentity                // x / 1 and x % 1
+	divNegate                  // x / -1 and x % -1
+	divPlain                   // another constant: a bare divide or remainder
+)
+
+// foldDiv classifies a divisor the checker folded.
+func foldDiv(c int64, ok bool) divFold {
+	switch {
+	case !ok, c == 0:
+		return divHelper
+	case c == 1:
+		return divIdentity
+	case c == -1:
+		return divNegate
+	}
+	return divPlain
+}
+
+// intConstOf reports the value of an integer expression the checker folded: a
+// literal, a `-` in front of one, or a constant field. Everything else is not
+// one, and saying so is what keeps an emitter from guessing. Both back ends ask
+// it, because "what counts as a constant" is a rule about Java.
+func intConstOf(p *sema.Program, x ast.Expr) (int64, bool) {
+	switch v := x.(type) {
+	case *ast.Literal:
+		switch v.Kind {
+		case ast.LitChar, ast.LitInt, ast.LitLong:
+			return int64(v.Int), true
+		}
+	case *ast.Unary:
+		if v.Op == "-" {
+			if c, ok := intConstOf(p, v.X); ok {
+				return -c, true
+			}
+		}
+	}
+	if cv := p.ConstInt(x); cv != nil {
+		return *cv, true
+	}
+	return 0, false
 }
