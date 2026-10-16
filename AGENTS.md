@@ -614,8 +614,14 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   缺陷的另一種寫法（`getelementptr **inbounds**` 從 null 出發是 poison，於是分支條件是
   poison）。**發現它的路徑值得記下來**：W14 第 9 項的代理實驗（把 `TY_ALIGN` 改成 32）讓
   `bench_escape` 在每個規模都 SIGSEGV，而**同一支變體在 `-fsanitize=address` 下跑得完**——
-  ASan 看不到、UBSan 一指就中的那個組合，就是它。（順帶：**修好它並沒有讓 (32,32) 那個變體
-  跑起來**，所以 (32,32) 崩潰還有別的原因，見下一條。）
+  ASan 看不到、UBSan 一指就中的那個組合，就是它。
+  **修好它並沒有讓 (32,32) 那個變體跑起來**：修完之後 (32,32) 在 UBSan 下**沒有診斷**、
+  在 `-fsanitize=address` 下**跑得完**、`n=10000` 也跑得完，但 `n=100000` 起仍然 SIGSEGV——
+  所以它要一次收集才會踩到，而且是別的東西。已排除的：UBSan（乾淨）、ASan（乾淨）、
+  執行期自己的 fault handler（**沒有印任何字**，這件事本身值得查）、core（這台機器
+  `coredump.conf` 的 `Storage=none`，所以沒有 core 可讀）、valgrind（沒裝）。下一步是
+  在收集器那側：`TY_ALIGN` 從 16 變 32 之後，block map（`TY_START_BYTES`）、
+  `obj_in_chunk` 的下標與 `valid_obj` 的對齊前置測試是三個要一起看的東西。
 - **W14 第 9 項（`TY_HDR` 與 `TY_ALIGN`）的第一個實驗：那兩個常數不是兩個常數。** 這一項要的是
   「收窄 8 或 16 位元組在真實基準上值多少」，而做這件事需要一個能單獨調這兩個數字的變體。
   試了：`TY_HDR` 16→32 與 `TY_ALIGN` 16→32 **各自單獨改**，`examples/bench_escape`（4000 萬次）
