@@ -1093,6 +1093,16 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   `frame_map_ok` 先驗證字陣列落在該執行緒的堆疊範圍內，不成立就**不採信那筆記錄**（它的字
   照樣被保守掃描，所以不會少 root）。
 
+- **兩個後端的語意一致性（W8.2 的清單在 `scripts/w8-inventory.md`）**：計畫寫的是「已經分叉過的
+  語意規則要下沉為共享的 lowering」，而清單做出來的結論比那個具體：**規則本身已經共享了**
+  （運算型別由檢查器寫在 AST 的 `Binary.OpType`／`Assign.OpType` 上，快取與 `valueOf` 在
+  `lib/04_boxing.teyru`，WTF-8 的合併規則在 `util.StrConcat` 與執行期的 `ty_str_concat`），
+  **重複的是 lowering**——而歷史上咬人的兩件事（浮點窄化飽和修了兩次、複合 `/=` 的提升 bug
+  只在 LLVM 後端）都在 lowering 裡。清單把該共享的五件事按風險排好了：移位的遮罩（兩邊寫法
+  不同）、null 與越界檢查的產生（26 處，最大的一份）、装箱／拆箱的 kind→accessor 表（兩份）、
+  `promoteOf` 搬家（它已經是共享的，只是住在 C 後端的檔案裡），以及 `constDivOp`（常數除數的
+  折疊**只有 C 後端有**，所以跨後端的整數除法時序比較量的是不同的程式）。**這一輪只交清單、
+  沒有動程式碼**；`scripts/backend-matrix.sh` 是那個「兩個後端不能分叉」的測試。
 - **LLVM 後端不帶框架地圖，於是跑保守的收集器（`llvm.go` 的 `EmitLLVM`，先前的指名拒絕已移除）**：
   地圖是預設之後，LLVM 後端是唯一會產生「收集器以為 roots 精確、後端卻從未說哪些字是參考」
   的程式的地方——它產自己的 IR，參考可能住在 SSA 暫存器或它自己選的 alloca 裡，失敗模式是
