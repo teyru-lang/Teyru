@@ -614,7 +614,13 @@ func (e *llvmEmitter) bumpAlloc(f *fb, total, size int64) string {
 	bump := e.loadRaw(f, "ptr", me, 8)
 	bend := e.loadRaw(f, "ptr", e.gepBytes(f, me, 8), 8)
 	end := f.reg()
-	f.ins(fmt.Sprintf("%s = getelementptr inbounds i8, ptr %s, i64 %d", end, bump, total))
+	// Not `inbounds`: the bump pointer is null while the thread's slab is
+	// detached, which is a state a collection leaves it in, and an inbounds
+	// getelementptr from null with a non-zero offset is poison -- the comparison
+	// below would be poison with it, and a branch on poison is undefined. The C
+	// back end's fast path had the same defect in its own terms (forming
+	// `p + total` on null); tyrt.h's ty_alloc says what it cost there.
+	f.ins(fmt.Sprintf("%s = getelementptr i8, ptr %s, i64 %d", end, bump, total))
 	over := f.reg()
 	f.ins(fmt.Sprintf("%s = icmp ugt ptr %s, %s", over, end, bend))
 	since := e.loadRaw(f, "i64", e.gepBytes(f, me, 16), 8)

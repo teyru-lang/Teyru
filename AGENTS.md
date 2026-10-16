@@ -603,6 +603,19 @@ vercel deploy --prod   # 建置並發佈；完成後 docs.teyru.dev 就是它
   照舊涵蓋，而**一個框架自己的字在兩種版面上都在範圍裡**。驗證：`t245_dropped_reference`
   在 arm64 上 **8 → 0**（x86-64 仍是 0），`gcc`／`aarch64-linux-gnu-gcc -c -O2 -Wall -Wextra`
   對 `tyrt.c` 都是 0 警告，而 `TEYRU_GC_STRESS=1` 下 `t57_gc_pressure` 與 `t245` 都符合期望。
+- **配置器的快速路徑從 null 造指標（已修），與它是怎麼被找到的**：`ty_alloc`（`tyrt.h`）與
+  `ty_alloc_slow`（`tyrt.c`）都用 `p + total > me->bump_end` 判斷 slab 還有沒有空間，而
+  `p = me->bump` 在**一個收集把這條執行緒的 slab 拆掉之後就是 NULL**——對一個 null 指標做
+  `p + total` 是未定義行為，編譯器因此可以假設 `p` 非 null，並把後面的寫入搬過這個測試。
+  **UBSan 在每一支程式上都報它**（`applying non-zero offset 48 to null pointer`），而它是
+  **既有的**（今天的任何改動之前就有）。修法是不從 null 造指標：**算術改用 `uintptr_t`**
+  （整數沒有這條規則，而且它編出來就是舊形式的那個加法加比較——交錯量測六次、各取最小，
+  `examples/bench_escape` 兩邊都是 0.92 s，差在雜訊裡）。兩個後端都修：LLVM 那邊是同一個
+  缺陷的另一種寫法（`getelementptr **inbounds**` 從 null 出發是 poison，於是分支條件是
+  poison）。**發現它的路徑值得記下來**：W14 第 9 項的代理實驗（把 `TY_ALIGN` 改成 32）讓
+  `bench_escape` 在每個規模都 SIGSEGV，而**同一支變體在 `-fsanitize=address` 下跑得完**——
+  ASan 看不到、UBSan 一指就中的那個組合，就是它。（順帶：**修好它並沒有讓 (32,32) 那個變體
+  跑起來**，所以 (32,32) 崩潰還有別的原因，見下一條。）
 - **W14 第 9 項（`TY_HDR` 與 `TY_ALIGN`）的第一個實驗：那兩個常數不是兩個常數。** 這一項要的是
   「收窄 8 或 16 位元組在真實基準上值多少」，而做這件事需要一個能單獨調這兩個數字的變體。
   試了：`TY_HDR` 16→32 與 `TY_ALIGN` 16→32 **各自單獨改**，`examples/bench_escape`（4000 萬次）

@@ -1101,7 +1101,10 @@ void *ty_alloc_slow(size_t total) {
     gc_collect("budget");
   }
   char *p = me->bump;
-  if (!(p + total > me->bump_end)) {
+  /* The same null as the fast path's, and here it is the usual case: a thread
+     whose slab a collection detached arrives with p NULL, and `p + total` on it
+     is undefined. Same fix, same reason -- see tyrt.h's ty_alloc. */
+  if ((uintptr_t)p + total <= (uintptr_t)me->bump_end) {
     me->bump = p + total;
     me->alloc_since += (int64_t)total;
     ty_heap_unlock();
