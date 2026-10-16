@@ -1480,21 +1480,6 @@ func (e *Emitter) unaryInner(v *ast.Unary) string {
 	return x
 }
 
-// promoteOf is the type a unary operator works in: JLS 5.6 promotes byte,
-// short and char to int and leaves the rest alone. It is sema's promoteUnary,
-// restated for the emitter (which cannot import the checker).
-func promoteOf(k ast.PrimKind) *ast.PrimType {
-	switch k {
-	case ast.Long:
-		return ast.TLong
-	case ast.Float:
-		return ast.TFloat
-	case ast.Double:
-		return ast.TDouble
-	}
-	return ast.TInt
-}
-
 // negate renders -x, where x is an expression of type p. An integral negation
 // goes through an unsigned value, because C leaves the negation of the most
 // negative one undefined and clang folds it away where Java wraps; a floating
@@ -1737,10 +1722,11 @@ func (e *Emitter) foldBinary(v *ast.Binary) (string, bool) {
 	// depends on the type the shift is performed in -- not on the int64 used
 	// here. Masking with the long width would fold an int `a << 32` to 0 where
 	// Java gives 1.
-	mask := uint((1 << shiftBitsInt) - 1)
+	bits := shiftBits(ast.TInt)
 	if wide {
-		mask = (1 << shiftBitsLong) - 1
+		bits = shiftBits(ast.TLong)
 	}
+	mask := uint((1 << bits) - 1)
 	var r int64
 	switch v.Op {
 	case "+":
@@ -1877,18 +1863,6 @@ func (e *Emitter) flatRight(y ast.Expr, v *ast.Binary) string {
 	return s
 }
 
-// shiftBitsInt and shiftBitsLong are the number of low bits of a shift count
-// that JLS 15.19 leaves significant: 5 for the int family, 6 for long. Every
-// other bit of the count is discarded, so an int `a << 33` shifts by 1. C
-// instead leaves a shift whose count reaches the operand width undefined, and
-// clang at -O1 and -O2 folds such a shift to an arbitrary value or lets a stack
-// address through, so masking is what keeps the emitted program defined rather
-// than an optimisation.
-const (
-	shiftBitsInt  = 5
-	shiftBitsLong = 6
-)
-
 // shiftType is the type a shift whose left operand has type t is performed in:
 // JLS 5.6 promotes every integral type but long to int.
 func shiftType(t ast.Type) ast.Type {
@@ -1898,18 +1872,19 @@ func shiftType(t ast.Type) ast.Type {
 	return ast.TInt
 }
 
-// shiftCount renders an already-rendered shift count reduced to the bits of
-// shiftBitsInt/shiftBitsLong. The count is masked as an unsigned value, so a
-// negative one wraps the way Java's does (`a << -1` shifts by 31), and the
-// masked count is cast back to the signed type the shift is performed in: a
-// count of unsigned type would drag the shifted operand into unsigned
-// arithmetic under the usual conversions and quietly turn `>>` into a logical
-// shift. left is the type of the operand being shifted.
+// shiftCount renders an already-rendered shift count reduced to the bits
+// shiftBits names. The count is masked as an unsigned value, so a negative one
+// wraps the way Java's does (`a << -1` shifts by 31), and the masked count is
+// cast back to the signed type the shift is performed in: a count of unsigned
+// type would drag the shifted operand into unsigned arithmetic under the usual
+// conversions and quietly turn `>>` into a logical shift. left is the type of
+// the operand being shifted.
 func shiftCount(count string, left ast.Type) string {
-	ut, st, bits := "uint32_t", "int32_t", shiftBitsInt
+	ut, st := "uint32_t", "int32_t"
 	if ast.IsPrim(left, ast.Long) {
-		ut, st, bits = "uint64_t", "int64_t", shiftBitsLong
+		ut, st = "uint64_t", "int64_t"
 	}
+	bits := shiftBits(left)
 	return "(" + st + ")((" + ut + ")(" + count + ") & " + strconv.Itoa((1<<bits)-1) + ")"
 }
 
