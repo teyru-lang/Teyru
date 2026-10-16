@@ -987,7 +987,15 @@ static void *take_batch(int k) {
 static tychunk *chunk_new(size_t total) {
     size_t cap = total > TY_CHUNK ? ((total + TY_CHUNK - 1) & ~(size_t)(TY_CHUNK - 1)) : TY_CHUNK;
   tychunk *c = (tychunk *)malloc(sizeof(tychunk));
-    c->mem = (char *)malloc(cap);
+    /* The slab base has to be TY_ALIGN-aligned, and not for tidiness: valid_obj
+       throws away a candidate whose low bits are not zero, so a base that malloc
+       only aligned to 16 makes every payload of a TY_ALIGN=32 build invisible --
+       the mark phase finds nothing live, the sweep frees the slabs that hold the
+       live objects, and the program walks into them. That is exactly what W14
+       item 9's experiment hit, and scripts/w14-analysis.md has the crash and its
+       diagnosis. malloc promises 16 bytes, aligned_alloc promises what it is
+       asked for, and TY_CHUNK is a multiple of both. */
+    c->mem = (char *)aligned_alloc(TY_ALIGN, (size_t)cap);
     c->starts = (uint8_t *)calloc(TY_START_BYTES(cap), 1);
     c->cap = cap;
     c->used = 0;
