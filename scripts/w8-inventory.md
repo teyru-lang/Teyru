@@ -41,11 +41,26 @@
 1. **移位遮罩**（兩邊各一份、寫法不同、而 C 的寫法要處理有號轉回）；
 2. **null／越界檢查的產生**（最大的一份，26 處）；
 3. **`promoteOf` 搬家**（它已經是共享的，只是住錯檔案）——**已做**；
-4. **`constDivOp` 兩邊都有或兩邊都沒有**（現在只有 C 有，所以跨後端的時序比較在整數除法上
-   量的是不同的程式）。
+4. **`constDivOp` 兩邊都有或兩邊都沒有** —— **已做**（見下）。
 
-前三項是「讓分叉不可能發生」，第四項是「讓量測可比」。**第一項（移位）與第三項（`promoteOf`）
-已經在 `internal/codegen/lower.go` 落地**（六格矩陣 0 分歧加整套 `go test ./...`）。
+前三項是「讓分叉不可能發生」，第四項是「讓量測可比」。**四項都已經在
+`internal/codegen/lower.go` 落地**：`shiftBits`、搬過去的 `promoteOf`、以及 `divFold` 與
+`intConstOf`（除數規則與「什麼算常數」，兩邊都讀同一份）。驗證：六格矩陣 0 分歧加整套
+`go test ./...`，加上 `tests/programs/t287_div_constants.teyru`（它的 `.expected` 是 JDK 21
+印的，兩個後端逐位元組相同）。
+
+第四項落地前後的樣子（`emit-llvm --backend=llvm -O0`，同一支最小程式）：
+
+```
+-  %t18 = call i32 @ty_div_int(i32 %t17, i32 3)     改動前（LLVM 後端）
++  %t18 = sdiv i32 %t17, 3                          改動後
++  %t27 = sub i32 0, %t26                           x / -1：Java 的 MIN / -1 是 MIN
+```
+
+**要注意量的是哪一個 `emit-llvm`**：不加 `--backend=llvm` 時它印的是 **C 後端產生的 C**
+交給 clang 之後的 IR（`driver.go` 的 `writeLLVMIR`），那裡本來就是折疊過的——所以那一條
+路徑看起來「兩邊早就一樣」，而 LLVM 後端自己的輸出（`--backend=llvm`）不是。這一輪先後
+被這件事騙了兩次（一次以為 LLVM 早就折疊、一次以為 `divide` 沒被走到）。
 
 **第二項的順序問題後來驗了，兩個後端一致**：C 後端的 `indexExpr`（`emit_expr.go:1205`）把
 `e.expr(v.X)` 與 `e.expr(v.Index)` 交給 `boundCheck`，而 `boundCheck` 把它們綁成兩個**先後有序的

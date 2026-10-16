@@ -2047,22 +2047,23 @@ func (e *Emitter) constDivOp(op, a, b string, divisor ast.Expr, opType ast.Type)
 	if isFloating(opType) {
 		return ""
 	}
-	c, ok := e.intConst(divisor)
-	if !ok || c == 0 {
+	// The rule -- what a constant divisor means, including the two cases C and
+	// LLVM each leave undefined -- lives in lower.go, because the LLVM back end
+	// has to answer the same way and a rule written twice is a rule that drifts.
+	fold := foldDiv(intConstOf(e.prog, divisor))
+	switch fold {
+	case divHelper:
 		return ""
-	}
-	if op == "%" {
-		// `x % 1` and `x % -1` are both 0 in Java, and `x % -1` is the one C
-		// leaves undefined
-		if c == 1 || c == -1 {
+	case divIdentity:
+		if op == "%" {
 			return "0"
 		}
-		return "((" + a + ") % (" + b + "))"
-	}
-	switch c {
-	case 1:
 		return "(" + a + ")"
-	case -1:
+	case divNegate:
+		// `x % -1` is 0 in Java, and C leaves it undefined
+		if op == "%" {
+			return "0"
+		}
 		// Java answers MIN / -1 with MIN; negate() goes through an unsigned
 		// value, which is the same answer with every input defined
 		if pt, ok := opType.(*ast.PrimType); ok && pt.IsIntegral() {
@@ -2070,30 +2071,10 @@ func (e *Emitter) constDivOp(op, a, b string, divisor ast.Expr, opType ast.Type)
 		}
 		return ""
 	}
+	if op == "%" {
+		return "((" + a + ") % (" + b + "))"
+	}
 	return "((" + a + ") / (" + b + "))"
-}
-
-// intConst reports the value of an integer expression the checker folded: a
-// literal, a `-` in front of one, or a constant field. Everything else is not
-// one, and saying so is what keeps the emitter from guessing.
-func (e *Emitter) intConst(x ast.Expr) (int64, bool) {
-	switch v := x.(type) {
-	case *ast.Literal:
-		switch v.Kind {
-		case ast.LitChar, ast.LitInt, ast.LitLong:
-			return int64(v.Int), true
-		}
-	case *ast.Unary:
-		if v.Op == "-" {
-			if c, ok := e.intConst(v.X); ok {
-				return -c, true
-			}
-		}
-	}
-	if cv := e.prog.ConstInt(x); cv != nil {
-		return *cv, true
-	}
-	return 0, false
 }
 
 // isFloating reports whether a type is float or double.
