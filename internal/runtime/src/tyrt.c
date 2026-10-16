@@ -158,6 +158,18 @@ __attribute__((noinline)) void ty_frame_enter_(tyframe *f, void **slots, int32_t
   f->fno = fno;
   f->lo = (char *)__builtin_frame_address(0) + sizeof(void *);
   f->hi = frame_addr + sizeof(void *);
+  /* The frame's own record and the array that names its words are the frame's
+     storage too, and they are the two things frame_map_ok insists on finding
+     inside the extent. Taking them here and the words themselves in
+     ty_frame_put is what makes the extent the frame's storage on either
+     layout -- see ty_frame_put for why the frame pointer alone is not. */
+  if ((char *)f < f->lo) f->lo = (char *)f;
+  if ((char *)f + sizeof(tyframe) > f->hi) f->hi = (char *)f + sizeof(tyframe);
+  if (slots && nslots > 0) {
+    if ((char *)slots < f->lo) f->lo = (char *)slots;
+    if ((char *)slots + (size_t)nslots * sizeof(void *) > f->hi)
+      f->hi = (char *)slots + (size_t)nslots * sizeof(void *);
+  }
   /* The register half of the map. A callee-saved register is the caller's
      value here, by the ABI; see tyrt.h's tyframe comment for why all of them
      are taken rather than the ones that hold a reference. */
@@ -193,6 +205,21 @@ void ty_frame_put(tyframe *f, int32_t k, void *p) {
     abort();
   }
   f->slots[k] = p;
+  /* The words a frame names are its own storage, and the extent has to cover
+     them: the collector leaves the extent out of the conservative scan, so a
+     word outside it is read as a root -- and a word a map has already given
+     back (this call with NULL) still holds what the program dropped there.
+     Deriving the extent from the frame pointer alone assumes a layout the two
+     targets do not share: x86-64 puts a frame's locals *below* the frame
+     pointer and arm64 puts them *above* it, so the same arithmetic covers the
+     frame on one and misses it on the other -- t245_dropped_reference answers
+     0 on x86-64 and 8 MB on arm64 for exactly that reason. Widening here, and
+     never narrowing, keeps what the frame pointers already covered (the frame's
+     floor and the callee's spills) and adds the words themselves. */
+  if (p) {
+    if ((char *)p < f->lo) f->lo = (char *)p;
+    if ((char *)p + sizeof(void *) > f->hi) f->hi = (char *)p + sizeof(void *);
+  }
 }
 
 /* Leave it. Only the innermost frame may unlink itself: after a longjmp has
