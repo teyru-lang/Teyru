@@ -642,8 +642,9 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   已存在的測試單獨釘住的原因**也寫在這裡：t216、最小的「執行緒內丟 Error」重現
   （`try`／`finally`／`ThreadPool` 四種形狀）在展開式 `longjmp` 下全都通過，只有 ws 那條路
   （`finally` 關 socket、worker 的 `catch (Throwable)` 重丟、替補執行緒同時啟動）會踩到。
-  **其中 16 支要用 `-O0` 建**：mingw 的 `cc1` 在最大的幾支 `-O1` 上跑超過兩小時（`-O0` 十幾秒）；
-  那是工具鏈的建置時間，不是行為差異。**另一個量測陷阱**：`WINEDEBUG` 沒設時 Wine 把自己的
+  **這個數字是整套以 `-O0` 建出來的**（302 支約 3 分鐘建完、跑完）：mingw 的 `cc1` 在最大的幾支
+  `-O1` 上跑超過兩小時，所以 `-O1` 的整套在這台機器上不是一個可行的量測——那是工具鏈的建置時間，
+  不是行為差異（`-O1` 下 274 支建得完的也都逐位元組相同）。**另一個量測陷阱**：`WINEDEBUG` 沒設時 Wine 把自己的
   版本橫幅與註冊表抱怨寫進 stderr，`.experr` 的比對因此失敗——`tests/run.sh` 現在預設
   `WINEDEBUG=-all`。
 - **配置器的快速路徑從 null 造指標（已修），與它是怎麼被找到的**：`ty_alloc`（`tyrt.h`）與
