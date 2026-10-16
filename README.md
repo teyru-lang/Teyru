@@ -32,7 +32,7 @@ teyru run hello.teyru
 | 目標 | 建置 | 執行 |
 |---|---|---|
 | linux/amd64 | ✅ | ✅ 原生，整套測試都在這裡跑（`go test ./...`、`TEYRU=<編譯器> sh tests/run.sh`） |
-| windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉編譯；**碰得到 TLS 的程式除外**，那些是具名拒絕（mingw-w64 沒有 OpenSSL） | ✅ 在 Wine 下跑，2026-10-17 量 `tests/programs` 的 **302 支**：**290 支輸出（stdout、stderr、結束碼）逐位元組相同**、**11 支碰得到 TLS 而被具名拒絕**、**1 支（`t99_file_shell_meta`）因 NTFS 不能有那種檔名而跳過**——**0 支不符**。其中 16 支要用 `-O0` 建（mingw 的 `cc1` 在最大的幾支 `-O1` 上跑超過兩小時，`-O0` 十幾秒），那是工具鏈的建置時間，不是行為差異 |
+| windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉編譯；**碰得到 TLS 的程式除外**，那些是具名拒絕（mingw-w64 沒有 OpenSSL） | ✅ 在 Wine 下跑，2026-10-17 量 `tests/programs` 的 **302 支**：**290 支輸出（stdout、stderr、結束碼）逐位元組相同**、**11 支碰得到 TLS 而被具名拒絕**、**1 支（`t99_file_shell_meta`）因 NTFS 不能有那種檔名而跳過**——**0 支不符**。整套以 `-O0` 建（約 3 分鐘建完 302 支）；`-O1` 在最大的幾支上 mingw 的 `cc1` 要跑超過兩小時，那是工具鏈的建置時間，不是行為差異 |
 | linux/arm64 | ✅ 需一支指向 arm64 sysroot 的編譯器（`CC=aarch64-linux-gnu-gcc` ＋ `QEMU_LD_PREFIX`，做法寫在 `AGENTS.md` §10） | ✅ 在 qemu 下跑：整套 **250 項全過、0 項不符**（222 支程式＋3 個套件＋23 個診斷＋2 個原生），量於 2026-09-17 |
 | darwin/amd64、darwin/arm64 | ✅ 以 `--cc <zig cc -target <arch>-macos>`（`resolveTarget` 現在看的是這次真的會用的那支編譯器） | ❌ 這裡沒有 macOS：**沒有任何一行程式在它上面執行過**，只到「編譯並連結」 |
 
