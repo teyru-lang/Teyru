@@ -46,3 +46,4 @@
 #     back end does not claim (precision), not a rule of the language either of
 #     them gets wrong, so it is recorded here rather than fixed in either.
 t245_dropped_reference none the LLVM back end maps no frames, so the collector scans its frames conservatively and the case's own subject -- the live set after a dropped reference -- reads 8 where the C back end reads 0
+t222_http_parser_fuzz W8 the LLVM back end crashes on this case (exit 139, no output) where the C back end prints the fuzz results; pre-existing -- a compiler built at 50a46c6 and one at main before today's landings both crash the same way -- and recorded here with the work item that owns the matrix rather than fixed, because a crash is not a decided difference. Reproduce: `teyru build --backend=llvm -O0 -o /tmp/t222 tests/programs/t222_http_parser_fuzz.teyru && /tmp/t222`

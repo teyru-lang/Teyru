@@ -642,7 +642,17 @@ static inline void *ty_alloc(size_t size) {
   size_t total = (size + TY_HDR + TY_ALIGN - 1) & ~(size_t)(TY_ALIGN - 1);
   tythread *me = ty_self;
   char *p = me->bump;
-  if (p + total > me->bump_end || me->alloc_since > ty_gc_threshold) {
+  /* The arithmetic is done in uintptr_t rather than on `p`, because `p` is NULL
+     while the thread's slab is detached -- a state a collection leaves it in --
+     and forming `p + total` on a null pointer is undefined, so a compiler may
+     assume p is non-NULL and move the stores below past this test. UBSan reports
+     the old form on every program ("applying non-zero offset 48 to null
+     pointer"), and the optimiser acts on it once the sizes change: with TY_ALIGN
+     at 32, examples/bench_escape segfaults at every scale (measured; the same
+     variant runs to completion under -fsanitize=address, which is what made the
+     cause findable). Integers have no such rule, and this compiles to the add
+     and compare the old form did. */
+  if ((uintptr_t)p + total > (uintptr_t)me->bump_end || me->alloc_since > ty_gc_threshold) {
     return ty_alloc_slow(total);
   }
   me->bump = p + total;
