@@ -8,6 +8,12 @@
 #include <float.h>
 #include <stdarg.h>
 
+#ifdef _WIN32
+/* _aligned_malloc and _aligned_free, which slab_alloc and slab_free use where
+   MinGW does not declare C11's aligned_alloc. */
+#include <malloc.h>
+#endif
+
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define TY_ASAN 1
@@ -96,6 +102,36 @@ static tyclass *array_class(void) {
 
 #define TY_HDR 16
 #define TY_CHUNK (1u << 18)
+
+/* A slab base has to be TY_ALIGN-aligned, and not for tidiness: valid_obj throws
+   away a candidate whose low bits are not zero, so a base that malloc only
+   aligned to 16 makes every payload of a TY_ALIGN=32 build invisible -- the mark
+   phase finds nothing live, the sweep frees the slabs that hold the live objects,
+   and the program walks into them. That is what W14 item 9's experiment hit, and
+   scripts/w14-analysis.md has the crash and its diagnosis.
+
+   malloc promises 16 bytes. C11's aligned_alloc promises what it is asked for,
+   but MinGW does not declare it (its UCRT only does under __STDC_VERSION__ >=
+   201112L, and the driver compiles with -std=gnu11), so the Windows side uses
+   _aligned_malloc, which pairs with _aligned_free rather than free. TY_CHUNK and
+   the rounded cap are both multiples of TY_ALIGN, which is what aligned_alloc
+   requires. */
+static void *slab_alloc(size_t cap) {
+#ifdef _WIN32
+  return _aligned_malloc(cap, TY_ALIGN);
+#else
+  return aligned_alloc(TY_ALIGN, cap);
+#endif
+}
+
+static void slab_free(void *p) {
+#ifdef _WIN32
+  _aligned_free(p);
+#else
+  free(p);
+#endif
+}
+
 #define TY_ALIGN 16
 
 typedef struct tychunk {
@@ -831,7 +867,7 @@ static void gc_collect(const char *trigger) {
           break;
         }
       }
-      free(c->mem);
+      slab_free(c->mem);
       free(c->starts);
       free(c);
       continue;
@@ -987,15 +1023,7 @@ static void *take_batch(int k) {
 static tychunk *chunk_new(size_t total) {
     size_t cap = total > TY_CHUNK ? ((total + TY_CHUNK - 1) & ~(size_t)(TY_CHUNK - 1)) : TY_CHUNK;
   tychunk *c = (tychunk *)malloc(sizeof(tychunk));
-    /* The slab base has to be TY_ALIGN-aligned, and not for tidiness: valid_obj
-       throws away a candidate whose low bits are not zero, so a base that malloc
-       only aligned to 16 makes every payload of a TY_ALIGN=32 build invisible --
-       the mark phase finds nothing live, the sweep frees the slabs that hold the
-       live objects, and the program walks into them. That is exactly what W14
-       item 9's experiment hit, and scripts/w14-analysis.md has the crash and its
-       diagnosis. malloc promises 16 bytes, aligned_alloc promises what it is
-       asked for, and TY_CHUNK is a multiple of both. */
-    c->mem = (char *)aligned_alloc(TY_ALIGN, (size_t)cap);
+    c->mem = (char *)slab_alloc(cap);
     c->starts = (uint8_t *)calloc(TY_START_BYTES(cap), 1);
     c->cap = cap;
     c->used = 0;
@@ -2872,15 +2900,7 @@ tystr *ty_getenv(tystr *name) {
 tystr *ty_get_property(tystr *key) {
   if (!key) ty_npe();
   const char *k = TY_STR_DATA(key);
-  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
-  if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
-  if (strcmp(k, "path.separator") == 0) return ty_str_intern(":");
   if (strcmp(k, "file.encoding") == 0) return ty_str_intern("UTF-8");
-  if (strcmp(k, "java.io.tmpdir") == 0) return ty_str_intern("/tmp");
-#ifdef _WIN32
-  return NULL;
-#else
-  if (strcmp(k, "os.name") == 0) return ty_str_intern("Linux");
   if (strcmp(k, "os.arch") == 0) return ty_str_intern(
 #ifdef __x86_64__
       "amd64"
@@ -2888,6 +2908,56 @@ tystr *ty_get_property(tystr *key) {
       "aarch64"
 #else
       ""
+#endif
+  );
+  /* The rest of the keys are the platform's, and the Windows half is not a
+     fallback: a program that asks for os.name there and gets "Linux", or for
+     user.dir and gets null -- which is what made File.getAbsolutePath return a
+     relative path, and t99_file_paths caught it -- is answered wrongly rather
+     than not answered. line.separator and file.separator are the platform's in
+     Java too, so they differ by design here; the standard library's own
+     File.separator is "/" on every platform, which every platform accepts. */
+#ifdef _WIN32
+  /* line.separator and file.separator stay "\n" and "/" on Windows, which is
+     not what the JDK answers there and is deliberate: every line this language
+     writes is written with "\n" -- println, the stack traces, the exception
+     reports -- and every path the standard library builds is built with "/".
+     A line.separator of "\r\n" next to a println that writes "\n" is an
+     inconsistency a program cannot see coming, and it put "\r" into every
+     trace and broke seven cases on the windows run before it was reverted.
+     path.separator is a different thing (the separator in a *list* of paths,
+     like a classpath) and java.io.tmpdir is the machine's, so both are the
+     platform's. */
+  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
+  if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
+  if (strcmp(k, "path.separator") == 0) return ty_str_intern(";");
+  if (strcmp(k, "os.name") == 0) return ty_str_intern("Windows");
+  if (strcmp(k, "java.io.tmpdir") == 0) {
+    const char *t = getenv("TEMP");
+    if (!t) t = getenv("TMP");
+    return t ? ty_str_intern(t) : NULL;
+  }
+  {
+    const char *env = NULL;
+    if (strcmp(k, "user.name") == 0) env = getenv("USERNAME");
+    else if (strcmp(k, "user.home") == 0) env = getenv("USERPROFILE");
+    else if (strcmp(k, "user.dir") == 0) {
+      static char cwd[4096];
+      if (getcwd(cwd, sizeof cwd)) return ty_str_intern(cwd);
+      return NULL;
+    }
+    return env ? ty_str_intern(env) : NULL;
+  }
+#else
+  if (strcmp(k, "line.separator") == 0) return ty_str_intern("\n");
+  if (strcmp(k, "file.separator") == 0) return ty_str_intern("/");
+  if (strcmp(k, "path.separator") == 0) return ty_str_intern(":");
+  if (strcmp(k, "java.io.tmpdir") == 0) return ty_str_intern("/tmp");
+  if (strcmp(k, "os.name") == 0) return ty_str_intern(
+#if defined(__APPLE__)
+      "Mac OS X"
+#else
+      "Linux"
 #endif
   );
   {

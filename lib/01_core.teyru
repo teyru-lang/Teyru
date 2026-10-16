@@ -35,36 +35,23 @@ interface Cloneable {
    names, so a class that implements it is a class with length/charAt and a
    subSequence returning the same kind of thing.
 
-   The defaults are Java's own (JDK 11 and later): isEmpty is length() == 0,
-   and chars()/codePoints() stream the units and the code points, the same
-   IntStream a String's own do. */
+   isEmpty is Java's own default (length() == 0), and so are the code-point
+   walks below. chars() and codePoints() are *not* declared here, although Java
+   declares them as defaults on this interface: their return type is IntStream,
+   so a default body returning one makes the whole stream library reachable from
+   the vtable of every class that implements this one -- and String is one of
+   them, in every program. Measured: hello world went from 66,808 bytes to
+   618,080 when they arrived, and back to 92,016 when they left. String and the
+   two builders declare both under their Java names, so the method is there
+   wherever Java has one; what is missing is the interface's *default*, which is
+   only reachable through a CharSequence-typed receiver nobody in this library
+   writes. */
 interface CharSequence {
   int length()
   char charAt(int index)
   CharSequence subSequence(int start, int end)
   default boolean isEmpty() {
     return length() == 0
-  }
-  default IntStream chars() {
-    int n = length()
-    int[] out = new int[n]
-    for (var i = 0 : i < n : i++) {
-      out[i] = charAt(i)
-    }
-    return IntStream.of(out)
-  }
-  default IntStream codePoints() {
-    int n = length()
-    int[] out = new int[codePointCount(0, n)]
-    int k = 0
-    int i = 0
-    while (i < n) {
-      int cp = codePointAt(i)
-      out[k] = cp
-      k++
-      i += (cp >= 0x10000 ? 2 : 1)
-    }
-    return IntStream.of(out)
   }
   /* The two code-point walks, on the same indices String's own use. They are
      here rather than only on String because CharSequence is what a

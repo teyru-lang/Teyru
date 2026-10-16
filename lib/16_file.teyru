@@ -317,8 +317,41 @@ class File extends Object implements Comparable<File> {
     return dir + separator + name
   }
 
+  // Whether the platform this program is running on is Windows, which is what
+  // decides the two path shapes below. Java's File.separator is the platform's;
+  // this library writes "/" everywhere, which every platform it builds for
+  // accepts, so the difference only shows where the *shape* of a path is the
+  // question -- which is exactly isAbsolutePath.
+  private static final boolean WINDOWS =
+      System.getProperty("os.name") != null && System.getProperty("os.name").startsWith("Windows")
+
+  /* Java's answer, and the platform's: a leading separator is absolute
+     everywhere; on Windows a drive letter followed by a separator ("C:\dir",
+     "C:/dir") and a UNC path ("\\host\share", which the leading backslash
+     covers) are absolute too, while "C:" on its own is not. The drive test used
+     to be missing, and t99_file_paths is what caught it: the path
+     getAbsolutePath builds out of user.dir is "C:\dir", and this same function
+     called it relative. */
   public static boolean isAbsolutePath(String p) {
-    return p.length() > 0 && p.charAt(0) == 47
+    int n = p.length()
+    if (n == 0) {
+      return false
+    }
+    char c0 = p.charAt(0)
+    if (c0 == 47) {
+      return true
+    }
+    if (!WINDOWS) {
+      return false
+    }
+    if (c0 == 92) {
+      return true
+    }
+    if (n >= 3 && ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))
+        && p.charAt(1) == 58 && (p.charAt(2) == 92 || p.charAt(2) == 47)) {
+      return true
+    }
+    return false
   }
 
   // The path without its trailing separators, except that the root keeps its
