@@ -1186,18 +1186,17 @@ func (e *llvmEmitter) remainder(f *fb, b *ast.Binary) lval {
 // shift lowers <<, >> and >>>. JLS 15.19 leaves only the low five bits of an
 // int's count (six for a long) significant, and C leaves a shift whose count
 // reaches the operand width undefined -- which LLVM makes poison -- so the count
-// is masked here, exactly as the C back end masks it.
+// is masked with the shared shiftBits, exactly as the C back end masks it.
 func (e *llvmEmitter) shift(f *fb, b *ast.Binary) lval {
 	ot := b.OpType
 	if ot == nil {
 		ot = shiftType(b.GetType())
 	}
 	ot = e.p.Erased(ot)
-	width := llvmWidth(e.llvmType(ot))
 	x := e.coerce(f, e.expr(f, b.X), ot)
 	y := e.coerce(f, e.expr(f, b.Y), ot)
 	mask := f.reg()
-	f.ins(fmt.Sprintf("%s = and %s %s, %d", mask, e.llvmType(ot), y.v, width-1))
+	f.ins(fmt.Sprintf("%s = and %s %s, %d", mask, e.llvmType(ot), y.v, (1<<shiftBits(ot))-1))
 	r := f.reg()
 	switch b.Op {
 	case "<<":
