@@ -204,7 +204,7 @@ source → lexer → parser → ast → sema → codegen
 
 | 檔案 | 內容 | 什麼時候要改 |
 |---|---|---|
-| `README.md`（本倉庫） | 倉庫門面：這是什麼、怎麼安裝、其他倉庫在哪 | 專案定位或安裝方式改變時 |
+| `README.md`（本倉庫，正本）與 `README.zh-CN.md`／`README.en.md`／`README.ja.md` | 倉庫門面：這是什麼、怎麼安裝、其他倉庫在哪；四個語言 | 專案定位、安裝方式或任何數字改變時——**四份一起改** |
 | `examples/*/README.md`（本倉庫） | 範例自己的說明 | 範例改變時 |
 | `AGENTS.md`（本倉庫） | 本檔 | 流程改變時 |
 | `teyru-lang/docs` 的〈語言參考〉 | 完整語言參考 | 語法或語意改變時 |
@@ -216,9 +216,12 @@ source → lexer → parser → ast → sema → codegen
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
 
-文件站在 `teyru-lang/docs`，`README` 的**英**與**簡中**版本也在那裡（對應語言的頁面）。
-網站有三個 locale：`zh-TW`（正本，不翻譯也不改寫）、`zh-CN` 與 `en`，內容要一致——
-改了其中一份就要改其餘兩份的結構（程式碼區塊、識別字與路徑照抄，只翻散文）。
+文件站在 `teyru-lang/docs`。網站有三個 locale：`zh-TW`（正本，不翻譯也不改寫）、`zh-CN` 與
+`en`，內容要一致——改了其中一份就要改其餘兩份的結構（程式碼區塊、識別字與路徑照抄，只翻散文）。
+**本倉庫的 `README` 有四個語言**：`README.md` 是繁體中文正本，`README.zh-CN.md`、
+`README.en.md`、`README.ja.md` 是它的翻譯，規則相同——數字、日期、路徑、指令與程式碼區塊
+逐字照抄，只翻散文；每一份最上面一行是語言切換連結。改了正本的任何數字，其餘三份在同一個
+提交裡跟著改，否則「同一件事在四個地方各說各話」就是這個專案最常犯的那種錯。
 
 **文件站的部署是手動的，push 不會部署。** 2026-09-17 查過 Vercel 專案 `teyru-docs`
 （team `langyas-projects`）：它的 `link` 是空的，也就是**沒有接 Git**；每一筆 production
