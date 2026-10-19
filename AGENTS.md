@@ -144,6 +144,9 @@ source → lexer → parser → ast → sema → codegen
   而函式庫對它拿到的那個檔案在**兩種佈局下都讀對**（vanguard 與 rearguard 對愛爾蘭給出相同的
   offset 與縮寫、相反的 `isdst`），所以沒有任何固定的期望能同時滿足兩者；差一點就去改讀取程式
   那一邊，而該改的是測試。
+- **Teyru 自己的測試**：語言層級的單元測試用 `teyru test`（`@Test`／`@BeforeEach`／
+  `Assert`，見〈工具鏈〉），放在 `tests/test-framework/`。它驗的是**標準庫與語言語意**；
+  編譯器本身的 Go 測試仍用 `go test`，兩者不互相取代。
 - **端到端**：在 `tests/programs/` 放 `xxx.teyru` 與 `xxx.expected`。
   需要命令列參數時另外放 `xxx.args`（每行一個）。`go test` 會自動編譯並比對輸出。
   `tests/` 是 `teyru-lang/tests` 的 submodule：改測試要在**那個**倉庫提交，這裡只會
@@ -174,6 +177,11 @@ source → lexer → parser → ast → sema → codegen
 - 效能相關的改動要附上 `sh scripts/bench.sh` 的前後數字。
 
 ---
+
+**CI 是必需的路徑，不是可選的。** `.github/workflows/ci.yml` 在每個 push 與 PR 上跑
+`go build`、`go vet` 與整套 `go test`，`nightly.yml` 每天以 `CC=gcc` 跑同一套。
+本機的 pre-commit hook 跑的是同一條路徑；略過它（`TEYRU_SKIP_HOOKS=1`）時，
+必須在同一個提交前自己跑過同樣的檢查，並在回報裡說明。
 
 ## 7. 診斷碼規範
 
@@ -213,6 +221,7 @@ source → lexer → parser → ast → sema → codegen
 | `teyru-lang/docs` 的〈原生互通〉 | 以 C 實作 native 方法、符號命名與型別對應 | native 介面或 CLI 旗標改變時 |
 | `teyru-lang/docs` 的〈架構〉 | 編譯流程與執行期模型 | 架構改變時 |
 | `teyru-lang/docs` 的〈JSON〉／〈Web 框架〉／〈模組〉 | 各主題的完整說明 | 該主題行為改變時 |
+| `teyru-lang/docs` 的〈工具鏈〉 | `teyru fmt`／`lsp`／`test`、`-g` 與 CI 的用法與限制 | 任一工具的行為、旗標或限制改變時 |
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
 
@@ -386,6 +395,14 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   `t290_daemon_exit.teyru`、`t291_thread_local.teyru`。**沒有的**：優先權、
   `ThreadGroup`、堆疊大小與逾時的 `join(long)`、中斷阻塞 I/O，以及未處理例外的
   handler（執行期印出 Java 預設處理常式那一行，然後結束那個執行緒、行程繼續）。
+  **虛擬執行緒**（`Thread.startVirtualThread`／`Thread.ofVirtual()`／`isVirtual()`）
+  是 ucontext 上的 M:N：每個虛擬執行緒有自己的堆疊，停在執行期自己的阻塞點
+  （`sleep`、`join`、`wait`、socket 與檔案的讀寫、accept／connect）時讓出 carrier，
+  carrier 的數量由 `TEYRU_VTHREAD_CARRIERS` 指定（預設是 CPU 數）。停在停車場的
+  堆疊以保守掃描註冊成 root，所以只有它指到的物件活著。實測 10,000 條各睡 50 ms：
+  虛擬 0.11–0.12 s／約 94 MB，平台執行緒 0.24–0.25 s／約 156 MB。**Windows 以具名
+  例外拒絕**（沒有 ucontext），虛擬堆疊沒有自己的 guard page（靠既有的 256 KB
+  stack-check 餘裕），TLS 的 I/O 還不會 parking。測試是 `t314`–`t317`。
   GC 是**合作式**停止世界：安全點在每個迴圈回邊（產生器會放）、配置慢路徑、等
   heap 鎖，以及執行期自己每個會等的呼叫——socket 的讀、寫、accept 與 connect 等待，TLS
   的握手與讀寫，檔案與管線的讀寫迴圈，stdin 讀一行，以及 sleep、join、monitor wait
@@ -1311,6 +1328,8 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
 ## 11. 送出前檢查清單
 
 - [ ] `go build ./...`、`go vet ./...`、`go test ./... -count=1` 全綠（`tests/` submodule 已 checkout）
+- [ ] 改了 `.teyru` 就 `teyru fmt -w`（`fmt` 是冪等的，輸出會被 CI 與測試比對）
+- [ ] 新增的診斷碼已在 docs 的〈診斷碼〉三個 locale 各有一列
 - [ ] 新功能有端到端測試；新診斷碼有拒絕測試
 - [ ] 沒有多行 TODO 或空殼實作；未實作路徑會明確失敗
 - [ ] 共用邏輯在 `internal/util`，沒有兩份實作
