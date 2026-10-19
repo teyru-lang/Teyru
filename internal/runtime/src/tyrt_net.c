@@ -174,6 +174,20 @@ int32_t ty_net_listen(int32_t port, int32_t backlog, int32_t reuse) {
    connect is made non-blocking even when the caller asked for no timeout: it
    turns an unbounded wait in the kernel into a wait this code can bound, and it
    is the only way connect can be given a deadline at all. */
+#if !defined(_WIN32)
+/* tests/native/net_c_test.c compiles this file and the platform layer on their
+   own, without tyrt_thread.c: the stop-point helpers and the descriptor wait
+   live there, and a whole program links it. These weak definitions keep the
+   standalone test linkable, and every build that has the thread unit overrides
+   them with the real ones. Windows is excluded because MinGW drops weak
+   function definitions, and it never builds this test anyway. */
+__attribute__((weak)) void ty_thread_stopped_begin(void) {}
+__attribute__((weak)) void ty_thread_stopped_end(void) {}
+__attribute__((weak)) int32_t ty_wait_fd(int32_t fd, int32_t events, int32_t timeout_ms) {
+  return typlat_socket_wait(fd, events == 2, timeout_ms);
+}
+#endif
+
 static int32_t ty_connect_one(const struct addrinfo *r, int32_t timeout_ms) {
   int32_t fd = typlat_socket_open(r->ai_family, r->ai_socktype, r->ai_protocol);
   if (fd < 0) return fd;
