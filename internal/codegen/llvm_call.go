@@ -105,6 +105,27 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 		if c.Super {
 			e.refuse(c.GetPos(), "Iface.super.%s(): the llvm back end does not lower a call to a specific interface's default (it dispatches through the receiver, which would reach an override)", m.Name)
 		}
+		// When every class in the program answers this selector with one
+		// implementation, the interface map lookup can only find it: bind the
+		// call. The C back end makes the same decision from the same scan
+		// (Emitter.devirtInterface), so the two back ends call the same
+		// function for the same program.
+		impl := e.devirtInterface(m)
+		if impl == nil && c.Recv != nil {
+			// A final receiver's static type is its dynamic type, so the one
+			// implementation is the class's interface-table entry even when
+			// other implementors of the interface disagree.
+			impl = e.cEmitter().finalReceiverImpl(m, c.Recv.GetType())
+		}
+		if impl != nil {
+			recvArg := recv
+			if c.Recv == nil {
+				recvArg = e.selfOperand(f)
+			} else {
+				e.nullCheck(f, recvArg, e.npeInvoke(m), callRecvCause(c))
+			}
+			return e.directCall(f, impl, recvArg, e.callArgs(f, impl, c, c.Args))
+		}
 		if c.Recv == nil {
 			return e.ifaceDispatch(f, m, value(e.selfOperand(f), e.refType()), e.callArgs(f, m, c, c.Args), c)
 		}
@@ -150,9 +171,27 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 			e.nullCheck(f, recv, e.npeInvoke(m), e.npeCause(c.Recv))
 			return e.directCall(f, m, recv, args)
 		}
+		if impl := e.cEmitter().finalReceiverImpl(m, c.Recv.GetType()); impl != nil {
+			e.nullCheck(f, recv, e.npeInvoke(m), e.npeCause(c.Recv))
+			return e.directCall(f, impl, recv, args)
+		}
 		return e.virtualCall(f, m, value(recv, c.Recv.GetType()), args, c)
 	}
 	return e.directCall(f, m, recv, args)
+}
+
+// devirtInterface is the C back end's whole-program interface decision, cached
+// here because each of its answers walks every class in the program.
+func (e *llvmEmitter) devirtInterface(m *ast.Method) *ast.Method {
+	if got, ok := e.ifaceDevirt[m]; ok {
+		return got
+	}
+	got := e.cEmitter().devirtInterface(m)
+	if e.ifaceDevirt == nil {
+		e.ifaceDevirt = map[*ast.Method]*ast.Method{}
+	}
+	e.ifaceDevirt[m] = got
+	return got
 }
 
 // needsReflection reports whether a call site can reach a member table. It is

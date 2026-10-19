@@ -129,6 +129,9 @@ type Emitter struct {
 	stackLocals map[*ast.Var]*ast.New
 	// what is known about each method's receiver
 	leakCache map[*ast.Method]leakState
+	// ifaceDevirt caches devirtInterface's answer per interface method: the
+	// whole-program scan behind it is not something to repeat per call site.
+	ifaceDevirt map[*ast.Method]*ast.Method
 	// primitive types named by a class literal, whose class objects the emitter
 	// synthesizes; filled in while the function bodies are emitted and written
 	// out with the rest of the metadata, before them

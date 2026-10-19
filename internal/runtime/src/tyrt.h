@@ -886,6 +886,7 @@ tystr *ty_str_of_bytes_all(tyarr *b);
 int64_t ty_str_len(tystr *s);
 int64_t ty_str_blen(tystr *s);
 tystr *ty_str_concat(tystr *a, tystr *b);
+tystr *ty_str_concatN(int64_t n, tystr **parts);
 int32_t ty_str_eq(tystr *a, tystr *b);
 int32_t ty_str_cmp(tystr *a, tystr *b);
 int32_t ty_str_hash(tystr *s);

@@ -2058,7 +2058,17 @@ func isFloating(t ast.Type) bool {
 
 // concat renders Java string concatenation.
 func (e *Emitter) concat(v *ast.Binary) string {
-	return e.concatParts([]seqOperand{e.stringPart(v.X)}, v.Y)
+	if e.libraryCode() {
+		// The standard library keeps the pairwise form. Its concatenations are
+		// cold (an exception message, a toString), and its emitted unit is
+		// compiled into every program: leaving it byte-identical is what keeps
+		// this change from moving whole-program code layout, which on the
+		// benchmark machine moved bench_loop's unchanged loop by 20% when the
+		// library's text changed. The program's own code is where a chain is
+		// hot, and that is what gets flattened below.
+		return e.concatParts([]seqOperand{e.stringPart(v.X)}, v.Y)
+	}
+	return e.concatParts(nil, v)
 }
 
 // concatFrom builds the concatenation of an already-rendered left operand, the
@@ -2077,11 +2087,25 @@ func (e *Emitter) concatFrom(first ast.Expr, firstText string, x ast.Expr) strin
 // arguments of the ty_str_concat calls the chain turns into unspecified, which
 // is what made t43 answer differently under the two C compilers; sequence is
 // what puts the operands back in the order the source wrote them.
+//
+// A chain is left-associative, so `a + b + c` is the Binary `(a + b) + c`: both
+// sides of a node are walked, and the operands come out in source order. That
+// is also what lets the chain become one ty_str_concatN call -- the alternative,
+// folding the operands pairwise, allocates and copies an intermediate string for
+// every `+` after the first.
+//
+// A pair of string literals is left as one part: the folder turns `"a" + "b"`
+// into a single literal, and splitting it into two operands would undo that and
+// change the program's literal table.
 func (e *Emitter) concatParts(head []seqOperand, x ast.Expr) string {
 	parts := head
 	var collect func(ast.Expr)
 	collect = func(y ast.Expr) {
 		if b, ok := y.(*ast.Binary); ok && b.Op == "+" && e.isStringType(b.GetType()) {
+			if !e.libraryCode() && foldableStringConcat(b) {
+				parts = append(parts, e.stringPart(b))
+				return
+			}
 			collect(b.X)
 			collect(b.Y)
 			return
@@ -2090,12 +2114,29 @@ func (e *Emitter) concatParts(head []seqOperand, x ast.Expr) string {
 	}
 	collect(x)
 	return e.sequence(parts, func(a []string) string {
+		if len(a) > 2 && !e.libraryCode() {
+			return "ty_str_concatN(" + fmt.Sprint(len(a)) + ", (tystr*[]){" + strings.Join(a, ", ") + "})"
+		}
 		out := a[0]
 		for _, p := range a[1:] {
 			out = "ty_str_concat(" + out + ", " + p + ")"
 		}
 		return out
 	})
+}
+
+// foldableStringConcat reports whether foldBinary would turn b into one literal:
+// both operands are string literals and the operator is `+`.
+func foldableStringConcat(b *ast.Binary) bool {
+	if b.Op != "+" {
+		return false
+	}
+	x, ok := b.X.(*ast.Literal)
+	if !ok || x.Kind != ast.LitString {
+		return false
+	}
+	y, ok := b.Y.(*ast.Literal)
+	return ok && y.Kind == ast.LitString
 }
 
 // stringPart is one operand of a concatenation, as the string it contributes.
@@ -2119,18 +2160,35 @@ func (e *Emitter) stringOperand(x ast.Expr) string {
 	if p, ok := t.(*ast.PrimType); ok {
 		switch p.Kind {
 		case ast.Boolean:
-			return "ty_str_of_bool(" + e.expr(x) + ")"
+			return e.stringValue("ty_str_of_bool(" + e.expr(x) + ")")
 		case ast.Char:
-			return "ty_str_of_char(" + e.expr(x) + ")"
+			return e.stringValue("ty_str_of_char(" + e.expr(x) + ")")
 		case ast.Float:
-			return "ty_str_of_float(" + e.expr(x) + ")"
+			return e.stringValue("ty_str_of_float(" + e.expr(x) + ")")
 		case ast.Double:
-			return "ty_str_of_double(" + e.expr(x) + ")"
+			return e.stringValue("ty_str_of_double(" + e.expr(x) + ")")
 		case ast.Byte, ast.Short, ast.Int, ast.Long:
-			return "ty_str_of_long(" + e.expr(x) + ")"
+			return e.stringValue("ty_str_of_long(" + e.expr(x) + ")")
 		}
 	}
-	return "ty_str_of_obj((tyobj*)" + e.expr(x) + ")"
+	return e.stringValue("ty_str_of_obj((tyobj*)" + e.expr(x) + ")")
+}
+
+// stringValue holds a string the emitter builds in a frame word.
+//
+// A concatenation evaluates every part before the call that joins them, and the
+// parts array is an ordinary C array in the caller's frame -- memory a mapped
+// frame's precise scan does not name and the conservative pass skips, because
+// the frame is mapped. A part that is a call is already in a frame word (see
+// frameWrap); a string built from a primitive or from an object's toString is
+// not, and a later part's allocation can collect it while it waits in the
+// array. The runtime call's own allocation is the other window: it reads the
+// array after allocating, and the array is not a root.
+func (e *Emitter) stringValue(v string) string {
+	if !e.frameMap || e.libraryCode() || e.prog == nil || e.prog.Builtins == nil || e.prog.Builtins.String == nil {
+		return v
+	}
+	return e.frameTemp(&ast.ClassType{Class: e.prog.Builtins.String}, v)
 }
 
 // targetClinit returns the class-initialization prefix for a static target.
@@ -2416,7 +2474,19 @@ func (e *Emitter) callExpr(v *ast.Call) string {
 		return e.callTo(a, name+"(", ")")
 	}
 	if v.Recv == nil {
-		if (m.Selector >= 0 || m.VIndex >= 0) && !directBind(m) {
+		thisCl := e.thisClass()
+		if m.Selector >= 0 {
+			impl := e.devirtInterface(m)
+			if impl == nil && !e.libraryCode() && finalClass(thisCl) {
+				impl = e.selectorImpl(thisCl, m.Selector)
+			}
+			if impl != nil {
+				call := e.argsFor(receiver(nil, "("+cname(impl.Owner)+"*)"+recv), v.Args, impl, v)
+				return e.callTo(call, e.cfunc(impl)+"(", ")")
+			}
+		}
+		if (m.Selector >= 0 || m.VIndex >= 0) && !directBind(m) &&
+			(e.libraryCode() || !finalClass(thisCl)) {
 			return e.virtCall(m, cname(m.Owner)+"*", e.thisExpr(), v.Args, v)
 		}
 		return e.callTo(a, name+"(", ")")
@@ -2424,6 +2494,12 @@ func (e *Emitter) callExpr(v *ast.Call) string {
 	if (m.Selector >= 0 || m.VIndex >= 0) && !m.Mods.Has(ast.ModPrivate) {
 		if directBind(m) {
 			return e.bindCall(m, cname(m.Owner)+"*", v.Recv, v.Args, v)
+		}
+		if impl := e.devirtInterface(m); impl != nil {
+			return e.bindCallAs(impl, m, cname(impl.Owner)+"*", v.Recv, v.Args, v)
+		}
+		if impl := e.finalReceiverImpl(m, v.Recv.GetType()); impl != nil {
+			return e.bindCallAs(impl, m, cname(impl.Owner)+"*", v.Recv, v.Args, v)
 		}
 		return e.virtCallTemp(v.Recv, m, v.Args, v)
 	}
@@ -2456,19 +2532,131 @@ func directBind(m *ast.Method) bool {
 		(m.Owner != nil && m.Owner.Mods.Has(ast.ModFinal)))
 }
 
+// finalClass reports whether cl is a class no subclass can extend.
+func finalClass(cl *ast.Class) bool {
+	return cl != nil && !cl.IsInterface() && cl.Mods.Has(ast.ModFinal)
+}
+
+// finalReceiverImpl is the implementation a call must reach when its receiver's
+// static type is final: the checker's resolution for a class method, and the
+// class's interface-table entry for an interface method. nil means the receiver
+// is not final and the call has to dispatch.
+func (e *Emitter) finalReceiverImpl(m *ast.Method, t ast.Type) *ast.Method {
+	ct, ok := t.(*ast.ClassType)
+	if !ok || !finalClass(ct.Class) || e.libraryCode() {
+		return nil
+	}
+	if m.Selector < 0 {
+		return m
+	}
+	return e.selectorImpl(ct.Class, m.Selector)
+}
+
+// thisClass is the class of the instance an unqualified call runs on: the class
+// of the method being emitted, or, inside a lambda body that captures it, the
+// enclosing instance the body's `this` denotes.
+func (e *Emitter) thisClass() *ast.Class {
+	if e.curLambda != nil {
+		if cl := e.enclosureOf(e.curLambda); cl != nil {
+			return cl
+		}
+	}
+	return e.curClass
+}
+
+// selectorImpl is the method a class's interface table names for a selector.
+//
+// It walks the same interfaces, in the same order, as emitClassMeta's table
+// builder, so a call bound with its answer cannot disagree with what ty_itab
+// would have returned. Later interfaces overwrite earlier ones there, and they
+// do here too.
+func (e *Emitter) selectorImpl(cl *ast.Class, sel int) *ast.Method {
+	var impl *ast.Method
+	for _, iface := range e.prog.AllInterfaces(cl) {
+		for _, m := range e.prog.InterfaceMethods(iface) {
+			if m.Selector != sel {
+				continue
+			}
+			if got := e.prog.Implements(cl, m); got != nil {
+				impl = got
+			}
+		}
+	}
+	return impl
+}
+
+// devirtInterface returns the one implementation an interface call can reach,
+// or nil when the program has more than one answer.
+//
+// Teyru compiles a whole program: every class an instance can have is in
+// p.Classes, and reflection cannot create a class that was not compiled. So
+// when every class that implements the interface resolves the selector to the
+// same method, the interface table can only answer with that method and the
+// call can be bound directly. bench_oop is the case this exists for: one
+// implementation of Shape.area() serves every shape, yet each call walked the
+// class chain and an interface map before an indirect jump.
+//
+// A split build's library unit is compiled before the program exists and is
+// cached, so the classes it can see are not the whole program. There the lookup
+// stays: binding it against a set that does not include the program's classes
+// would be a wrong answer, not a slow one.
+func (e *Emitter) devirtInterface(m *ast.Method) *ast.Method {
+	if m == nil || m.Selector < 0 || e.split || e.libraryCode() || e.prog == nil {
+		return nil
+	}
+	if got, ok := e.ifaceDevirt[m]; ok {
+		return got
+	}
+	var only *ast.Method
+	for _, cl := range e.prog.Classes {
+		if cl.IsInterface() {
+			continue
+		}
+		implements := false
+		for _, iface := range e.prog.AllInterfaces(cl) {
+			if iface == m.Owner {
+				implements = true
+				break
+			}
+		}
+		if !implements {
+			continue
+		}
+		impl := e.selectorImpl(cl, m.Selector)
+		if impl == nil || (only != nil && impl != only) {
+			only = nil
+			break
+		}
+		only = impl
+	}
+	if e.ifaceDevirt == nil {
+		e.ifaceDevirt = map[*ast.Method]*ast.Method{}
+	}
+	e.ifaceDevirt[m] = only
+	return only
+}
+
 // bindCall calls a method that cannot dispatch anywhere else. The receiver is
 // bound once and tested, exactly as the vtable lookup would have tested it: a
 // call on a null receiver is a NullPointerException in Java, and the generated
 // callee reads its own fields without a test of its own -- the gap virtCall's
 // comment describes for a call the generator never entered through.
 func (e *Emitter) bindCall(m *ast.Method, recvT string, recv ast.Expr, args []ast.Expr, call *ast.Call) string {
+	return e.bindCallAs(m, m, recvT, recv, args, call)
+}
+
+// bindCallAs is bindCall for a call whose callee is not the method the source
+// named: an interface call bound to its one implementation still has to name
+// the interface in the NullPointerException a null receiver raises, because
+// that message is about the call site and not about the callee.
+func (e *Emitter) bindCallAs(callee, named *ast.Method, recvT string, recv ast.Expr, args []ast.Expr, call *ast.Call) string {
 	if recvT == "" {
 		recvT = "void*"
 	}
 	n := e.tmpName()
-	inner := e.callTo(e.argsFor(seqOperand{text: n}, args, m, call), e.cfunc(m)+"(", ")")
-	npe := e.npeCall(e.npeInvokeSig(m), e.npeCauseOf(recv))
-	if ret := e.ctype(m.Result); ret != "void" {
+	inner := e.callTo(e.argsFor(seqOperand{text: n}, args, callee, call), e.cfunc(callee)+"(", ")")
+	npe := e.npeCall(e.npeInvokeSig(named), e.npeCauseOf(recv))
+	if ret := e.ctype(callee.Result); ret != "void" {
 		return "({ " + recvT + " " + n + " = (" + recvT + ")" + e.expr(recv) + "; " +
 			"((" + n + ") ? " + inner + " : (" + ret + ")((intptr_t)" + npe + ")); })"
 	}
@@ -2891,4 +3079,19 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	if dbgOn {
 		e.writeReset(e.code)
 	}
+}
+
+// libraryCode reports whether the function being emitted belongs to the
+// standard library.
+//
+// A lambda body is emitted with curClass set to the class it was written in
+// (see emitLambdaMethod), and that is the right answer for name resolution but
+// not for this question: the synthesized closure class carries the file of the
+// body that made it, which is what says whose code this is.
+func (e *Emitter) libraryCode() bool {
+	cl := e.curClass
+	if e.curLambda != nil && e.curLambda.Class != nil {
+		cl = e.curLambda.Class
+	}
+	return cl != nil && cl.Prelude()
 }

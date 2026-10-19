@@ -2102,6 +2102,75 @@ tystr *ty_str_concat(tystr *a, tystr *b) {
   return r;
 }
 
+/* The concatenation of n parts in one allocation.
+
+   `a + b + c` is left-associative, so before this the generator emitted
+   ty_str_concat(ty_str_concat(a, b), c): the `a + b` half was allocated and
+   copied only to be copied again into the answer, and a chain of k parts
+   allocated k - 1 intermediate strings. This computes the total length from
+   the parts first and fills one buffer, which is one allocation and one copy
+   per part no matter how long the chain is.
+
+   The join rule is ty_str_concat's, applied to every adjacent pair: a high
+   surrogate ending one part and a low surrogate starting the next are one
+   four-byte sequence rather than two three-byte ones, so each join takes 2 off
+   the byte total. The code-unit total is unaffected: the pair is still two
+   UTF-16 units, which is what length() counts, so the two halves of a joined
+   pair cost the same units they did separately. That is why the byte length
+   can be summed and corrected in one pass while the unit count is just the
+   sum.
+
+   "Adjacent" means adjacent in the result, and an empty part contributes
+   nothing to it: `hi + "" + lo` is the same text as `hi + lo`, and Java's
+   getBytes agrees. The fold this replaced reached the same answer by accident
+   -- the empty middle string was joined on one side and the resulting high
+   surrogate joined again -- so the boundary walk below skips empty parts on
+   both sides. */
+tystr *ty_str_concatN(int64_t n, tystr **parts) {
+  int64_t i, blen = 0, ulen = 0, prev = -1;
+  int ascii = 1;
+  if (n <= 0) return ty_str_intern("");
+  for (i = 0; i < n; i++) {
+    if (!parts[i]) parts[i] = ty_str_intern("null");
+    blen += parts[i]->blen;
+    ulen += parts[i]->ulen;
+    ascii = ascii && TY_STR_ASCII(parts[i]);
+  }
+  for (i = 0; i < n; i++) {
+    if (parts[i]->blen == 0) continue;
+    if (prev >= 0 && str_ends_high(parts[prev]) && str_starts_low(parts[i])) {
+      blen -= 2;
+    }
+    prev = i;
+  }
+  tystr *r = str_alloc(blen, ulen, ascii);
+  char *out = TY_STR_DATA(r);
+  prev = -1;
+  for (i = 0; i < n; i++) {
+    tystr *s = parts[i];
+    if (s->blen == 0) continue;
+    const char *d = TY_STR_DATA(s);
+    int64_t skip = 0, len = s->blen;
+    if (prev >= 0 && str_ends_high(parts[prev]) && str_starts_low(s)) {
+      /* The pair straddles the boundary: write the one code point both halves
+         make, then copy the rest of this part. */
+      int32_t hi = seq_cp(TY_STR_DATA(parts[prev]) + parts[prev]->blen - 3, 3);
+      int32_t lo = seq_cp(d, 3);
+      out += seq_put(out, 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+      skip = 3;
+      len -= 3;
+    }
+    int64_t next = i + 1;
+    while (next < n && parts[next]->blen == 0) next++;
+    if (next < n && str_ends_high(s) && str_starts_low(parts[next])) len -= 3;
+    memcpy(out, d + skip, (size_t)len);
+    out += len;
+    prev = i;
+  }
+  TY_STR_DATA(r)[r->blen] = 0;
+  return r;
+}
+
 int32_t ty_str_eq(tystr *a, tystr *b) {
   if (a == b) return 1;
   if (!a || !b) return 0;
@@ -2182,9 +2251,22 @@ int32_t ty_obj_hash(void *o) {
 int32_t ty_obj_eq(void *a, void *b) { return a == b; }
 
 tystr *ty_str_of_long(int64_t v) {
-  char buf[32];
-  int n = snprintf(buf, sizeof buf, "%lld", (long long)v);
-  return ty_str_new(buf, n);
+  /* Decimal, the way %lld spells it, without going through printf. bench_string
+     spent two thirds of its time here: every `+` that touches an int formats
+     one, and snprintf's format parsing and locale checks cost more than the
+     digits themselves. The magnitude is taken unsigned, which is also what
+     makes INT64_MIN print without overflowing a signed negation. */
+  char buf[24];
+  char *p = buf + sizeof buf;
+  uint64_t u = (uint64_t)v;
+  int neg = v < 0;
+  if (neg) u = 0 - u;
+  do {
+    *--p = (char)('0' + (int)(u % 10));
+    u /= 10;
+  } while (u);
+  if (neg) *--p = '-';
+  return ty_str_new(p, (int64_t)(buf + sizeof buf - p));
 }
 tystr *ty_str_of_int(int64_t v) { return ty_str_of_long(v); }
 tystr *ty_str_of_bool(int32_t v) { return ty_str_intern(v ? "true" : "false"); }
