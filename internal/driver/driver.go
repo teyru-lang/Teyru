@@ -51,9 +51,14 @@ type Options struct {
 	// the C without leaving a binary behind.
 	CSourceOnly bool
 	NoLTO       bool // disable link-time optimisation (on by default)
-	Verbose     bool
-	ExtraCC     []string
-	KeptTemp    bool
+	// Debug is -g: the generated C carries #line directives back to the .teyru
+	// sources, and the C compiler is asked for DWARF. The c back end implements
+	// it; the llvm back end refuses it rather than accepting it and writing no
+	// debug information (see compileLLVM).
+	Debug    bool
+	Verbose  bool
+	ExtraCC  []string
+	KeptTemp bool
 	// Native lists C sources that implement the program's native methods; they
 	// are compiled together with the generated program.
 	Native []string
@@ -216,14 +221,6 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	if debugOpt(opt) {
 		return compileSplit(prog, opts, tgt, opt, cc)
 	}
-	csrc, link := codegen.Emit(prog)
-	// A program whose reachable code can call the TLS layer has to be linked
-	// against OpenSSL, and a target that has no OpenSSL for it is refused here,
-	// by name and before anything is written, rather than by the linker later.
-	if err := checkTLS(tgt, link); err != nil {
-		return nil, err
-	}
-
 	rtDir, err := os.MkdirTemp("", "teyru-rt-")
 	if err != nil {
 		return nil, err
@@ -238,6 +235,15 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	cfile := opts.CFile
 	if cfile == "" {
 		cfile = filepath.Join(rtDir, "program.c")
+	}
+	// The generated path goes with the debug request: it is the file every
+	// #line region returns to, and the line numbers are the assembled file's.
+	csrc, link := codegen.Emit(prog, codegen.Debug{On: opts.Debug, CFile: cfile})
+	// A program whose reachable code can call the TLS layer has to be linked
+	// against OpenSSL, and a target that has no OpenSSL for it is refused here,
+	// by name and before anything is written, rather than by the linker later.
+	if err := checkTLS(tgt, link); err != nil {
+		return nil, err
 	}
 	dir := filepath.Dir(cfile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -299,9 +305,19 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	// libraries come after them, which is the order a static link needs.
 	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
 	cflags = append(cflags, tgt.cflags...)
+	if opts.Debug {
+		// The compiler writes the DWARF; the emitter has already put the line
+		// mapping in the C it is given.
+		cflags = append(cflags, "-g")
+	}
 	cflags = append(cflags, opts.ExtraCC...)
 	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
 	ldflags = append(ldflags, tgt.cflags...)
+	if opts.Debug {
+		// The link is where link-time optimisation produces the debug info of
+		// the code it inlines, so it is asked for there as well.
+		ldflags = append(ldflags, "-g")
+	}
 	// The target's own flags, before the libraries: -static has to be seen
 	// before the -l that follows it, or the library it is meant to apply to is
 	// taken from the dynamic import library instead and the program needs a
@@ -377,17 +393,24 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	if !opts.KeptTemp {
 		defer os.RemoveAll(rtDir)
 	}
+	// The generated path is what a debug build's #line regions return to, and
+	// the emitter needs it before it writes a line: see codegen.Debug.
+	cfile := opts.CFile
+	if cfile == "" {
+		cfile = filepath.Join(rtDir, "program.c")
+	}
+	dbg := codegen.Debug{On: opts.Debug, CFile: cfile}
 	// The program's unit first: it is where the reflection tables go, whatever
 	// class they belong to, and both units have to agree on which of them
 	// defines a string literal, which is what the second argument is for.
 	start := time.Now()
-	unit := codegen.EmitProgram(prog)
-	entry := preludeEntry(tgt, opt, cc)
+	unit := codegen.EmitProgram(prog, dbg)
+	entry := preludeEntry(tgt, opt, cc, opts.Debug)
 	if opts.Verbose {
 		fmt.Fprintf(os.Stderr, "teyru: the program's unit: %s\n", time.Since(start).Round(time.Millisecond))
 		start = time.Now()
 	}
-	libSrc, libObj, err := libraryUnit(entry, rtDir, cc, tgt, opt, unit)
+	libSrc, libObj, err := libraryUnit(entry, rtDir, cc, tgt, opt, unit, opts.Debug)
 	if err != nil {
 		return nil, err
 	}
@@ -406,10 +429,6 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 		return nil, err
 	}
 	rtC := writeRuntime(rtDir, tgt, link)
-	cfile := opts.CFile
-	if cfile == "" {
-		cfile = filepath.Join(rtDir, "program.c")
-	}
 	if err := os.MkdirAll(filepath.Dir(cfile), 0o755); err != nil {
 		return nil, err
 	}
@@ -457,9 +476,15 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
 		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
 	cflags = append(cflags, tgt.cflags...)
+	if opts.Debug {
+		cflags = append(cflags, "-g")
+	}
 	cflags = append(cflags, opts.ExtraCC...)
 	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
 	ldflags = append(ldflags, tgt.cflags...)
+	if opts.Debug {
+		ldflags = append(ldflags, "-g")
+	}
 	ldflags = append(ldflags, tgt.ldflags...)
 	ldflags = append(ldflags, gcSectionsFlag(tgt)...)
 	// The objects in the order the sources were named in before the driver
@@ -504,7 +529,7 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 // program's unit was not emitted for, which is the failure a cache must not
 // have. The entry is keyed by everything they were built from, and a file is
 // published by rename, so what is read is a whole artifact of some build.
-func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, unit codegen.Program) (string, string, error) {
+func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, unit codegen.Program, debug bool) (string, string, error) {
 	writeRuntimeHeaders(rtDir)
 	if entry.Has(preludeHeader, "prelude.c", "prelude.o") {
 		hdr, ok := entry.Get(preludeHeader)
@@ -530,13 +555,16 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	if diags.HasErrors() {
 		return "", "", fmt.Errorf("the standard library does not check on its own: %s", diags.String())
 	}
-	lib := codegen.EmitLibrary(pa)
+	srcFile := filepath.Join(rtDir, "prelude.c")
+	// The standard library's sources are embedded in the compiler, so they
+	// carry no #line directives; the path is named anyway, because a debug
+	// build's regions have to return to the file they are compiled from.
+	lib := codegen.EmitLibrary(pa, codegen.Debug{On: debug, CFile: srcFile})
 	if !sameStrings(lib.Literals, unit.PreludeLiterals) {
 		return "", "", fmt.Errorf("internal error: the standard library's string literals and the program's unit disagree "+
 			"(%d against %d); a literal is one object only if both agree which unit defines it. This is a compiler bug",
 			len(lib.Literals), len(unit.PreludeLiterals))
 	}
-	srcFile := filepath.Join(rtDir, "prelude.c")
 	hdrFile := filepath.Join(rtDir, preludeHeader)
 	if err := os.WriteFile(srcFile, []byte(lib.Source), 0o644); err != nil {
 		return "", "", err
@@ -548,6 +576,13 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	args := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
 		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
 	args = append(args, tgt.cflags...)
+	if debug {
+		// The standard library's sources are embedded in the compiler, so they
+		// carry no #line directives (see codegen.Debug); the object is still
+		// compiled with DWARF so that a frame in it has line information of its
+		// own rather than none.
+		args = append(args, "-g")
+	}
 	// One unit, compiled through the same path the program's own units take, so
 	// that there is one place in the driver that runs a C compiler on generated
 	// C -- and so that the compiler's own diagnostics reach stderr, which is
@@ -587,7 +622,13 @@ const preludeHeader = "typrelude.h"
 
 // preludeEntry is the cache entry the standard library's unit and object live
 // in for one build's settings.
-func preludeEntry(tgt *target, opt, cc string) *cache.Entry {
+func preludeEntry(tgt *target, opt, cc string, debug bool) *cache.Entry {
+	// The object differs when the build asks for debug information, so the
+	// entry does too. A build without -g keeps the key it always had.
+	variant := fmt.Sprintf("cc=%s", filepath.Base(cc))
+	if debug {
+		variant += ";debug=1"
+	}
 	return cache.Open().Lookup(cache.Key{
 		Compiler: cache.Build(version),
 		Runtime:  runtimeHash(tgt),
@@ -600,7 +641,7 @@ func preludeEntry(tgt *target, opt, cc string) *cache.Entry {
 		// from the same source. Reflection is not one of them any more: neither
 		// reflection table is written into the library's unit, so one entry
 		// serves every program (see codegen.EmitLibrary).
-		Variant: fmt.Sprintf("cc=%s", filepath.Base(cc)),
+		Variant: variant,
 	})
 }
 
@@ -676,6 +717,16 @@ const (
 // runtime, which is C. A refusal is a diagnostic, not a fallback.
 func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*Result, error) {
 	res := &Result{Diags: diags}
+	// Debug information is the C back end's: its emitter writes the #line
+	// mapping and the C compiler turns it into DWARF. The module this back end
+	// writes carries no !dbg metadata, and accepting -g here would produce a
+	// binary a debugger has nothing to say about, which is worse than saying so
+	// before anything is built.
+	if opts.Debug {
+		diags.Errorf(source.Pos{}, "TY-INT-0103",
+			"the llvm back end does not emit debug information yet: -g is supported by the c back end only")
+		return res, fmt.Errorf("the llvm backend does not support -g")
+	}
 	// The target decides which half of the runtime is compiled beside the module
 	// and what the output is called, exactly as it does for the C back end.
 	tgt, err := resolveTarget(opts.Target, opts.CC)

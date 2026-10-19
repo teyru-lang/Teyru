@@ -128,7 +128,27 @@ func (e *Emitter) stmt(s ast.Stmt) {
 
 // stmtInner is the statement itself, with the frame scope around it already open
 // (see stmt and frameScope).
+//
+// It is also where a debug build says where the statement came from: the
+// directive goes before the statement's first line and the generated file is
+// named again after its last, so the lines between two statements -- a closing
+// brace, a loop's own label -- are not attributed to a source line they were
+// not written at. This is the one funnel every statement passes through,
+// however it was reached, which is what makes the mapping complete.
 func (e *Emitter) stmtInner(s ast.Stmt) {
+	d, ok := e.sourceDirective(stmtPos(s))
+	if ok {
+		writeDirective(e.code, d)
+	}
+	e.stmtBody(s)
+	if ok {
+		e.writeReset(e.code)
+	}
+}
+
+// stmtBody is the statement's own C, with the debug region around it already
+// open (see stmtInner).
+func (e *Emitter) stmtBody(s ast.Stmt) {
 	switch v := s.(type) {
 	case *ast.Block:
 		e.line("{\n")

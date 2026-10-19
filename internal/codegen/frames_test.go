@@ -204,7 +204,7 @@ func emitFrameCase(t *testing.T, src string) string {
 	if diags.HasErrors() {
 		t.Fatalf("semantic errors in the test program: %v", diags)
 	}
-	c, _ := Emit(prog)
+	c, _ := Emit(prog, Debug{})
 	return c
 }
 

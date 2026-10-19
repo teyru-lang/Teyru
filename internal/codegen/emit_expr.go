@@ -15,29 +15,7 @@ import (
 
 // cstr returns a C string literal for s.
 func (e *Emitter) cstr(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '"':
-			b.WriteString("\\\"")
-		case c == '\\':
-			b.WriteString("\\\\")
-		case c == '\n':
-			b.WriteString("\\n")
-		case c == '\r':
-			b.WriteString("\\r")
-		case c == '\t':
-			b.WriteString("\\t")
-		case c < 32 || c > 126:
-			fmt.Fprintf(&b, "\\%03o", c)
-		default:
-			b.WriteByte(c)
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
+	return cQuote(s)
 }
 
 // tmpRef materialises an expression into a statement-expression so it can be
@@ -2868,6 +2846,10 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	e.indent = 0
 	restoreFrame := e.frameReset()
 	defer restoreFrame()
+	ld, dbgOn := e.sourceDirective(lam.Pos)
+	if dbgOn {
+		writeDirective(e.code, ld)
+	}
 	fmt.Fprintf(e.code, "%s%s {\n", e.link, e.signature(m))
 	e.indent++
 	e.stackCheck()
@@ -2906,4 +2888,7 @@ func (e *Emitter) emitLambdaMethod(cl *ast.Class, m *ast.Method) {
 	}
 	e.indent--
 	e.code.WriteString("}\n\n")
+	if dbgOn {
+		e.writeReset(e.code)
+	}
 }
