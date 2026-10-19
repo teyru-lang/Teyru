@@ -369,21 +369,25 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	}
 	ldflags = append(ldflags, opts.Link...)
 	ldflags = append(ldflags, opts.ExtraCC...)
-	// Link-time optimisation lets clang inline runtime helpers (string ops, the
-	// allocation fast path) into the generated program. It is on by default and
-	// retried without it when the toolchain has no LTO support: only the flags
-	// differ between the two attempts, so a retry is a successful build like
-	// any other.
-	if err := compileAndLink(cc, cflags, ldflags, units, !opts.NoLTO, opts.Verbose); err != nil {
-		if opts.NoLTO {
-			return res, err
+	// Link-time optimisation lets the C compiler inline runtime helpers (string
+	// ops, the allocation fast path) into the generated program. It is on by
+	// default, and it is asked for in its parallel form first: gcc's -flto=auto
+	// or clang's -flto linked by lld, whose code generation runs in one
+	// partition per CPU. The plain form is the retry for a toolchain that does
+	// not know the parallel spelling and no LTO the retry for one with none:
+	// only the flags differ between the attempts, so a later attempt is a
+	// successful build like any other.
+	modes := ltoAttempts(cc, tgt.name, compileJobs(len(units)), !opts.NoLTO)
+	for i, mode := range modes {
+		if err = compileAndLink(cc, cflags, ldflags, units, tgt.name, mode, opts.Verbose); err == nil {
+			break
 		}
-		if opts.Verbose {
-			fmt.Fprintln(os.Stderr, "teyru: retrying without -flto")
+		if opts.Verbose && i+1 < len(modes) {
+			fmt.Fprintf(os.Stderr, "teyru: retrying with %s\n", ltoName(modes[i+1]))
 		}
-		if err2 := compileAndLink(cc, cflags, ldflags, units, false, opts.Verbose); err2 != nil {
-			return res, err
-		}
+	}
+	if err != nil {
+		return res, err
 	}
 	res.Exe = exe
 	return res, nil
@@ -873,15 +877,16 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 	}
 	ldflags = append(ldflags, opts.Link...)
 	ldflags = append(ldflags, opts.ExtraCC...)
-	// Link-time optimisation lets clang inline the runtime's helpers (the
-	// allocation fast path's slow half, the string operations) into the module,
-	// which is what the C backend's build gets. It is retried without it when
-	// the toolchain has no LTO support: only the flags differ.
-	build := func(lto bool) error {
+	// Link-time optimisation lets the C compiler inline the runtime's helpers
+	// (the allocation fast path's slow half, the string operations) into the
+	// module, which is what the C backend's build gets. It is asked for in the
+	// same order the C backend asks for it: the parallel form first, the plain
+	// form for a toolchain that does not know it, and no LTO for one with none.
+	build := func(mode ltoMode) error {
 		cf, ld := cflags, ldflags
-		if lto {
-			cf = append([]string{"-flto"}, cflags...)
-			ld = append([]string{"-flto"}, ldflags...)
+		if cfExtra, ldExtra := ltoFlags(cc, tgt.name, compileJobs(len(units)), mode); len(cfExtra) > 0 || len(ldExtra) > 0 {
+			cf = append(append([]string{}, cfExtra...), cflags...)
+			ld = append(append([]string{}, ldExtra...), ldflags...)
 		}
 		if err := compileUnits(cc, cf, units, opts.Verbose); err != nil {
 			return err
@@ -896,16 +901,17 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 		}
 		return nil
 	}
-	if err := build(!opts.NoLTO); err != nil {
-		if opts.NoLTO {
-			return res, backendFailure(err, mfile)
+	modes := ltoAttempts(cc, tgt.name, compileJobs(len(units)), !opts.NoLTO)
+	for i, mode := range modes {
+		if err = build(mode); err == nil {
+			break
 		}
-		if opts.Verbose {
-			fmt.Fprintln(os.Stderr, "teyru: retrying without -flto")
+		if opts.Verbose && i+1 < len(modes) {
+			fmt.Fprintf(os.Stderr, "teyru: llvm backend: retrying with %s\n", ltoName(modes[i+1]))
 		}
-		if err2 := build(false); err2 != nil {
-			return res, backendFailure(err, mfile)
-		}
+	}
+	if err != nil {
+		return res, backendFailure(err, mfile)
 	}
 	res.Exe = exe
 	return res, nil

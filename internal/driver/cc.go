@@ -183,15 +183,16 @@ func objectList(units []cUnit) []string {
 // compileAndLink compiles every unit of a build in parallel and links the
 // objects, which is the whole of what a build asks a C compiler for.
 //
-// lto adds -flto to both halves, and it has to be both: the compile is what
-// writes the intermediate representation into the object and the link is what
-// optimises across the units. The failure a caller retries without it is the
-// toolchain's, and it can come from either half, so a retry redoes both.
-func compileAndLink(cc string, cflags, ldflags []string, units []cUnit, lto, verbose bool) error {
+// mode adds that mode's flags to both halves, and it has to be both: the
+// compile is what writes the intermediate representation into the object and
+// the link is what optimises across the units. The failure a caller retries
+// with a lesser mode is the toolchain's, and it can come from either half, so a
+// retry redoes both.
+func compileAndLink(cc string, cflags, ldflags []string, units []cUnit, target string, mode ltoMode, verbose bool) error {
 	cf, ld := cflags, ldflags
-	if lto {
-		cf = append([]string{"-flto"}, cflags...)
-		ld = append([]string{"-flto"}, ldflags...)
+	if cfExtra, ldExtra := ltoFlags(cc, target, compileJobs(len(units)), mode); len(cfExtra) > 0 || len(ldExtra) > 0 {
+		cf = append(append([]string{}, cfExtra...), cflags...)
+		ld = append(append([]string{}, ldExtra...), ldflags...)
 	}
 	if err := compileUnits(cc, cf, units, verbose); err != nil {
 		return fmt.Errorf("C backend failed: %w", err)
@@ -206,4 +207,129 @@ func compileAndLink(cc string, cflags, ldflags []string, units []cUnit, lto, ver
 		return fmt.Errorf("C backend failed: %w", err)
 	}
 	return nil
+}
+
+// ltoMode is how a build asks for link-time optimisation, and in which form.
+//
+// The parallel form is the same optimisation as the plain one, done by a
+// toolchain that can spread it over the machine's cores. It is the form a
+// release build asks for first; the plain form is the retry for a toolchain
+// that does not know the parallel spelling.
+type ltoMode int
+
+const (
+	// ltoOff is a build with no link-time optimisation.
+	ltoOff ltoMode = iota
+	// ltoPlain is -flto: the linker's own optimisation, in one process.
+	ltoPlain
+	// ltoParallel is the toolchain's parallel spelling of the same optimisation.
+	ltoParallel
+)
+
+// ccFamily is the C compiler family, as far as the LTO flags are concerned.
+type ccFamily int
+
+const (
+	// familyUnknown is a compiler this driver cannot name from its path. Both
+	// flags below are accepted by the two families it might be, so the parallel
+	// spelling is still asked for.
+	familyUnknown ccFamily = iota
+	familyGCC
+	familyClang
+)
+
+// compilerFamily names the C compiler family from the name the caller gave it.
+//
+// The name is all this can use. Asking the compiler would be another process in
+// every build, and the two parallel spellings are chosen by the driver rather
+// than probed: a toolchain that rejects the one asked for is retried with the
+// plain form, which is what the retry has always been for.
+func compilerFamily(cc string) ccFamily {
+	name := strings.ToLower(filepath.Base(cc))
+	switch {
+	case strings.Contains(name, "clang"):
+		return familyClang
+	case strings.Contains(name, "gcc"), strings.Contains(name, "g++"):
+		return familyGCC
+	}
+	return familyUnknown
+}
+
+// hasLLD reports whether an lld the C driver can be pointed at is on PATH.
+//
+// clang's LTO is parallel only through lld: --lto-partitions splits code
+// generation into that many tasks after the optimisation has run. Without lld
+// there is nothing to ask, and the plain form is used.
+func hasLLD() bool {
+	_, err := exec.LookPath("ld.lld")
+	return err == nil
+}
+
+// ltoFlags is the flags one mode adds to the compile command and to the link
+// command, in that order. jobs is the build's parallelism budget, the same
+// number compileJobs gives the compilers.
+//
+// GCC's -flto=auto runs its LTRANS back end on every core, and is the parallel
+// spelling that needs nothing but the compiler. clang's -flto is parallel only
+// in lld, so the link is given lld and one code-generation partition per job:
+// the number is the machine's rather than a constant so that the flags say what
+// the build is actually asking for. More partitions than jobs was measured to
+// buy nothing -- the serial optimisation is most of an LTO link, and 8, 16 and
+// 32 partitions came out within a second of each other -- while moving the hot
+// code between layouts, which is worth a few per cent either way.
+//
+// clang's -flto=thin is not used even though it is the other parallel spelling:
+// it parallelises per module, and a release build's program is one generated
+// module, so it ran the same work on one core and measured no faster.
+func ltoFlags(cc, target string, jobs int, mode ltoMode) (compile, link []string) {
+	switch mode {
+	case ltoPlain:
+		return []string{"-flto"}, []string{"-flto"}
+	case ltoParallel:
+		switch compilerFamily(cc) {
+		case familyGCC:
+			return []string{"-flto=auto"}, []string{"-flto=auto"}
+		case familyClang:
+			if strings.HasPrefix(target, "linux/") && hasLLD() {
+				partitions := "-Wl,--lto-partitions=" + strconv.Itoa(jobs)
+				return []string{"-flto"}, []string{"-flto", "-fuse-ld=lld", partitions}
+			}
+		}
+		// A compiler this driver cannot name, or a clang whose linker is not
+		// lld: -flto=auto is the parallel form where the compiler has one and
+		// the plain form where it does not.
+		return []string{"-flto=auto"}, []string{"-flto=auto"}
+	}
+	return nil, nil
+}
+
+// ltoAttempts is the order a release build tries its LTO modes in: the parallel
+// form, then the plain one when that is a different command line, then no LTO.
+//
+// The last attempt is what makes a toolchain with no LTO support at all a
+// successful build like any other; the middle one is the retry for a toolchain
+// that knows -flto but not the parallel spelling. When the two produce the same
+// command line the middle attempt is not repeated.
+func ltoAttempts(cc, target string, jobs int, lto bool) []ltoMode {
+	if !lto {
+		return []ltoMode{ltoOff}
+	}
+	pcf, pld := ltoFlags(cc, target, jobs, ltoParallel)
+	ccf, cld := ltoFlags(cc, target, jobs, ltoPlain)
+	modes := []ltoMode{ltoParallel}
+	if !sameStrings(pcf, ccf) || !sameStrings(pld, cld) {
+		modes = append(modes, ltoPlain)
+	}
+	return append(modes, ltoOff)
+}
+
+// ltoName is what a mode is called in a verbose build's retry line.
+func ltoName(mode ltoMode) string {
+	switch mode {
+	case ltoParallel:
+		return "parallel LTO"
+	case ltoPlain:
+		return "-flto"
+	}
+	return "no LTO"
 }
