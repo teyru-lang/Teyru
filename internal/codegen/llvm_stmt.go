@@ -70,7 +70,7 @@ func (e *llvmEmitter) stmt(f *fb, s ast.Stmt) {
 	case *ast.Assert:
 		e.assertStmt(f, v)
 	case *ast.Sync:
-		e.refuse(noPos, "synchronized: the llvm back end does not lower monitors yet")
+		e.syncStmt(f, v)
 	default:
 		e.refuse(noPos, "the statement %T: the llvm back end does not lower it", s)
 	}
@@ -349,6 +349,85 @@ func (e *llvmEmitter) continueStmt(f *fb, v *ast.Continue) {
 	}
 	e.leaveFinallys(f, fr.depth)
 	f.br(fr.cont)
+}
+
+// syncStmt lowers `synchronized (lock) { ... }`: the lock expression is
+// evaluated once, before the monitor is taken, so that a `synchronized
+// (obj.field)` releases the object it locked rather than whatever the field
+// holds by the time the body ends. The monitor is the runtime's (ty_sync_enter
+// and ty_sync_exit, the same pair a synchronized method takes), and the release
+// is a finally action, so a return, a break or a throw out of the body gives
+// the monitor back -- a monitor left held hangs every other thread that asks
+// for the object.
+//
+// A null lock is Java's `synchronized (null)` (JLS 14.19), which throws the
+// NullPointerException the runtime's bare ty_npe builds.
+func (e *llvmEmitter) syncStmt(f *fb, v *ast.Sync) {
+	e.decl("ty_sync_enter", "void", []string{"ptr"}, "")
+	lock := e.expr(f, v.Lock)
+	e.nullCheck(f, lock.v, "", "")
+	// The lock is kept in a stack slot: a setjmp sits in the body's path, and
+	// only memory survives the jump back, which is the rule every slot of a
+	// function holding a catch frame is under (fb.slots).
+	f.volatile = true
+	slot := f.tempSlot(e.refType(), "lock")
+	e.store(f, slot, e.refType(), value(lock.v, e.refType()))
+	f.ins(fmt.Sprintf("call void @ty_sync_enter(ptr %s)", e.load(f, slot, e.refType()).v))
+	e.syncBody(f, func() string { return e.load(f, slot, e.refType()).v }, v.Body)
+}
+
+// syncBody runs a block holding the monitor `lock` names, and releases it on
+// every way out. It is the try/finally shape: a catch frame around the body,
+// the release as the finally action, and the exception rethrown once the
+// monitor is back.
+func (e *llvmEmitter) syncBody(f *fb, lock func() string, body *ast.Block) {
+	e.decl("ty_sync_exit", "void", []string{"ptr"}, "")
+	depth := len(f.loops)
+	finSlot := f.rawSlot("%tycatch", "sync", 8)
+	finEx := f.tempSlot(e.refType(), "syncex")
+	e.store(f, finEx, e.refType(), value("null", e.refType()))
+	finBody := f.nextLabel("sync_body")
+	finLand := f.nextLabel("sync_land")
+	finDone := f.nextLabel("sync_done")
+	e.armCatch(f, finSlot)
+	f.cbr(e.setjmp(f, finSlot), finLand, finBody)
+	f.label(finBody)
+	exit := func() { f.ins(fmt.Sprintf("call void @ty_sync_exit(ptr %s)", lock())) }
+	f.pushFin(handlerFrame{depth: depth, frame: finSlot, emit: exit})
+	e.block(f, body)
+	f.popFin()
+	f.br(finDone)
+	f.label(finLand)
+	ex := e.loadRaw(f, "ptr", e.gepBytes(f, finSlot, 208), 8)
+	e.store(f, finEx, e.refType(), value(ex, e.refType()))
+	f.br(finDone)
+	f.label(finDone)
+	e.restoreCatch(f, finSlot)
+	exit()
+	exNow := e.load(f, finEx, e.refType())
+	none := f.reg()
+	f.ins(fmt.Sprintf("%s = icmp eq ptr %s, null", none, exNow.v))
+	ret := f.nextLabel("sync_ret")
+	ok := f.nextLabel("sync_ok")
+	f.cbr(none, ok, ret)
+	f.label(ret)
+	e.rethrow(f, exNow.v)
+	f.label(ok)
+}
+
+// syncMethodBody is a `synchronized` method: the monitor is the receiver, or
+// the class itself for a static method -- the same object Java locks, since a
+// Class value in Teyru is that class's tyclass and there is exactly one per
+// class. Neither is ever null, so there is no null test here.
+func (e *llvmEmitter) syncMethodBody(f *fb, m *ast.Method, body *ast.Block) {
+	e.decl("ty_sync_enter", "void", []string{"ptr"}, "")
+	lock := "%this"
+	if m.IsStatic() {
+		lock = "@cls_" + util.Mangle(m.Owner.Full)
+	}
+	f.ins(fmt.Sprintf("call void @ty_sync_enter(ptr %s)", lock))
+	f.volatile = true
+	e.syncBody(f, func() string { return lock }, body)
 }
 
 func (e *llvmEmitter) labeled(f *fb, v *ast.Labeled) {
@@ -746,9 +825,15 @@ func (e *llvmEmitter) tryStmt(f *fb, v *ast.Try) {
 // which is what ty_throw longjmps to.
 func (e *llvmEmitter) armCatch(f *fb, slot string) {
 	e.declGlobal("ty_cur_catch", "thread_local ", "ptr", ", align 8")
+	e.declGlobal("ty_frames", "thread_local ", "ptr", ", align 8")
 	prev := e.loadRaw(f, "ptr", "@ty_cur_catch", 8)
 	f.ins(fmt.Sprintf("store ptr %s, ptr %s", prev, e.gepBytes(f, slot, 200)))
 	f.ins(fmt.Sprintf("store ptr null, ptr %s", e.gepBytes(f, slot, 208)))
+	// The frame chain as of this point: ty_throw rewinds to it before the
+	// longjmp, so the collector walks the landing frame's chain and not a dead
+	// frame's (see tycatch in internal/runtime/src/tyrt.h).
+	frames := e.loadRaw(f, "ptr", "@ty_frames", 8)
+	f.ins(fmt.Sprintf("store ptr %s, ptr %s", frames, e.gepBytes(f, slot, 216)))
 	f.ins(fmt.Sprintf("store ptr %s, ptr @ty_cur_catch", slot))
 }
 
