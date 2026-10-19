@@ -358,6 +358,9 @@ type llvmEmitter struct {
 
 	trapNames map[string]string // a vtable slot's signature -> its trap
 	trapOrder []string
+	// ifaceDevirt caches the C back end's whole-program devirtualization
+	// answer per interface method (see Emitter.devirtInterface).
+	ifaceDevirt map[*ast.Method]*ast.Method
 
 	// classWraps interns the object a class literal is built from, one per
 	// class a literal names.
