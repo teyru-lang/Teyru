@@ -336,7 +336,7 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	// The link names the objects where the compile named the sources, and the
 	// libraries come after them, which is the order a static link needs.
 	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
-	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, targetCflags(tgt, cc)...)
 	if opts.Debug {
 		// The compiler writes the DWARF; the emitter has already put the line
 		// mapping in the C it is given.
@@ -511,7 +511,7 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	}
 	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
 		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
-	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, targetCflags(tgt, cc)...)
 	if opts.Debug {
 		cflags = append(cflags, "-g")
 	}
@@ -611,7 +611,7 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	objFile := filepath.Join(rtDir, "prelude.o")
 	args := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
 		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
-	args = append(args, tgt.cflags...)
+	args = append(args, targetCflags(tgt, cc)...)
 	if debug {
 		// The standard library's sources are embedded in the compiler, so they
 		// carry no #line directives (see codegen.Debug); the object is still
@@ -714,6 +714,23 @@ func runtimeHash(tgt *target) string {
 func writeRuntimeHeaders(dir string) {
 	must(os.WriteFile(filepath.Join(dir, "tyrt.h"), []byte(tyrt.Header), 0o644))
 	must(os.WriteFile(filepath.Join(dir, "tyrt_plat.h"), []byte(tyrt.PlatHeader), 0o644))
+}
+
+// targetCflags is tgt.cflags plus whatever this particular compiler needs.
+//
+// MinGW's assembler refuses an object with more than 32,767 COFF sections, and
+// the standard library's unit compiled with -ffunction-sections passes that
+// once the library grows past a few thousand functions: the cold-cache build
+// of t93_json failed with "too many sections (35655)". -Wa,-mbig-obj lifts the
+// limit. clang's integrated assembler does not take that option, so it is
+// added only for a MinGW gcc; any other windows compiler gets the plain flags
+// and, if it has a limit of its own, says so itself.
+func targetCflags(tgt *target, cc string) []string {
+	out := append([]string{}, tgt.cflags...)
+	if strings.Contains(strings.ToLower(filepath.Base(cc)), "mingw") {
+		out = append(out, "-Wa,-mbig-obj")
+	}
+	return out
 }
 
 // gcSectionsFlag is how a target's linker is told to drop what nothing
