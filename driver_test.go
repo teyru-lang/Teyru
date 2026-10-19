@@ -3,6 +3,7 @@ package teyru_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/teyru-lang/Teyru/internal/driver"
 	"github.com/teyru-lang/Teyru/internal/java"
@@ -165,14 +167,37 @@ func programExit(dir, name string) (int, error) {
 	return code, nil
 }
 
+// programTimeout is how long one program may run before the harness calls it a
+// failure. Without it a program that never exits takes the whole suite down
+// with it, and the timeout says nothing about which case hung; the variable is
+// there because a deliberately slow case (a long benchmark run by hand) can
+// raise it.
+func programTimeout() time.Duration {
+	if v := os.Getenv("TEYRU_TEST_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 120 * time.Second
+}
+
 // runProgram runs a built executable and reports its stdout, stderr and status.
 func runProgram(exe string, args []string) (string, string, int, error) {
-	cmd := exec.Command(exe, args...)
+	timeout := programTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, args...)
 	// the two streams are compared separately: merging them would make the
 	// result depend on when the buffered stdout happens to flush
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
 	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return outBuf.String(), errBuf.String(), 0, fmt.Errorf("%s did not exit within %s (TEYRU_TEST_TIMEOUT)", filepath.Base(exe), timeout)
+	}
 	code := 0
 	if err != nil {
 		ee, ok := err.(*exec.ExitError)
