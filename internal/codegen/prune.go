@@ -268,10 +268,19 @@ func parseC(src string, staticOnly bool) *cparse {
 		owned[i] = -1
 	}
 	mainAt := -1
+	// The index is advanced past each definition it finds (`i = d.end`), so
+	// this is a loop whose variable is assigned in its body: it cannot be a
+	// range over the line count.
 	for i := 0; i < len(lines); i++ {
 		l := lines[i]
 		if mainAt < 0 && strings.HasPrefix(l, "int main(") {
 			mainAt = i
+		}
+		// A preprocessor line is not a definition. A debug build's #line
+		// directives are the reason this has to be said: a path with a `[` or
+		// an `=` in it is exactly what declName reads as the start of a table.
+		if strings.HasPrefix(l, "#") {
+			continue
 		}
 		if staticOnly && !strings.HasPrefix(l, "static ") {
 			continue
@@ -754,6 +763,9 @@ func (p *cparse) isSub(x, owner string) bool {
 // what the runtime reads on an object is not a property of the program's call
 // sites.
 func (p *cparse) rewrite() string {
+	// Every line keeps its position: a debug build's #line directives name the
+	// generated file's line numbers, and one dropped or added line here would
+	// point the rest of the file at the wrong one.
 	out := make([]string, len(p.lines))
 	copy(out, p.lines)
 	for _, d := range p.defs {

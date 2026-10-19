@@ -50,6 +50,10 @@ flags:
                 -O1 the standard library is compiled once into the user cache
                 and linked, instead of the whole program being optimised as
                 one; -O2 and above keep the whole-program build
+  -g            include source-level debug information (DWARF): the generated
+                C carries #line directives back to the .teyru files and the C
+                compiler is given -g, so a debugger stops at Teyru source
+                lines. The c back end only; the llvm back end refuses -g
   --llvm-ir <p> write the LLVM IR module to <p> (the backend is clang/LLVM)
   --backend <b> c (default) or llvm: which back end compiles the program.
                 The llvm back end emits the program's own LLVM module and
@@ -123,6 +127,8 @@ func run() int {
 			}
 		case a == "--no-lto":
 			opts.NoLTO = true
+		case a == "-g":
+			opts.Debug = true
 		case a == "-v":
 			opts.Verbose = true
 		case a == "--native":
