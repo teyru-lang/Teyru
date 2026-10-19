@@ -321,6 +321,11 @@ static size_t gc_nshared = 0;
    the one the walk would have given. */
 static char *gc_heap_lo = NULL;
 static size_t gc_heap_span = 0;
+/* How many bytes of slab the collection is about to walk, summed in
+   collect_slabs. The trace reports it as the heap's size before the sweep, and
+   the worker count uses it to keep the parallel path off heaps too small to pay
+   for waking it. */
+static size_t gc_slab_used = 0;
 
 /* The heap lock: held by a thread while it refills its slab, and by the
    collector for the whole of a collection. ty_heap_lock counts the caller as
@@ -411,7 +416,12 @@ void ty_heap_detach(void) {
   ty_heap_unlock();
 }
 
-static tychunk *valid_obj_last = NULL;
+/* One per thread: the mark phase runs on several threads at once, and a cache
+   shared between them would be written by one while another read it. Each
+   worker keeps its own last-answer slab, which is what it needs anyway -- a
+   worker's candidates are the objects it is tracing, not the ones its peers
+   are. */
+static _Thread_local tychunk *valid_obj_last = NULL;
 
 /* valid_obj_forget drops the last-chunk cache: the sweep frees whole chunks,
    and a stale pointer would be a use after free. */
@@ -489,28 +499,110 @@ static void build_block_starts(void) {
   }
 }
 
+/* --------------------------------------------------------- parallel marking
+
+   Marking is the part of a collection that scales with the live set, so it runs
+   on up to TY_GC_MAX_WORKERS threads while the world is stopped. The collector
+   thread is worker 0; the rest are helper threads it starts once and keeps for
+   the life of the process, parked on a condition variable between collections.
+   Nothing here mutates the heap except the mark bit and the slab's live flag,
+   both of which are claimed atomically, and the workers run only while every
+   mutator is inside a stop point -- so the trace sees the same heap a serial
+   trace would, in a different order.
+
+   Work distribution is a shared deque guarded by a mutex, drained in batches of
+   TY_GC_BATCH. A worker keeps the batch it took on its own stack and pushes the
+   objects it discovers back into the deque in batches, so the lock is taken once
+   per batch and not once per object. A worker that finds nothing to do is
+   counted out; the last one to leave sets `done`, which is the statement that no
+   work remains anywhere (the deque is empty and every other worker is idle),
+   and the collector proceeds to the sweep only after every helper has left the
+   mark loop.
+
+   Why a shared deque and not one deque per worker: the mark bit makes the work
+   set unordered and duplicate marking harmless, so there is nothing to gain
+   from affinity, and one queue is one place for the termination rule. */
+#define TY_GC_MAX_WORKERS 4
+#define TY_GC_BATCH 256
+/* Below this many bytes of slab the serial path is used whatever the worker
+   setting says: a collection of a few thousand objects costs less than waking
+   the helpers, and under TEYRU_GC_STRESS that is most collections. */
+#define TY_GC_PARALLEL_MIN (1u << 20)
+
+typedef struct gc_mark_ctx {
+  /* The objects this worker still has to trace, newest last. */
+  void *batch[TY_GC_BATCH];
+  int n;
+  /* Which root partition this worker scans. */
+  int index;
+  /* The serial fallback pushes to mark_stack instead of the shared deque. */
+  int serial;
+  /* The collector's own accounting, per worker; summed once marking ends. */
+  int64_t live_bytes;
+  int64_t frames_walked, precise_words, conserv_words;
+} gc_mark_ctx;
+
+static gc_mark_ctx gc_ctxs[TY_GC_MAX_WORKERS];
+
+/* The shared work deque: a ring of object pointers. `head` and `tail` only grow,
+   and are masked when indexing, so the subtraction that tests emptiness is the
+   count without a wrap case. All of it is guarded by gc_work_mtx. */
+typedef struct gc_queue {
+  void **items;
+  size_t cap, head, tail;
+} gc_queue;
+
+static gc_queue gc_q;
+
+/* A slice of a large array's reference elements, handed to the workers as its
+   own unit of work. An array can be millions of words long, and marking its
+   elements inline would leave that whole array on one worker while the others
+   idle; a range makes the elements the same kind of work as an object. The
+   threshold is well above a cache line's worth of pointers, so the queue is not
+   touched for the small arrays that are the common case. */
+#define TY_GC_RANGE_MIN 1024
+#define TY_GC_RANGE_CHUNK 4096
+
+typedef struct gc_range {
+  void **data;
+  int64_t start, count;
+} gc_range;
+
+static gc_range *gc_ranges = NULL;
+static size_t gc_range_cap = 0, gc_range_head = 0, gc_range_tail = 0;
+static typlat_mutex gc_work_mtx = TYPLAT_MUTEX_INITIALIZER;
+static typlat_cond gc_work_cv = TYPLAT_COND_INITIALIZER;
+/* Mark-phase termination state, all under gc_work_mtx: how many workers are
+   still looking for work, how many are parked waiting for some, and whether the
+   last one out has declared the phase over. */
+static int gc_active = 0, gc_sleepers = 0, gc_done = 0;
+/* Bumped every time a worker publishes work. A worker that finds nothing uses
+   it to spin cheaply instead of parking: in the shapes where one worker
+   produces a batch at a time and the others consume it, a sleep/wake pair per
+   batch costs far more than the batch does. */
+static uint64_t gc_push_seq = 0;
+#define TY_GC_SPIN 4096
+
+/* A hint that this is a spin, not useful work: pause on the architectures that
+   have one, and let the compiler keep the load in the loop either way. Yielding
+   the CPU on every iteration turns the spin into a syscall per iteration, which
+   is exactly what the spin exists to avoid. */
+static inline void gc_cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield");
+#else
+  __atomic_signal_fence(__ATOMIC_RELAXED);
+#endif
+}
+
+/* The serial fallback's mark stack, unchanged: one thread, and the existing
+   bound. The parallel path never touches it. */
 static void *mark_stack[1 << 20];
 static size_t mark_sp = 0;
 
-static void trace_object(void *obj);
-
-static void mark_value(void *p) {
-  if (!p) return;
-  tychunk *slab = NULL;
-  if (!valid_obj((char *)p, &slab)) return;
-  uint64_t *h = hdr_of(p);
-  if (h[1] & TY_MARK_BIT) return;
-  h[1] |= TY_MARK_BIT;
-  /* The collector's own bookkeeping, kept where the one pass that sees every
-     live object is: which slabs hold something live -- what decides whether a
-     slab is walked or handed back -- and how many bytes are live, which is what
-     the next collection's budget is derived from. Deriving the same two answers
-     from the heap afterwards means walking every block of every slab a second
-     time. */
-  slab->live_any = 1;
-  live_bytes += (int64_t)(h[0] & TY_SIZE_MASK);
-  if (mark_sp < (1 << 20)) mark_stack[mark_sp++] = p;
-}
+static void trace_object(void *obj, gc_mark_ctx *ctx);
 
 /* Whether a class describes an array. Class identity is the primary test because
    the emitted array class is registered without the array flag; the flag covers
@@ -522,19 +614,178 @@ static int is_array_class(tyclass *c) {
   return c && ((c->flags & TY_CLS_ARRAY) || c == TY_ARRAY);
 }
 
-static void trace_object(void *obj) {
+static void gc_queue_init(void) {
+  if (!gc_q.items) {
+    gc_q.cap = 1u << 16;
+    gc_q.items = (void **)malloc(gc_q.cap * sizeof(void *));
+    if (!gc_q.items) abort();
+  }
+  gc_q.head = gc_q.tail = 0;
+}
+
+static void gc_range_init(void) {
+  if (!gc_ranges) {
+    gc_range_cap = 1024;
+    gc_ranges = (gc_range *)malloc(gc_range_cap * sizeof(gc_range));
+    if (!gc_ranges) abort();
+  }
+  gc_range_head = gc_range_tail = 0;
+}
+
+static void gc_range_push_locked(void **data, int64_t start, int64_t count) {
+  if (gc_range_tail - gc_range_head == gc_range_cap) {
+    size_t ncap = gc_range_cap * 2;
+    gc_range *r = (gc_range *)malloc(ncap * sizeof(gc_range));
+    if (!r) abort();
+    size_t n = gc_range_tail - gc_range_head;
+    for (size_t i = 0; i < n; i++) r[i] = gc_ranges[(gc_range_head + i) & (gc_range_cap - 1)];
+    free(gc_ranges);
+    gc_ranges = r;
+    gc_range_cap = ncap;
+    gc_range_head = 0;
+    gc_range_tail = n;
+  }
+  gc_range *r = &gc_ranges[gc_range_tail & (gc_range_cap - 1)];
+  r->data = data;
+  r->start = start;
+  r->count = count;
+  gc_range_tail++;
+}
+
+static int gc_ranges_empty(void) { return gc_range_head == gc_range_tail; }
+
+/* Splits a large array's reference words across the workers. Called by the
+   worker that traced the array; the array itself is already marked, and its
+   elements are marked by whoever takes each range. */
+static void gc_push_ranges(void **data, int64_t len) {
+  typlat_mutex_lock(&gc_work_mtx);
+  for (int64_t s = 0; s < len; s += TY_GC_RANGE_CHUNK) {
+    int64_t n = len - s;
+    if (n > TY_GC_RANGE_CHUNK) n = TY_GC_RANGE_CHUNK;
+    gc_range_push_locked(data, s, n);
+  }
+  __atomic_add_fetch(&gc_push_seq, 1, __ATOMIC_RELAXED);
+  if (gc_sleepers) typlat_cond_broadcast(&gc_work_cv);
+  typlat_mutex_unlock(&gc_work_mtx);
+}
+
+static void gc_queue_grow_locked(void) {
+  size_t ncap = gc_q.cap * 2;
+  void **items = (void **)malloc(ncap * sizeof(void *));
+  if (!items) abort();
+  size_t n = gc_q.tail - gc_q.head;
+  for (size_t i = 0; i < n; i++) items[i] = gc_q.items[(gc_q.head + i) & (gc_q.cap - 1)];
+  free(gc_q.items);
+  gc_q.items = items;
+  gc_q.cap = ncap;
+  gc_q.head = 0;
+  gc_q.tail = n;
+}
+
+static void gc_queue_push_locked(void *p) {
+  if (gc_q.tail - gc_q.head == gc_q.cap) gc_queue_grow_locked();
+  gc_q.items[gc_q.tail & (gc_q.cap - 1)] = p;
+  gc_q.tail++;
+}
+
+static void *gc_queue_pop_locked(void) {
+  void *p = gc_q.items[gc_q.head & (gc_q.cap - 1)];
+  gc_q.head++;
+  return p;
+}
+
+/* Hand this worker's local batch to the shared deque. The push is under the
+   lock that guards the termination counters, and the sleepers are woken under
+   the same lock, so a worker that is about to park cannot miss a batch that
+   arrives first. */
+static void gc_flush(gc_mark_ctx *ctx) {
+  if (!ctx->n) return;
+  typlat_mutex_lock(&gc_work_mtx);
+  for (int i = 0; i < ctx->n; i++) gc_queue_push_locked(ctx->batch[i]);
+  __atomic_add_fetch(&gc_push_seq, 1, __ATOMIC_RELAXED);
+  if (gc_sleepers) typlat_cond_broadcast(&gc_work_cv);
+  typlat_mutex_unlock(&gc_work_mtx);
+  ctx->n = 0;
+}
+
+static void mark_value(void *p, gc_mark_ctx *ctx) {
+  if (!p) return;
+  tychunk *slab = NULL;
+  if (!valid_obj((char *)p, &slab)) return;
+  uint64_t *h = hdr_of(p);
+  /* One worker wins the mark bit and traces the object; the others see the bit
+     and leave it alone. The exchange is what makes "who traces it" single even
+     when two workers reach the same object at once, and its release half is
+     what makes the winner's later reads of the object's fields the ones that
+     count. The serial path is the same test without the atomic. */
+  if (ctx->serial) {
+    if (h[1] & TY_MARK_BIT) return;
+    h[1] |= TY_MARK_BIT;
+  } else if (__atomic_fetch_or(&h[1], (uint64_t)TY_MARK_BIT, __ATOMIC_ACQ_REL) & TY_MARK_BIT) {
+    return;
+  }
+  /* The collector's own bookkeeping, kept where the one pass that sees every
+     live object is: which slabs hold something live -- what decides whether a
+     slab is walked or handed back -- and how many bytes are live, which is what
+     the next collection's budget is derived from. Deriving the same two answers
+     from the heap afterwards means walking every block of every slab a second
+     time. */
+  /* The flag is monotonic, so writing it only when it is not already set turns
+     a store from every worker into a store once per slab. That matters on a
+     shared deque design: every object in a slab names the same cache line, and
+     four workers storing to it per object would serialise on the line for no
+     information. A lost race is harmless -- both writers store the same 1. */
+  if (!__atomic_load_n(&slab->live_any, __ATOMIC_RELAXED))
+    __atomic_store_n(&slab->live_any, 1, __ATOMIC_RELAXED);
+  ctx->live_bytes += (int64_t)(h[0] & TY_SIZE_MASK);
+  /* An object with no reference words has nothing for a trace to do: queueing it
+     would hand another worker a class word to read and no field to follow. Most
+     objects in a program of small value holders are this kind, so the test is
+     also what keeps a large array of them from filling the deque with no-ops. */
+  tyclass *cls = ((tyobj *)p)->cls;
+  int has_refs = 0;
+  if (cls) {
+    if (is_array_class(cls)) {
+      has_refs = ((tyarr *)p)->refs != 0;
+    } else {
+      /* Offset 0 is the class word, which every emitted class lists as its
+         first reference. It is not a heap object, and tracing it is a rejected
+         valid_obj call; a class whose only entry is that one has no field to
+         follow. */
+      for (int32_t i = 0; i < cls->nref; i++) {
+        if (cls->refoffs[i] != 0) {
+          has_refs = 1;
+          break;
+        }
+      }
+    }
+  }
+  if (!has_refs) return;
+  if (ctx->serial) {
+    if (mark_sp < (1 << 20)) mark_stack[mark_sp++] = p;
+  } else {
+    if (ctx->n == TY_GC_BATCH) gc_flush(ctx);
+    ctx->batch[ctx->n++] = p;
+  }
+}
+
+static void trace_object(void *obj, gc_mark_ctx *ctx) {
   tyclass *c = ((tyobj *)obj)->cls;
   if (is_array_class(c)) { /* array */
     tyarr *a = (tyarr *)obj;
     if (a->refs) {
       void **d = (void **)a->data;
-      for (int64_t i = 0; i < a->len; i++) mark_value(d[i]);
+      if (!ctx->serial && a->len >= TY_GC_RANGE_MIN) {
+        gc_push_ranges(d, a->len);
+      } else {
+        for (int64_t i = 0; i < a->len; i++) mark_value(d[i], ctx);
+      }
     }
     return;
   }
   if (c && c->nref) {
     for (int32_t i = 0; i < c->nref; i++) {
-      mark_value(*(void **)((char *)obj + c->refoffs[i]));
+      mark_value(*(void **)((char *)obj + c->refoffs[i]), ctx);
     }
   }
 }
@@ -574,25 +825,20 @@ static void collect_slabs(void) {
      collection with no slab at all leaves it empty, and then nothing is an
      object, which is also what the walk would say. */
   char *lo = NULL, *hi = NULL;
+  gc_slab_used = 0;
   for (size_t i = 0; i < gc_nslabs; i++) {
     tychunk *c = gc_slabs[i];
     /* Nothing is marked in any slab yet. The sweep of the previous collection
        cleared the mark bits, and this is what stands in for them while this one
        runs. */
     c->live_any = 0;
+    gc_slab_used += c->used;
     if (!lo || c->mem < lo) lo = c->mem;
     if (!hi || c->mem + c->cap > hi) hi = c->mem + c->cap;
   }
   gc_heap_lo = lo;
   gc_heap_span = hi ? (size_t)(hi - lo) : 0;
 }
-
-/* How much of a collection's root scan was precise and how much was
-   conservative: frames walked, words read out of a frame map, words read by the
-   conservative pass. Only TEYRU_GCTRACE reads them. */
-static int64_t gc_frames_walked = 0, gc_precise_words = 0, gc_conserv_words = 0;
-/* The range this collection scans: set before the walk, read by frame_map_ok. */
-static char *gc_scan_lo = NULL, *gc_scan_hi = NULL;
 
 /* Scans one thread's stack conservatively, from where that thread stopped (or
    from this frame, for the thread that is collecting) up to the top of its
@@ -611,7 +857,7 @@ static char *gc_scan_lo = NULL, *gc_scan_hi = NULL;
    point writes, the prologue above the outermost generated frame, and every
    generated frame that emits no map -- is still read this way, which is what
    keeps the runtime's own discipline exactly as it was. */
-static void scan_stack(char *lo, char *hi) {
+static void scan_stack(char *lo, char *hi, gc_mark_ctx *ctx) {
   /* The scan steps a pointer at a time, so it has to start on a pointer
      boundary: a word read from a misaligned address is a value shifted by a few
      bits, which is not a pointer to anything, and a scan that starts at an
@@ -626,8 +872,8 @@ static void scan_stack(char *lo, char *hi) {
 #endif
   }
   for (char *q = lo; q + sizeof(void *) <= hi; q += sizeof(void *)) {
-    mark_value(*(void **)q);
-    if (gc_trace) gc_conserv_words++;
+    mark_value(*(void **)q, ctx);
+    if (gc_trace) ctx->conserv_words++;
   }
 }
 
@@ -657,14 +903,14 @@ static int frame_map_ok(tyframe *f, char *lo, char *hi) {
    whose value a reference could be in -- and it is the whole of what a mapped
    frame contributes to the root set. Its other words are neither read nor
    needed: the runtime's other frames are, and they are outside the extent. */
-static void mark_frame(tyframe *f) {
+static void mark_frame(tyframe *f, char *lo, char *hi, gc_mark_ctx *ctx) {
   /* This frame's words are a contiguous array inside the frame, so a record
      whose array is not inside the frame it names is not believed: it is one a
      frame left in the chain without unlinking itself, whose storage has since
      been reused. Nothing is lost by dropping it -- the words the map does not
      describe are the conservative pass's, and a frame that cannot be described
      is simply one the pass covers. */
-  if (!frame_map_ok(f, gc_scan_lo, gc_scan_hi)) {
+  if (!frame_map_ok(f, lo, hi)) {
     if (gc_trace) fprintf(stderr, "teyru gc: frame %d has no usable map (n=%d slots=%p lo=%p hi=%p)\n", f->fno, f->nslots, (void*)f->slots, (void*)f->lo, (void*)f->hi);
     return;
   }
@@ -679,15 +925,15 @@ static void mark_frame(tyframe *f) {
        words are zero, and zero means there is no value yet rather than a value
        at address zero. */
     if (!f->slots[i]) continue;
-    mark_value(*(void **)f->slots[i]);
-    if (gc_trace) gc_precise_words++;
+    mark_value(*(void **)f->slots[i], ctx);
+    if (gc_trace) ctx->precise_words++;
   }
   for (int32_t i = 0; i < TY_FRAME_REGS; i++) {
-    mark_value(f->saved[i]);
-    if (gc_trace) gc_precise_words++;
+    mark_value(f->saved[i], ctx);
+    if (gc_trace) ctx->precise_words++;
   }
-  if (gc_trace) gc_frames_walked++;
-  if (gc_trace) gc_frames_walked++;
+  if (gc_trace) ctx->frames_walked++;
+  if (gc_trace) ctx->frames_walked++;
 }
 
 /* Whether a frame's recorded extent may be used to exclude words from the
@@ -712,15 +958,15 @@ static int extent_usable(tyframe *f, char *lo, char *hi) {
    so far, which a chain of records from two different stack depths would give --
    is left alone rather than allowed to move the cursor back, so no word is
    scanned twice and none is skipped. */
-static void scan_unmapped(tyframe *chain, char *lo, char *hi) {
+static void scan_unmapped(tyframe *chain, char *lo, char *hi, gc_mark_ctx *ctx) {
   char *cur = lo;
   for (tyframe *f = chain; f; f = f->prev) {
     if (!extent_usable(f, lo, hi)) continue;
     char *flo = (char *)f->lo, *fhi = (char *)f->hi;
-    if ((uintptr_t)flo > (uintptr_t)cur) scan_stack(cur, flo);
+    if ((uintptr_t)flo > (uintptr_t)cur) scan_stack(cur, flo, ctx);
     if ((uintptr_t)fhi > (uintptr_t)cur) cur = fhi;
   }
-  if ((uintptr_t)cur < (uintptr_t)hi) scan_stack(cur, hi);
+  if ((uintptr_t)cur < (uintptr_t)hi) scan_stack(cur, hi, ctx);
 }
 
 /* What the maps do not cover, reported rather than ignored: TEYRU_GC_VERIFY=1
@@ -756,6 +1002,277 @@ static void verify_frame(tyframe *f) {
   }
 }
 
+/* How much of a collection's root scan was precise and how much was
+   conservative: frames walked, words read out of a frame map, words read by the
+   conservative pass. Only TEYRU_GCTRACE reads them, and they are the sum over
+   the workers of the same counters each of them keeps. */
+static int64_t gc_frames_walked = 0, gc_precise_words = 0, gc_conserv_words = 0;
+
+/* The collector thread, captured before any worker starts. A helper's own
+   `ty_self` is a different thread-local -- C initialises it to the main
+   thread's state, not to anything that describes the helper -- so "the thread
+   that is collecting" is named here rather than tested with `t == ty_self`,
+   which inside a helper would answer for the wrong thread. */
+static tythread *gc_collector = NULL;
+/* The number of workers this collection runs, set before the roots are split. */
+static int gc_worker_count = 1;
+/* The collector's own stack range, taken with setjmp in gc_collect so that the
+   scan starts exactly where the serial collector's always did -- in the
+   collector's frame, not in a callee's. */
+static char *gc_own_lo = NULL, *gc_own_hi = NULL;
+
+/* How many threads the mark phase may use. TEYRU_GC_WORKERS names it directly
+   (clamped to the workers this file can run); without it, a worker per live
+   thread up to TY_GC_MAX_WORKERS, which is the "do not start more workers than
+   there are threads to collect for" rule. One thread means the serial path. */
+static int gc_workers_cfg = 0; /* 0: automatic */
+
+static int gc_planned_workers(void) {
+  if (gc_workers_cfg > 0) {
+    int n = gc_workers_cfg;
+    if (n > TY_GC_MAX_WORKERS) n = TY_GC_MAX_WORKERS;
+    return n < 1 ? 1 : n;
+  }
+  int live = 0;
+  for (tythread *t = ty_thread_list(); t; t = t->next) {
+    if (t->state != TY_TH_DONE) live++;
+  }
+  if (live < 1) live = 1;
+  return live < TY_GC_MAX_WORKERS ? live : TY_GC_MAX_WORKERS;
+}
+
+/* Marks this worker's share of the roots. The world is stopped, so the registry
+   and every stack it names are still, and each source is scanned by exactly one
+   worker: the registry by position, the static table by stride. Splitting them
+   is safe because marking is idempotent -- an object two workers reach is
+   marked once -- and every source is still reached by someone.
+
+   The collector's own stack is the one source that cannot be handed to another
+   worker: it is the stack worker 0 is running on. Worker 0 scans it after its
+   share of the registry, which is the same order and the same range the serial
+   path used. */
+static void gc_mark_roots(gc_mark_ctx *ctx) {
+  int idx = ctx->index, n = gc_worker_count;
+  int live_index = 0;
+  for (tythread *t = ty_thread_list(); t; t = t->next) {
+    if (t->state == TY_TH_DONE) continue; /* its stack is going away with it */
+    if (live_index++ % n != idx) continue;
+    for (int64_t i = 0; i < t->sp; i++) mark_value(t->roots[i], ctx);
+    /* The thread's preallocated StackOverflowError. It is reachable from
+       nowhere else -- the thread holds the only reference, in a struct the
+       collector does not scan -- and a collection that swept it would leave the
+       thread's next overflow throwing a freed object. */
+    mark_value(t->soe, ctx);
+    if (t == gc_collector) continue;
+    if (!t->park_sp) continue; /* it has not stopped yet: ty_gc_stop_world would not have returned */
+    char *hi = t->stack_top ? t->stack_top : t->park_sp + 0x10000;
+    char *lo = t->park_sp - TY_PARK_MARGIN;
+    if (t->stack_base && lo < t->stack_base) lo = t->stack_base;
+    /* Its frames, precisely: the map of every generated frame it is inside, with
+       the registers each of them was entered with. `t->frames` is what the
+       thread published the last time it stopped, which is now -- it is stopped
+       at a stop point, and the chain it published there is the chain it has. */
+    for (tyframe *f = t->frames; f; f = f->prev) mark_frame(f, lo, hi, ctx);
+    /* And everything the maps do not cover, conservatively: the runtime's own
+       frames, the platform's wait frames, the register spills of the stop point,
+       and any generated frame that emitted no map. */
+    if (gc_noexcl) scan_stack(lo, hi, ctx); else scan_unmapped(t->frames, lo, hi, ctx);
+    if (gc_verify) {
+      for (tyframe *f = t->frames; f; f = f->prev) verify_frame(f);
+    }
+  }
+  /* roots: registered globals */
+  for (size_t i = (size_t)idx; i < nroots_static; i += (size_t)n) {
+    if (roots_static[i]) mark_value(*(void **)roots_static[i], ctx);
+  }
+  if (idx != 0) return;
+  /* roots: this thread's native stack and registers (conservative). The
+     registers are the ones setjmp saves; on another thread they were spilled by
+     __builtin_unwind_init at the point it stopped. */
+  char *sp = gc_own_lo;
+  char *hi = gc_own_hi;
+  for (tyframe *f = ty_frames; f; f = f->prev) mark_frame(f, sp, hi, ctx);
+  if (gc_noexcl) scan_stack(sp, hi, ctx); else scan_unmapped(ty_frames, sp, hi, ctx);
+  if (gc_verify) {
+    for (tyframe *f = ty_frames; f; f = f->prev) verify_frame(f);
+  }
+}
+
+/* One worker's mark loop. It drains its own batch first, then takes another
+   batch from the shared deque, and leaves the active set only when there is
+   neither. The last worker to leave sets `done`; every other worker is then
+   parked with an empty batch, so no work can appear after that statement. */
+static void gc_mark_worker(gc_mark_ctx *ctx) {
+  ctx->n = 0;
+  if (ctx->serial) {
+    gc_mark_roots(ctx);
+    while (mark_sp) {
+      void *o = mark_stack[--mark_sp];
+      trace_object(o, ctx);
+    }
+    return;
+  }
+  gc_mark_roots(ctx);
+  for (;;) {
+    while (ctx->n) {
+      void *o = ctx->batch[--ctx->n];
+      trace_object(o, ctx);
+    }
+    typlat_mutex_lock(&gc_work_mtx);
+    if (!gc_ranges_empty()) {
+      gc_range r = gc_ranges[gc_range_head & (gc_range_cap - 1)];
+      gc_range_head++;
+      typlat_mutex_unlock(&gc_work_mtx);
+      for (int64_t i = 0; i < r.count; i++) mark_value(r.data[r.start + i], ctx);
+      continue;
+    }
+    int n = 0;
+    while (n < TY_GC_BATCH && gc_q.head != gc_q.tail) {
+      ctx->batch[n++] = gc_queue_pop_locked();
+    }
+    if (n) {
+      ctx->n = n;
+      typlat_mutex_unlock(&gc_work_mtx);
+      continue;
+    }
+    if (--gc_active == 0) {
+      /* No local batch, an empty deque, and every other worker has already
+         left the active set: the phase is over. */
+      __atomic_store_n(&gc_done, 1, __ATOMIC_RELEASE);
+      typlat_cond_broadcast(&gc_work_cv);
+      typlat_mutex_unlock(&gc_work_mtx);
+      break;
+    }
+    /* Not the last active worker, and nothing to take right now. Spin on the
+       publish counter for a bounded time before parking: a batch usually
+       arrives in microseconds, and a futex round trip costs more than that. */
+    typlat_mutex_unlock(&gc_work_mtx);
+    uint64_t seen = __atomic_load_n(&gc_push_seq, __ATOMIC_RELAXED);
+    for (int i = 0; i < TY_GC_SPIN; i++) {
+      if (__atomic_load_n(&gc_done, __ATOMIC_ACQUIRE)) break;
+      if (__atomic_load_n(&gc_push_seq, __ATOMIC_RELAXED) != seen) break;
+      gc_cpu_relax();
+      if ((i & 255) == 255) typlat_yield();
+    }
+    typlat_mutex_lock(&gc_work_mtx);
+    if (!gc_ranges_empty() || gc_q.head != gc_q.tail) {
+      gc_active++;
+      typlat_mutex_unlock(&gc_work_mtx);
+      continue;
+    }
+    if (__atomic_load_n(&gc_done, __ATOMIC_ACQUIRE)) {
+      typlat_mutex_unlock(&gc_work_mtx);
+      break;
+    }
+    gc_sleepers++;
+    while (!__atomic_load_n(&gc_done, __ATOMIC_ACQUIRE) && gc_q.head == gc_q.tail && gc_ranges_empty())
+      typlat_cond_wait(&gc_work_cv, &gc_work_mtx);
+    gc_sleepers--;
+    if (__atomic_load_n(&gc_done, __ATOMIC_ACQUIRE)) {
+      typlat_mutex_unlock(&gc_work_mtx);
+      break;
+    }
+    /* Woken with work: rejoin the active set under the same lock that the last
+       active worker tests, so it cannot declare the phase over between this
+       wake-up and this increment. */
+    gc_active++;
+    typlat_mutex_unlock(&gc_work_mtx);
+  }
+  /* This worker's slab cache points into slabs the sweep may release. The
+     collector waits for every helper to get here before it sweeps, and clears
+     its own cache there. */
+  valid_obj_last = NULL;
+}
+
+/* The helper threads: created once, on the first collection that wants them,
+   and parked on a condition variable between collections. They are not
+   registered in the thread registry -- they never run generated code, never
+   allocate, and hold no roots -- so the stop-the-world protocol neither waits
+   for them nor scans them. */
+static typlat_mutex gc_par_mtx = TYPLAT_MUTEX_INITIALIZER;
+static typlat_cond gc_par_cv = TYPLAT_COND_INITIALIZER;
+static typlat_cond gc_par_done_cv = TYPLAT_COND_INITIALIZER;
+static uint64_t gc_par_epoch = 0;
+static int gc_par_finished = 0;
+static int gc_par_started = 0; /* helper threads created so far */
+
+static void *gc_helper_main(void *arg) {
+  int idx = (int)(intptr_t)arg;
+  uint64_t seen = 0;
+  for (;;) {
+    typlat_mutex_lock(&gc_par_mtx);
+    while (gc_par_epoch == seen) typlat_cond_wait(&gc_par_cv, &gc_par_mtx);
+    seen = gc_par_epoch;
+    typlat_mutex_unlock(&gc_par_mtx);
+    /* The pool only ever grows, but the number of workers a collection uses
+       follows the live thread count, so a helper that is no longer part of this
+       collection's partition must not run it: gc_worker_count was published
+       before the epoch that woke it. It goes back to waiting, and the collector
+       waits for exactly the helpers below that number. */
+    if (idx >= gc_worker_count) continue;
+    gc_mark_worker(&gc_ctxs[idx]);
+    typlat_mutex_lock(&gc_par_mtx);
+    gc_par_finished++;
+    typlat_cond_broadcast(&gc_par_done_cv);
+    typlat_mutex_unlock(&gc_par_mtx);
+  }
+  return NULL; /* the loop does not end; the return keeps the compiler quiet */
+}
+
+/* Starts helpers until there are n workers in all, and returns how many the
+   collection can actually use. A thread that cannot be created leaves the
+   collector with the workers it has -- down to the serial path -- which is the
+   fallback for a build or a machine without threads. */
+static int gc_ensure_helpers(int n) {
+  typlat_mutex_lock(&gc_par_mtx);
+  while (gc_par_started < n - 1) {
+    typlat_thread tid;
+    int idx = gc_par_started + 1;
+    if (typlat_thread_begin(&tid, gc_helper_main, (void *)(intptr_t)idx) != 0) break;
+    gc_par_started++;
+  }
+  int avail = gc_par_started + 1;
+  typlat_mutex_unlock(&gc_par_mtx);
+  return avail < n ? avail : n;
+}
+
+/* Runs the mark phase on n workers and leaves the summed answer in live_bytes
+   and the trace counters. Called only with n >= 2. */
+static void gc_parallel_mark(int n) {
+  if (n > TY_GC_MAX_WORKERS) n = TY_GC_MAX_WORKERS;
+  gc_worker_count = n;
+  for (int i = 0; i < n; i++) {
+    memset(&gc_ctxs[i], 0, sizeof gc_ctxs[i]);
+    gc_ctxs[i].index = i;
+  }
+  gc_queue_init();
+  gc_range_init();
+  typlat_mutex_lock(&gc_work_mtx);
+  gc_active = n;
+  gc_sleepers = 0;
+  __atomic_store_n(&gc_done, 0, __ATOMIC_RELAXED);
+  typlat_mutex_unlock(&gc_work_mtx);
+  /* Wake the helpers only once every piece of state they read is in place. */
+  typlat_mutex_lock(&gc_par_mtx);
+  gc_par_finished = 0;
+  gc_par_epoch++;
+  typlat_cond_broadcast(&gc_par_cv);
+  typlat_mutex_unlock(&gc_par_mtx);
+  /* Worker 0 is this thread, and it marks its share like any other. */
+  gc_mark_worker(&gc_ctxs[0]);
+  typlat_mutex_lock(&gc_par_mtx);
+  while (gc_par_finished < n - 1) typlat_cond_wait(&gc_par_done_cv, &gc_par_mtx);
+  typlat_mutex_unlock(&gc_par_mtx);
+  live_bytes = 0;
+  gc_frames_walked = gc_precise_words = gc_conserv_words = 0;
+  for (int i = 0; i < n; i++) {
+    live_bytes += gc_ctxs[i].live_bytes;
+    gc_frames_walked += gc_ctxs[i].frames_walked;
+    gc_precise_words += gc_ctxs[i].precise_words;
+    gc_conserv_words += gc_ctxs[i].conserv_words;
+  }
+}
+
 /* The heap's size in bytes: every chunk's watermark, the shared ones and the
    private slab of every registered thread. Read with the world stopped, which
    is the only time the watermarks are exact and the set cannot change, and from
@@ -784,64 +1301,35 @@ static void gc_collect(const char *trigger) {
      would be holding the heap lock, which is held right now by this thread. */
   ty_gc_stop_world();
   collect_slabs();
-  if (gc_trace) before = heap_used();
+  if (gc_trace) before = gc_slab_used;
   build_block_starts();
-  mark_sp = 0;
-  /* Counted by mark_value, the one place that sees every live object exactly
-     once. */
-  live_bytes = 0;
-  gc_frames_walked = gc_precise_words = gc_conserv_words = 0;
-  /* roots: every thread's shadow stack, and its stack and registers */
-  for (tythread *t = ty_thread_list(); t; t = t->next) {
-    if (t->state == TY_TH_DONE) continue; /* its stack is going away with it */
-    for (int64_t i = 0; i < t->sp; i++) mark_value(t->roots[i]);
-    /* The thread's preallocated StackOverflowError. It is reachable from
-       nowhere else -- the thread holds the only reference, in a struct the
-       collector does not scan -- and a collection that swept it would leave the
-       thread's next overflow throwing a freed object. */
-    mark_value(t->soe);
-    if (t == ty_self) continue;
-    if (!t->park_sp) continue; /* it has not stopped yet: ty_gc_stop_world would not have returned */
-    char *hi = t->stack_top ? t->stack_top : t->park_sp + 0x10000;
-    char *lo = t->park_sp - TY_PARK_MARGIN;
-    if (t->stack_base && lo < t->stack_base) lo = t->stack_base;
-    gc_scan_lo = lo;
-    gc_scan_hi = hi;
-    /* Its frames, precisely: the map of every generated frame it is inside, with
-       the registers each of them was entered with. `t->frames` is what the
-       thread published the last time it stopped, which is now -- it is stopped
-       at a stop point, and the chain it published there is the chain it has. */
-    for (tyframe *f = t->frames; f; f = f->prev) mark_frame(f);
-    /* And everything the maps do not cover, conservatively: the runtime's own
-       frames, the platform's wait frames, the register spills of the stop point,
-       and any generated frame that emitted no map. */
-    if (gc_noexcl) scan_stack(lo, hi); else scan_unmapped(t->frames, lo, hi);
-    if (gc_verify) {
-      for (tyframe *f = t->frames; f; f = f->prev) verify_frame(f);
-    }
-  }
-  /* roots: registered globals */
-  for (size_t i = 0; i < nroots_static; i++) {
-    if (roots_static[i]) mark_value(*(void **)roots_static[i]);
-  }
-  /* roots: this thread's native stack and registers (conservative). The
-     registers are the ones setjmp saves; on another thread they were spilled by
-     __builtin_unwind_init at the point it stopped. */
+  /* The roots, and then the trace. Which of the two paths runs is decided
+     before either starts: the serial one keeps the mark stack it always had,
+     and the parallel one splits the roots across the workers and traces on all
+     of them. `gc_collector` is named here because a helper cannot answer "is
+     this the collector" from its own thread-local state. */
+  gc_collector = ty_self;
   jmp_buf regs;
   setjmp(regs);
-  char *sp = (char *)&regs;
-  char *hi = ty_self->stack_top ? ty_self->stack_top : sp + 0x10000;
-  gc_scan_lo = sp;
-  gc_scan_hi = hi;
-  for (tyframe *f = ty_frames; f; f = f->prev) mark_frame(f);
-  if (gc_noexcl) scan_stack(sp, hi); else scan_unmapped(ty_frames, sp, hi);
-  if (gc_verify) {
-    for (tyframe *f = ty_frames; f; f = f->prev) verify_frame(f);
-  }
-  /* trace */
-  while (mark_sp) {
-    void *o = mark_stack[--mark_sp];
-    trace_object(o);
+  gc_own_lo = (char *)&regs;
+  gc_own_hi = ty_self->stack_top ? ty_self->stack_top : gc_own_lo + 0x10000;
+  int nworkers = gc_slab_used >= TY_GC_PARALLEL_MIN ? gc_planned_workers() : 1;
+  if (nworkers > 1) nworkers = gc_ensure_helpers(nworkers);
+  if (nworkers > 1) {
+    gc_parallel_mark(nworkers);
+  } else {
+    /* Counted by mark_value, the one place that sees every live object exactly
+       once. */
+    gc_mark_ctx *ctx = &gc_ctxs[0];
+    memset(ctx, 0, sizeof *ctx);
+    ctx->serial = 1;
+    gc_worker_count = 1;
+    mark_sp = 0;
+    gc_mark_worker(ctx);
+    live_bytes = ctx->live_bytes;
+    gc_frames_walked = ctx->frames_walked;
+    gc_precise_words = ctx->precise_words;
+    gc_conserv_words = ctx->conserv_words;
   }
   /* Sweep. Free lists are rebuilt from scratch so that blocks belonging to a
      reclaimed chunk can never be handed out again. A chunk with no live object
@@ -1263,6 +1751,21 @@ void ty_gc_init(void) {
   gc_verify = verify && *verify && strcmp(verify, "0") != 0;
   const char *noexcl = getenv("TEYRU_GC_NOEXCL");
   gc_noexcl = noexcl && *noexcl && strcmp(noexcl, "0") != 0;
+  /* TEYRU_GC_WORKERS names the size of the mark phase's worker pool. It is a
+     tuning switch and not a correctness one: 1 selects the serial path, and an
+     unset or unusable value leaves the automatic choice (one worker per live
+     thread, up to four) in place. */
+  const char *workers = getenv("TEYRU_GC_WORKERS");
+  if (workers && *workers) {
+    char *end = NULL;
+    long n = strtol(workers, &end, 10);
+    if (end != workers && *end == '\0' && n > 0) {
+      gc_workers_cfg = n > TY_GC_MAX_WORKERS ? TY_GC_MAX_WORKERS : (int)n;
+    } else {
+      fprintf(stderr, "teyru: TEYRU_GC_WORKERS=%s is not a positive number of workers; using the default\n",
+              workers);
+    }
+  }
 }
 
 void *ty_alloc_arr(int64_t len, size_t elemsize) {
