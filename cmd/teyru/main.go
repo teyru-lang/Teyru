@@ -14,6 +14,7 @@ import (
 	teyrufmt "github.com/teyru-lang/Teyru/internal/format"
 	"github.com/teyru-lang/Teyru/internal/lsp"
 	"github.com/teyru-lang/Teyru/internal/mod"
+	"github.com/teyru-lang/Teyru/internal/testrun"
 )
 
 const usage = `teyru - the Teyru compiler
@@ -24,6 +25,7 @@ usage:
   teyru emit  [flags] <paths...>   print the generated C
   teyru emit-llvm [flags] <paths...>  print the LLVM IR the backend feeds to LLVM
   teyru emit-java [flags] <paths...>  print the equivalent Java source
+  teyru test  [paths...]           compile and run the package's tests
   teyru get <module>@<version>     fetch a module into the cache and require it
   teyru mod init <module-path>     write teyru.mod for a new module
   teyru mod tidy                   make teyru.mod and teyru.sum match the sources
@@ -105,6 +107,11 @@ func run() int {
 		return runFmt(args)
 	case "lsp":
 		return runLSP(args)
+	case "test":
+		// The test command takes paths and no compiler flags: the package is
+		// compiled the way `teyru run` compiles it, with a generated entry
+		// point in place of the program's own main.
+		return testrun.Run(args)
 	}
 	opts := driver.Options{Out: "a.out"}
 	var files []string

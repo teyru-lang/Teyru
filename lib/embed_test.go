@@ -12,8 +12,11 @@ func TestFilesAreOrderedAndComplete(t *testing.T) {
 	}
 	seen := map[string]string{}
 	for i, f := range files {
-		if !strings.HasPrefix(f.Source, "package teyru\n") {
-			t.Errorf("%s: the standard library is in package teyru", f.Name)
+		// The standard library is package teyru, except for the test
+		// framework, which lives in teyru.test so that the annotation names
+		// say what they are for.
+		if !strings.HasPrefix(f.Source, "package teyru\n") && !strings.HasPrefix(f.Source, "package teyru.test\n") {
+			t.Errorf("%s: the standard library is in package teyru or teyru.test", f.Name)
 		}
 		if i > 0 && f.Name < files[i-1].Name {
 			t.Errorf("%s comes after %s; the numeric prefix must fix the order", f.Name, files[i-1].Name)
