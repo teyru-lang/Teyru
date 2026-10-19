@@ -44,7 +44,7 @@ func (c *Checker) subst(t ast.Type, b map[*ast.TypeVar]ast.Type) ast.Type {
 		if len(v.Args) == 0 {
 			return v
 		}
-		nt := &ast.ClassType{Class: v.Class}
+		nt := &ast.ClassType{Class: v.Class, Raw: v.Raw}
 		changed := false
 		for _, a := range v.Args {
 			na := c.subst(a, b)
@@ -108,7 +108,7 @@ func (c *Checker) wildToBound(t ast.Type) ast.Type {
 		if !changed {
 			return v
 		}
-		return &ast.ClassType{Class: v.Class, Args: args}
+		return &ast.ClassType{Class: v.Class, Args: args, Raw: v.Raw}
 	case *ast.ArrayType:
 		e := c.wildToBound(v.Elem)
 		if e == v.Elem {

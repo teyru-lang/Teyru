@@ -135,13 +135,9 @@ func (e *Emitter) classLiteralTarget(v *ast.ClassLit) string {
 		e.primClasses[t.Kind] = true
 		return "&cls_" + primClassName(t.Kind)
 	case *ast.ArrayType:
-		// Every array value is an instance of the one synthetic teyru.Array
-		// class, so that is the class `A[].class` denotes; naming a class per
-		// element type, as Java does, would make the literal a class no array
-		// is an instance of.
-		if a := e.prog.ArrayClass(); a != nil {
-			return "&cls_" + mangle(a.Full)
-		}
+		// `A[].class` names the array class of A, which is the class an array
+		// value of that type carries (see arrayclass.go).
+		return "&" + e.arrayClassFor(t.Elem)
 	}
 	return "&cls_" + mangle(e.prog.Builtins.Object.Full)
 }
@@ -2773,7 +2769,8 @@ func (e *Emitter) newArrayLevel(elem ast.Type, lens []string) string {
 			refs = "1"
 		}
 		promise := e.elemPromise("_a", elem)
-		return "({ tyarr* _a = ty_array_new(" + dim + ", " + es + "); _a->refs = " + refs + ";" + promise + " _a; })"
+		return "({ tyarr* _a = ty_array_new(" + dim + ", " + es + "); _a->obj.cls = &" +
+			e.arrayClassFor(elem) + "; _a->refs = " + refs + ";" + promise + " _a; })"
 	}
 	// Another dimension follows, so this level holds arrays: its slots are
 	// references, each one a freshly allocated array of the element type. Only
@@ -2786,7 +2783,8 @@ func (e *Emitter) newArrayLevel(elem ast.Type, lens []string) string {
 	n := e.tmpName()
 	i := e.tmpName()
 	var b strings.Builder
-	fmt.Fprintf(&b, "({ tyarr* %s = ty_array_new(%s, 8); %s->refs = 1;", n, dim, n)
+	fmt.Fprintf(&b, "({ tyarr* %s = ty_array_new(%s, 8); %s->obj.cls = &%s; %s->refs = 1;",
+		n, dim, n, e.arrayClassFor(elem), n)
 	fmt.Fprintf(&b, " for (int64_t %s = 0; %s < %s->len; %s++) ((void**)%s->data)[%s] = (void*)(%s);", i, i, n, i, n, i, alloc)
 	fmt.Fprintf(&b, " %s; })", n)
 	return b.String()
@@ -2804,7 +2802,8 @@ func (e *Emitter) arrayInitOf(v *ast.ArrayInit, elem ast.Type) string {
 	}
 	var b strings.Builder
 	n := e.tmpName()
-	fmt.Fprintf(&b, "({ tyarr* %s = ty_array_new(%d, %s); %s->refs = %s;%s", n, len(v.Elems), es, n, refs, e.elemPromise(n, elem))
+	fmt.Fprintf(&b, "({ tyarr* %s = ty_array_new(%d, %s); %s->obj.cls = &%s; %s->refs = %s;%s",
+		n, len(v.Elems), es, n, e.arrayClassFor(elem), n, refs, e.elemPromise(n, elem))
 	for i, el := range v.Elems {
 		val := e.arrayElemValue(el, elem)
 		if e.isRefElem(elem) {

@@ -203,9 +203,13 @@ class ReflectFactory implements BeanFactory {
   public Object create(ApplicationContext ctx) {
     if (beanMethod != null) {
       Object owner = ctx.getBean(beanMethod.getDeclaringClass())
+      // A @Bean method is a member of its configuration class, and Spring calls
+      // it whatever its access is.
+      beanMethod.setAccessible(true)
       return beanMethod.invoke(owner, argumentsOf(beanMethod, ctx))
     }
     Constructor ctor = constructorOf(type)
+    ctor.setAccessible(true)
     return ctor.newInstance(argumentsOf(ctor, ctx))
   }
 
@@ -317,6 +321,7 @@ class ReflectInjector implements BeanInjector {
     Method[] ms = type.getDeclaredMethods()
     for (int i = 0 : i < ms.length : i++) {
       if (ms[i].isAnnotationPresent(PostConstruct.class)) {
+        ms[i].setAccessible(true)
         ms[i].invoke(bean)
       }
     }
@@ -380,6 +385,7 @@ class ReflectInjector implements BeanInjector {
     Method[] ms = type.getDeclaredMethods()
     for (int i = 0 : i < ms.length : i++) {
       if (ms[i].isAnnotationPresent(PreDestroy.class)) {
+        ms[i].setAccessible(true)
         ms[i].invoke(bean)
       }
     }

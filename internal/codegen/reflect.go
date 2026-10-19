@@ -119,8 +119,8 @@ func erasureOf(t ast.Type) ast.Type {
 }
 
 // typeClassExpr names the class object of a type: the compiled class, the
-// primitive's own class (which every program carries), or the single array
-// class every array in a program belongs to.
+// primitive's own class (which every program carries), or the array class of
+// the type's component (see arrayclass.go).
 func (e *Emitter) typeClassExpr(t ast.Type) string {
 	switch tt := erasureOf(t).(type) {
 	case *ast.PrimType:
@@ -131,7 +131,7 @@ func (e *Emitter) typeClassExpr(t ast.Type) string {
 		}
 		return "&cls_" + mangle(tt.Class.Full)
 	case *ast.ArrayType:
-		return "&cls_" + mangle(e.prog.ArrayClass().Full)
+		return "&" + e.arrayClassFor(tt.Elem)
 	}
 	return "&cls_" + mangle(e.prog.Builtins.Object.Full)
 }
@@ -221,6 +221,110 @@ func (e *Emitter) elementTypeExpr(t ast.Type) string {
 	return e.typeClassExpr(elem)
 }
 
+// genSig is the generic signature of one declared type: the erased raw type and
+// one level of type arguments, which is what the language keeps. A signature
+// the runtime cannot represent (a wildcard, a type variable, or an argument
+// that is itself parameterized) is carried as a refusal, so getGenericType
+// throws instead of answering the erased type, which is a different answer.
+type genSig struct {
+	raw  ast.Type
+	args []ast.Type
+	bad  bool
+	why  string
+}
+
+// genSigOf answers the signature of a declared type. The second result says
+// whether the type carries a signature at all: a raw class, a primitive, or an
+// array whose component is not generic has none, and reflection answers the
+// erased Class for it, as Java does.
+func genSigOf(t ast.Type) (genSig, bool) {
+	switch tt := t.(type) {
+	case *ast.TypeVarType:
+		// Java represents this as a TypeVariable, which needs a class per type
+		// parameter; this runtime does not synthesize one.
+		return genSig{bad: true, why: "a type variable has no reflection representation"}, true
+	case *ast.WildcardType:
+		return genSig{bad: true, why: "a wildcard has no reflection representation"}, true
+	case *ast.ArrayType:
+		// Java represents an array of a parameterized type as a
+		// GenericArrayType; one level of arguments cannot describe it.
+		if inner, ok := genSigOf(tt.Elem); ok && (inner.bad || len(inner.args) > 0) {
+			return genSig{bad: true, why: "an array of a parameterized type has no reflection representation"}, true
+		}
+		return genSig{}, false
+	case *ast.ClassType:
+		if tt.Class == nil {
+			return genSig{bad: true, why: "the declared type did not resolve"}, true
+		}
+		if tt.Raw || len(tt.Args) == 0 {
+			// A raw declaration answers its Class, as Java's does; the checker
+			// filled the arguments with bounds to have a type to work with.
+			return genSig{}, false
+		}
+		args := make([]ast.Type, 0, len(tt.Args))
+		for _, a := range tt.Args {
+			switch at := a.(type) {
+			case *ast.PrimType:
+				args = append(args, at)
+			case *ast.ClassType:
+				if at.Class == nil {
+					return genSig{bad: true, why: "a type argument did not resolve"}, true
+				}
+				if len(at.Args) > 0 {
+					return genSig{bad: true, why: "a nested parameterized type is deeper than one level"}, true
+				}
+				args = append(args, at)
+			case *ast.ArrayType:
+				if inner, ok := genSigOf(at); ok && (inner.bad || len(inner.args) > 0) {
+					return genSig{bad: true, why: "an array of a parameterized type has no reflection representation"}, true
+				}
+				args = append(args, at)
+			case *ast.TypeVarType:
+				return genSig{bad: true, why: "a type variable has no reflection representation"}, true
+			case *ast.WildcardType:
+				return genSig{bad: true, why: "a wildcard has no reflection representation"}, true
+			default:
+				return genSig{bad: true, why: "a type argument has no reflection representation"}, true
+			}
+		}
+		return genSig{raw: tt, args: args}, true
+	}
+	return genSig{}, false
+}
+
+// emitSig writes a signature record and answers the C expression naming it, or
+// "NULL" when the type carries none.
+func (e *Emitter) emitSig(name string, t ast.Type) string {
+	return e.emitSigTo(e.meta, name, t)
+}
+
+// emitSigTo is emitSig into one section. Member signatures belong in the
+// member tables' section; a class's generic superclass is written beside the
+// class record, which is in the data section.
+func (e *Emitter) emitSigTo(b *strings.Builder, name string, t ast.Type) string {
+	s, ok := genSigOf(t)
+	if !ok {
+		return "NULL"
+	}
+	if s.bad {
+		fmt.Fprintf(b, "%sconst tysig %s = {.raw = NULL, .nargs = -1, .why = %q};\n",
+			e.link, name, s.why)
+		return "&" + name
+	}
+	args := "NULL"
+	if len(s.args) > 0 {
+		var names []string
+		for _, a := range s.args {
+			names = append(names, e.typeClassExpr(a))
+		}
+		args = name + "_args"
+		fmt.Fprintf(b, "%sconst tyclass* %s[] = {%s};\n", e.link, args, strings.Join(names, ", "))
+	}
+	fmt.Fprintf(b, "%sconst tysig %s = {.raw = %s, .args = %s, .nargs = %d};\n",
+		e.link, name, e.typeClassExpr(s.raw), args, len(s.args))
+	return "&" + name
+}
+
 // emitFieldTable writes the field descriptors of a class and answers with the
 // table's C name, or NULL when the class declares no field.
 func (e *Emitter) emitFieldTable(cl *ast.Class) string {
@@ -240,10 +344,11 @@ func (e *Emitter) emitFieldTable(cl *ast.Class) string {
 			offset = fmt.Sprint(offs[f])
 		}
 		anns, nannos := e.emitAnnoTable(mangle(cl.Full)+"_f_"+mangle(f.Name), f.Annos)
+		sig := e.emitSig("sig_"+mangle(cl.Full)+"_f_"+mangle(f.Name), f.Type)
 		entries = append(entries, fmt.Sprintf(
-			"  {.name = %q, .type = %s, .owner = &cls_%s, .off = %s, .mods = %d, .addr = %s, .prim = %d, .annos = %s, .nannos = %d, .elem = %s},\n",
+			"  {.name = %q, .type = %s, .owner = &cls_%s, .off = %s, .mods = %d, .addr = %s, .prim = %d, .annos = %s, .nannos = %d, .elem = %s, .gsig = %s},\n",
 			f.Name, e.typeClassExpr(f.Type), mangle(cl.Full), offset, javaMods(f.Mods), addr, primKindOf(f.Type), anns, nannos,
-			e.elementTypeExpr(f.Type)))
+			e.elementTypeExpr(f.Type), sig))
 	}
 	name := "fds_" + mangle(cl.Full)
 	fmt.Fprintf(e.meta, "%sconst tyfield %s[] = {\n%s};\n", e.link, name, strings.Join(entries, ""))
@@ -457,6 +562,28 @@ func (e *Emitter) emitMethodTable(cl *ast.Class) string {
 		}
 		suffix := fmt.Sprintf("%s_m%d", mangle(cl.Full), mi)
 		anns, nannos := e.emitAnnoTable(suffix, methodAnnos(m))
+		// The declared generic types: the result and one entry per parameter,
+		// one level of arguments deep. A constructor has no result to describe,
+		// which is why Java has no Constructor.getGenericReturnType.
+		gret := "NULL"
+		if !m.IsCtor {
+			gret = e.emitSig("sig_"+suffix+"_ret", m.Result)
+		}
+		gparams := "NULL"
+		if len(m.Params) > 0 {
+			names := make([]string, len(m.Params))
+			any := false
+			for pi, p := range m.Params {
+				names[pi] = e.emitSig(fmt.Sprintf("sig_%s_p%d", suffix, pi), p)
+				if names[pi] != "NULL" {
+					any = true
+				}
+			}
+			if any {
+				gparams = "gps_" + suffix
+				fmt.Fprintf(e.meta, "%sconst tysig* %s[] = {%s};\n", e.link, gparams, strings.Join(names, ", "))
+			}
+		}
 		// a parameter's own annotations, which is where @Value and @Autowired
 		// on a constructor or method parameter are written
 		pannos, pnannos, pnames := "NULL", "NULL", "NULL"
@@ -484,9 +611,9 @@ func (e *Emitter) emitMethodTable(cl *ast.Class) string {
 			fmt.Fprintf(e.meta, "%sconst int32_t %s[] = {%s};\n", e.link, pnannos, strings.Join(counts, ", "))
 		}
 		entries = append(entries, fmt.Sprintf(
-			"  {.name = %q, .fn = (void*)%s, .owner = &cls_%s, .ret = %s, .params = %s, .nparams = %d, .mods = %d, .kind = %s, .primret = %d, .annos = %s, .nannos = %d, .pannos = %s, .pnannos = %s, .pnames = %s},\n",
+			"  {.name = %q, .fn = (void*)%s, .owner = &cls_%s, .ret = %s, .params = %s, .nparams = %d, .mods = %d, .kind = %s, .primret = %d, .annos = %s, .nannos = %d, .pannos = %s, .pnannos = %s, .pnames = %s, .gret = %s, .gparams = %s},\n",
 			m.Name, e.invokerName(m), mangle(m.Owner.Full), ret, params, len(m.Params),
-			javaMods(m.Mods), kind, primKindOf(m.Result), anns, nannos, pannos, pnannos, pnames))
+			javaMods(m.Mods), kind, primKindOf(m.Result), anns, nannos, pannos, pnannos, pnames, gret, gparams))
 	}
 	name := "mds_" + mangle(cl.Full)
 	fmt.Fprintf(e.meta, "%sconst tymethod %s[] = {\n%s};\n", e.link, name, strings.Join(entries, ""))

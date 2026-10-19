@@ -8,17 +8,19 @@ package teyru
 // table, a method table, the modifiers, the enum constants -- so a lookup costs
 // one array walk and nothing is built at run time.
 //
-// Two things are deliberately not here, and both are shapes of this runtime
-// rather than work left undone:
+// Arrays have a class per component type: `int[].class` is int[], an array
+// value carries the class of its own component, and Class.getComponentType and
+// Class.forName("[I") answer from it. The classes are emitted for the
+// components a program's reflection can reach (see internal/codegen/
+// arrayclass.go), so a program that never names an array type pays nothing.
 //
-//   * Annotations. A Teyru annotation is read by the compiler, not by the
-//     program, so there is no annotation object to hand back; @Retention is
-//     accepted and means nothing, exactly as Java's default retention means
-//     nothing at run time.
-//   * Classes per array type. Every array value is an instance of one
-//     teyru.Array, so there is no int[] class to ask for a component type, and
-//     Class.forName("[I") has nothing to answer with. Class.isArray,
-//     Array.newInstance and Array.get work on the array values themselves.
+// Generic types are reflected one level deep: a field declared List<Person>
+// answers a ParameterizedType whose raw type is List and whose argument is
+// Person, and a method's result and parameters do the same. That is exactly
+// the shape the language keeps -- deeper nesting, wildcards and type variables
+// are erased -- so a declaration that cannot be represented throws
+// UnsupportedOperationException rather than answering the erased type, which
+// would be a different answer rather than a shorter one.
 //
 // A member object (Field, Method, Constructor) is a handle: the class, which
 // table to read, and the index in it. It allocates once and holds no copy of
@@ -442,15 +444,27 @@ class Parameter {
 
 // ---- Class ---------------------------------------------------------------
 
-/* A class, or an interface, or a primitive type, or the one array class every
-   array value belongs to.
+/* java.lang.reflect.Type, as far as this runtime can answer it: a Class or a
+   ParameterizedType. Java has four more implementations (GenericArrayType,
+   WildcardType, TypeVariable and the generic form of an array); a declaration
+   that would need one of those is refused by the accessor that would return
+   it, with UnsupportedOperationException, rather than answered with the erased
+   type. */
+interface Type {
+  String getTypeName()
+}
+
+/* A class, an interface, a primitive type, or an array class. An array value
+   carries the array class of its component (int[], String[]), and the
+   synthetic teyru.Array class is the superclass those classes share, so
+   instanceof and casts to an array type keep working.
 
    Class values come in two forms, and both are Class values: a class literal
    is the raw tyclass handle, and Object.getClass is a Class object built by the
    runtime and cached per class. Every method here converts with handleOf first,
    so both forms answer the same, and the conversion is the only place that
    knows there are two. */
-class Class {
+class Class implements Type {
   /* The handle a Class value stands for. */
   static native long handleOf(Class c)
 
@@ -463,6 +477,11 @@ class Class {
 
   public native String getName()
 
+  /* Java's Type.getTypeName, which Class answers with its name. */
+  public String getTypeName() {
+    return getName()
+  }
+
   static native String simpleNameOf(long cm)
   static native int modsOf(long cm)
   static native boolean isPrimOf(long cm)
@@ -471,6 +490,7 @@ class Class {
   static native boolean isRecordOf(long cm)
   static native boolean isInterfaceOf(long cm)
   static native long superOf(long cm)
+  static native long componentOf(long cm)
   static native boolean isInstanceOf(long cm, Object o)
   static native boolean assignableOf(long cm, long other)
   static native int ifaceCountOf(long cm)
@@ -499,6 +519,20 @@ class Class {
   static native Object newInstOf(long cm)
   static native int enumCountOf(long cm)
   static native Object enumAtOf(long cm, int i)
+  /* The generic signatures the compiler writes: one per field, one for a
+     method's result, one per parameter, and one for a class's superclass. 0
+     means "not parameterized"; a negative argument count means the declaration
+     cannot be represented, and sigWhyOf says why. */
+  static native long fieldSigOf(long cm, boolean declared, int i)
+  static native long methodSigRetOf(long cm, boolean declared, int i)
+  static native long methodSigParamOf(long cm, boolean declared, int i, int p)
+  static native long ctorSigParamOf(long cm, int i, int p)
+  static native long classSigOf(long cm)
+  static native long sigRawOf(long sig)
+  static native int sigArgCountOf(long sig)
+  static native long sigArgOf(long sig, int i)
+  static native boolean sigOkOf(long sig)
+  static native String sigWhyOf(long sig)
   static native int annCountOf(long cm)
   static native long annAtOf(long cm, int i)
   static native int fieldAnnCountOf(long cm, boolean declared, int i)
@@ -516,6 +550,10 @@ class Class {
   /* The last two build a Class object, so the call site hands the runtime this
      program's teyru.Class: a header-less C file cannot name it. */
   static native Class makeOf(long h)
+  /* The array class of a component, or null when the program emitted none: the
+     emitter writes a class per component the program's reflection can reach
+     (internal/codegen/arrayclass.go). */
+  static native Class arrayOf(Class comp)
   static native Class forNameOf(String name)
 
   public String getSimpleName() {
@@ -566,6 +604,13 @@ class Class {
     return isArrayOf(handle())
   }
 
+  /* The component class of an array class, and null for anything else. Java
+     answers int.class for int[] and String.class for String[]; an array built
+     without a component (the runtime's own fallback class) answers null. */
+  public Class getComponentType() {
+    return makeOf(componentOf(handle()))
+  }
+
   public boolean isEnum() {
     return isEnumOf(handle())
   }
@@ -584,6 +629,20 @@ class Class {
       return null
     }
     return makeOf(s)
+  }
+
+  /* The superclass as it was declared, with its type arguments: a class that
+     extends ArrayList<String> answers ArrayList<String>, and one that extends
+     a raw class answers that Class. Java's getGenericSuperclass is the same
+     shape. A declaration whose arguments this runtime cannot represent (a
+     wildcard, a type variable, a nested parameterized type) throws
+     UnsupportedOperationException instead of answering the erased type. */
+  public Type getGenericSuperclass() {
+    Class sup = getSuperclass()
+    if (sup == null) {
+      return null
+    }
+    return genericOf(classSigOf(handle()), sup)
   }
 
   public boolean isInstance(Object o) {
@@ -800,12 +859,35 @@ class Class {
     return newInstOf(handle())
   }
 
+  /* genericOf turns a signature record into the Type a program reads: the
+     erased Class when the declaration carries no arguments, and a
+     ParameterizedType with one level of arguments when it does. A record the
+     compiler marked unrepresentable throws rather than answering raw. */
+  static Type genericOf(long sig, Class raw) {
+    if (sig == 0) {
+      return raw
+    }
+    if (!sigOkOf(sig)) {
+      String why = sigWhyOf(sig)
+      throw new UnsupportedOperationException(why == null ? "this generic type cannot be represented" : why)
+    }
+    int n = sigArgCountOf(sig)
+    Type[] args = new Type[n]
+    for (int i = 0 : i < n : i++) {
+      args[i] = makeOf(sigArgOf(sig, i))
+    }
+    return new ParameterizedType(makeOf(sigRawOf(sig)), args)
+  }
+
   /* Java's forName, with this language's names. The name is the binary name a
      class file carries -- teyru.Outer$Inner -- and a java.* name finds the
      library class the import of it resolves to, which is the last segment
      declared in teyru. The name matches the compiler's own rule, so a class a
      program can import is a class it can load. */
   public static Class forName(String name) {
+    if (name.length() > 0 && name.charAt(0) == '[') {
+      return arrayForName(name)
+    }
     try {
       return forNameOf(name)
     } catch (ClassNotFoundException e) {
@@ -820,6 +902,51 @@ class Class {
         throw e
       }
     }
+  }
+
+  /* arrayForName parses the JVM's array descriptor -- "[I", "[[I",
+     "[Ljava.lang.String;" -- and builds the class of the component it names.
+     The component is resolved by forName, so a java.* spelling finds the
+     library class it stands for. A descriptor naming a class the program did
+     not emit an array class for is a ClassNotFoundException, which is what
+     Java answers for a class that is not there. */
+  private static Class arrayForName(String name) {
+    int dims = 0
+    while (dims < name.length() && name.charAt(dims) == '[') {
+      dims++
+    }
+    String rest = name.substring(dims)
+    Class comp = null
+    if (rest.equals("Z")) {
+      comp = boolean.class
+    } else if (rest.equals("B")) {
+      comp = byte.class
+    } else if (rest.equals("S")) {
+      comp = short.class
+    } else if (rest.equals("C")) {
+      comp = char.class
+    } else if (rest.equals("I")) {
+      comp = int.class
+    } else if (rest.equals("J")) {
+      comp = long.class
+    } else if (rest.equals("F")) {
+      comp = float.class
+    } else if (rest.equals("D")) {
+      comp = double.class
+    } else if (rest.length() >= 2 && rest.charAt(0) == 'L' && rest.charAt(rest.length() - 1) == ';') {
+      comp = forName(rest.substring(1, rest.length() - 1))
+    }
+    if (comp == null) {
+      throw new ClassNotFoundException(name)
+    }
+    for (int i = 0 : i < dims : i++) {
+      Class arr = arrayOf(comp)
+      if (arr == null) {
+        throw new ClassNotFoundException(name)
+      }
+      comp = arr
+    }
+    return comp
   }
 
   public String toString() {
@@ -845,6 +972,84 @@ class Class {
     }
     Class other = (Class)o
     return getName().equals(other.getName())
+  }
+}
+
+/* A parameterized type, one level deep: List<Person>, Map<String,Person>,
+   Set<int[]>. getRawType is the erased class and getActualTypeArguments the
+   arguments the declaration wrote, each a Class. That is the whole of what
+   this runtime keeps, so a declaration needing a WildcardType, a TypeVariable
+   or a nested ParameterizedType is refused where it is read (see
+   Class.genericOf). */
+class ParameterizedType implements Type {
+  private Class raw
+  private Type[] args
+
+  ParameterizedType(Class raw, Type[] args) {
+    this.raw = raw
+    this.args = args
+  }
+
+  public Class getRawType() {
+    return raw
+  }
+
+  public Type[] getActualTypeArguments() {
+    return args
+  }
+
+  /* The declaration's source shape, which is what Java's toString answers for
+     a ParameterizedType. */
+  public String getTypeName() {
+    StringBuilder b = new StringBuilder()
+    b.append(raw.getName())
+    b.append("<")
+    for (int i = 0 : i < args.length : i++) {
+      if (i > 0) {
+        b.append(", ")
+      }
+      Type a = args[i]
+      if (a instanceof Class) {
+        b.append(((Class) a).getName())
+      } else if (a instanceof ParameterizedType) {
+        b.append(((ParameterizedType) a).getTypeName())
+      } else {
+        b.append(((Object) a).toString())
+      }
+    }
+    b.append(">")
+    return b.toString()
+  }
+
+  public String toString() {
+    return getTypeName()
+  }
+
+  public boolean equals(Object o) {
+    if ((Object)this == o) {
+      return true
+    }
+    if (!(o instanceof ParameterizedType)) {
+      return false
+    }
+    ParameterizedType p = (ParameterizedType) o
+    if (!raw.equals(p.getRawType())) {
+      return false
+    }
+    Type[] other = p.getActualTypeArguments()
+    if (args.length != other.length) {
+      return false
+    }
+    for (int i = 0 : i < args.length : i++) {
+      if (!((Object) args[i]).equals(other[i])) {
+        return false
+      }
+    }
+    return true
+  }
+
+  public int hashCode() {
+    return raw.hashCode() * 31 + args.length
   }
 }
 
@@ -876,8 +1081,10 @@ class Field {
   private long cm
   private boolean declared
   private int idx
-  /* setAccessible(true): from then on the field can be written even when it is
-     final, which is the one thing Java's reflection gate holds back. */
+  /* setAccessible(true): from then on a non-public field can be read and
+     written, and a final instance field can be written. Java's access check
+     consults the caller's class; there is no caller here, so every non-public
+     member is refused until the program says otherwise. */
   private boolean accessible
 
   Field(long cm, boolean declared, int idx) {
@@ -915,6 +1122,14 @@ class Field {
     return Class.makeOf(elem)
   }
 
+  /* The declared generic type: List<Person> answers ParameterizedType(List,
+     Person), and a type with no arguments answers its Class, which is what
+     Java does. A declaration this runtime cannot represent throws
+     UnsupportedOperationException (Class.genericOf explains which). */
+  public Type getGenericType() {
+    return Class.genericOf(Class.fieldSigOf(cm, declared, idx), getType())
+  }
+
   public Class getDeclaringClass() {
     return Class.makeOf(Class.fieldOwnerOf(cm, declared, idx))
   }
@@ -948,11 +1163,24 @@ class Field {
   }
 
   public Object get(Object obj) {
+    checkAccess()
     return Class.fieldGetOf(cm, declared, idx, obj)
   }
 
   public void set(Object obj, Object value) {
+    checkAccess()
     Class.fieldSetOf(cm, declared, idx, obj, value, accessible)
+  }
+
+  /* Java's access gate: a private, protected or package-private member is
+     refused until setAccessible(true). The message is Java's shape with the
+     declaring class standing in for the caller, which this runtime cannot
+     name. */
+  private void checkAccess() {
+    if (!accessible && !Modifier.isPublic(getModifiers())) {
+      throw new IllegalAccessException("cannot access " + Modifier.toString(getModifiers()) +
+          " field " + getDeclaringClass().getName() + "." + getName())
+    }
   }
 
   public int getInt(Object obj) {
@@ -1043,6 +1271,10 @@ class Method {
   private long cm
   private boolean declared
   private int idx
+  /* setAccessible(true): a non-public method can be invoked after it. There is
+     no caller class to consult, so every non-public method is refused until
+     the program says otherwise. */
+  private boolean accessible
 
   Method(long cm, boolean declared, int idx) {
     this.cm = cm
@@ -1066,6 +1298,14 @@ class Method {
     return Class.makeOf(Class.methodRetOf(cm, declared, idx))
   }
 
+  /* The declared generic result and parameters, one level deep: a method
+     returning List<Person> answers ParameterizedType(List, Person), and a
+     parameter with no arguments answers its Class. A declaration that cannot
+     be represented throws UnsupportedOperationException. */
+  public Type getGenericReturnType() {
+    return Class.genericOf(Class.methodSigRetOf(cm, declared, idx), getReturnType())
+  }
+
   public int getParameterCount() {
     return Class.methodParamCountOf(cm, declared, idx)
   }
@@ -1075,6 +1315,16 @@ class Method {
     Class[] out = new Class[n]
     for (int i = 0 : i < n : i++) {
       out[i] = Class.makeOf(Class.methodParamOf(cm, declared, idx, i))
+    }
+    return out
+  }
+
+  public Type[] getGenericParameterTypes() {
+    int n = getParameterCount()
+    Type[] out = new Type[n]
+    for (int i = 0 : i < n : i++) {
+      out[i] = Class.genericOf(Class.methodSigParamOf(cm, declared, idx, i),
+          Class.makeOf(Class.methodParamOf(cm, declared, idx, i)))
     }
     return out
   }
@@ -1126,7 +1376,23 @@ class Method {
   }
 
   public Object invoke(Object obj, Object... args) {
+    checkAccess()
     return Class.methodInvokeOf(cm, declared, idx, obj, args)
+  }
+
+  public void setAccessible(boolean flag) {
+    accessible = flag
+  }
+
+  public boolean isAccessible() {
+    return accessible
+  }
+
+  private void checkAccess() {
+    if (!accessible && !Modifier.isPublic(getModifiers())) {
+      throw new IllegalAccessException("cannot access " + Modifier.toString(getModifiers()) +
+          " method " + getDeclaringClass().getName() + "." + getName())
+    }
   }
 
   public String toString() {
@@ -1166,6 +1432,8 @@ class Method {
 class Constructor {
   private long cm
   private int idx
+  /* setAccessible(true): a non-public constructor can be called after it. */
+  private boolean accessible
 
   Constructor(long cm, int idx) {
     this.cm = cm
@@ -1193,6 +1461,19 @@ class Constructor {
     Class[] out = new Class[n]
     for (int i = 0 : i < n : i++) {
       out[i] = Class.makeOf(Class.ctorParamOf(cm, idx, i))
+    }
+    return out
+  }
+
+  /* The declared generic parameters, one level deep; see
+     Method.getGenericParameterTypes. A constructor has no result to describe,
+     which is why Java has no getGenericReturnType here. */
+  public Type[] getGenericParameterTypes() {
+    int n = getParameterCount()
+    Type[] out = new Type[n]
+    for (int i = 0 : i < n : i++) {
+      out[i] = Class.genericOf(Class.ctorSigParamOf(cm, idx, i),
+          Class.makeOf(Class.ctorParamOf(cm, idx, i)))
     }
     return out
   }
@@ -1240,7 +1521,23 @@ class Constructor {
   }
 
   public Object newInstance(Object... args) {
+    checkAccess()
     return Class.ctorNewOf(cm, idx, args)
+  }
+
+  public void setAccessible(boolean flag) {
+    accessible = flag
+  }
+
+  public boolean isAccessible() {
+    return accessible
+  }
+
+  private void checkAccess() {
+    if (!accessible && !Modifier.isPublic(getModifiers())) {
+      throw new IllegalAccessException("cannot access " + Modifier.toString(getModifiers()) +
+          " constructor " + getDeclaringClass().getName() + "(" + getParameterCount() + ")")
+    }
   }
 
   public String toString() {

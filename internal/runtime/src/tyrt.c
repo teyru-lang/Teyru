@@ -2582,7 +2582,10 @@ int64_t ty_array_len(tyarr *a) {
 tyarr *ty_array_clone(tyarr *a, int64_t elemsize) {
   if (!a) ty_npe();
   tyarr *r = ty_alloc_arr(a->len, (size_t)elemsize);
-  r->obj.cls = array_class();
+  /* The clone is the same array type as its source, so it keeps the class the
+     source carries -- a per-component array class, or the one fallback class
+     for an array the runtime built without a component. */
+  r->obj.cls = a->obj.cls;
   r->esize = a->esize;
   r->refs = a->refs;
   /* Java's clone keeps the array's runtime element type, so a copy of a
