@@ -896,6 +896,28 @@ func parseFile(path string, diags *source.Diagnostics) *ast.File {
 	return parseSource(path, string(data), diags)
 }
 
+// Analyze runs the front end on one source file: the standard library and the
+// file are parsed, and the checker runs over both. It returns the diagnostics
+// that belong to the file (the library's own are not the editor's business)
+// together with the file's syntax tree, whose resolved references are what a
+// definition lookup reads.
+//
+// This is the same parse-and-check path Compile takes, without the back end.
+func Analyze(path, text string) (*source.Diagnostics, *ast.File) {
+	all := &source.Diagnostics{}
+	files := parsePrelude(all)
+	f := parseSource(path, text, all)
+	files = append(files, f)
+	sema.Check(files, all)
+	out := &source.Diagnostics{}
+	for _, d := range all.List {
+		if d.Pos.File == f.Src {
+			out.List = append(out.List, d)
+		}
+	}
+	return out, f
+}
+
 func parseSource(path, text string, diags *source.Diagnostics) *ast.File {
 	// The parser reads a module path (`example.com/dep/pkg`) as readily as a
 	// dotted one, so the source goes in as it is written on disk and every

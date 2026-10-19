@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/teyru-lang/Teyru/internal/driver"
+	teyrufmt "github.com/teyru-lang/Teyru/internal/format"
+	"github.com/teyru-lang/Teyru/internal/lsp"
 	"github.com/teyru-lang/Teyru/internal/mod"
 )
 
@@ -25,6 +27,8 @@ usage:
   teyru get <module>@<version>     fetch a module into the cache and require it
   teyru mod init <module-path>     write teyru.mod for a new module
   teyru mod tidy                   make teyru.mod and teyru.sum match the sources
+  teyru fmt [-w] [paths...]        format Teyru sources in the canonical style
+  teyru lsp                        run the language server on stdin/stdout
   teyru version                    print the version
 
 paths:
@@ -93,6 +97,10 @@ func run() int {
 		return runMod(args)
 	case "get":
 		return runGet(args)
+	case "fmt":
+		return runFmt(args)
+	case "lsp":
+		return runLSP(args)
 	}
 	opts := driver.Options{Out: "a.out"}
 	var files []string
@@ -480,4 +488,77 @@ func loadGraph(dir string) (*mod.Graph, error) {
 		return nil, err
 	}
 	return g, nil
+}
+
+// runFmt implements `teyru fmt [-w] [paths...]`.
+func runFmt(args []string) int {
+	write := false
+	var paths []string
+	for _, a := range args {
+		switch {
+		case a == "-w":
+			write = true
+		case a == "--":
+			// the rest are paths, which cannot start with '-' anyway
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(os.Stderr, "teyru: fmt: unknown flag %q\n", a)
+			return 2
+		default:
+			paths = append(paths, a)
+		}
+	}
+	files, err := teyrufmt.Collect(paths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "teyru: fmt: %v\n", err)
+		return 1
+	}
+	if len(files) == 0 {
+		return 0
+	}
+	if !write && len(files) != 1 {
+		fmt.Fprintf(os.Stderr, "teyru: fmt without -w writes one file to stdout; %d file(s) matched\n", len(files))
+		return 2
+	}
+	status := 0
+	for _, path := range files {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "teyru: fmt: %v\n", err)
+			status = 1
+			continue
+		}
+		out, err := teyrufmt.Source(path, string(src))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "teyru: fmt: %s: %v\n", path, err)
+			status = 1
+			continue
+		}
+		if !write {
+			os.Stdout.WriteString(out)
+			continue
+		}
+		if out == string(src) {
+			continue
+		}
+		st, err := os.Stat(path)
+		mode := os.FileMode(0o644)
+		if err == nil {
+			mode = st.Mode().Perm()
+		}
+		if err := os.WriteFile(path, []byte(out), mode); err != nil {
+			fmt.Fprintf(os.Stderr, "teyru: fmt: %v\n", err)
+			status = 1
+		}
+	}
+	return status
+}
+
+// runLSP implements `teyru lsp`: the language server speaks JSON-RPC on
+// stdin/stdout, and the exit code is the one the protocol asks for.
+func runLSP(args []string) int {
+	if len(args) != 0 {
+		fmt.Fprint(os.Stderr, "teyru: lsp takes no arguments\n")
+		return 2
+	}
+	return lsp.Serve(os.Stdin, os.Stdout)
 }
