@@ -629,6 +629,67 @@ struct tythread {
      lets a program interrupt one that has not started -- and that entry is not
      live until this is set. */
   int32_t started;
+  /* ---- virtual threads (tyrt_thread.c) ---------------------------------
+
+     A virtual thread is a registry entry like any other -- it has an id, a
+     name, a Thread object, interrupt status, and a stack the collector scans --
+     but it is not an operating system thread. It runs on a carrier, and when
+     it blocks it is switched off that carrier and left here with `vstate`
+     saying what it is waiting for. The fields below are the scheduler's; the
+     stop-the-world protocol uses the ordinary ones above (`park_sp`,
+     `stack_base`, `stack_top`, `frames`, `stop_depth`, `state`) exactly as it
+     does for a platform thread, because a parked virtual thread is a stopped
+     thread with a stack that does not move.
+
+     `is_virtual` is the one flag every other file may read: the blocking
+     primitives ask it to decide whether to park or to wait on the platform. */
+  int32_t is_virtual;
+  /* TY_VT_* below. Guarded by the scheduler lock in tyrt_thread.c. */
+  int32_t vstate;
+  /* Set when a wake arrives while the thread is still running: the park it is
+     about to perform must return without switching out. */
+  int32_t vwake_pending;
+  /* Set by the scheduler when it made the thread runnable because its deadline
+     passed, and read by the blocking call when it resumes. */
+  int32_t vt_timedout;
+  /* What the parked thread waits for: a descriptor (-1 for none), the poll
+     events for it, and a monotonic deadline in nanoseconds (0 for none). */
+  int32_t vfd;
+  int32_t vevents;
+  int64_t vdeadline;
+  /* Links: the scheduler's run queue and blocked list use vprev/vnext, and a
+     condition variable's list of virtual waiters uses vwprev/vwnext. A thread
+     is on at most one scheduler list and at most one condition list at a time. */
+  struct tythread *vprev, *vnext;
+  struct tythread *vwprev, *vwnext;
+  /* A carrier's private batch of runnable threads, taken from the shared run
+     queue a handful at a time so that the queue's lock is not touched once per
+     switch. Only the carrier that owns the batch touches these. */
+  struct tythread *vlocal_head, *vlocal_tail;
+  /* The condition variable this thread is parked on, or NULL. Kept so that a
+     wake that is not a notification -- an interrupt, or a deadline -- can take
+     the thread off that variable's list, rather than leaving a notification to
+     be spent on a thread that is no longer waiting. */
+  void *vwait_cv;
+  /* The waiter-list entry for vwait_cv, so taking the thread off that list is
+     a pointer write rather than a hash lookup. */
+  void *vwait_q;
+  /* The continuation: a ucontext_t on POSIX (NULL on Windows, where virtual
+     threads are refused), and the mmap'd stack it runs on. */
+  void *vctx;
+  char *vstack;
+  size_t vstack_bytes;
+  /* The carrier this thread is running on, or ran on last. Written by the
+     carrier before it switches in and read by the thread when it parks. */
+  struct tythread *vcarrier;
+  /* Saved across a context switch: the exception handler chain, and this
+     thread's stack limit (ty_stack_limit is per thread and a carrier serves
+     many). `frames` above is the third one, published by park_point. */
+  void *catch_chain;
+  char *stack_limit;
+  /* The interface selector of Runnable.run, which the virtual thread's entry
+     uses to reach the program's own run() the way thread_body does. */
+  int32_t vsel;
   struct tythread *next;  /* the registry the collector walks */
 };
 
@@ -642,6 +703,16 @@ struct tythread {
 #define TY_TH_PARKED 1
 #define TY_TH_BLOCKED 2
 #define TY_TH_DONE 3
+
+/* A virtual thread's scheduler state. RUNNING is on a carrier; RUNNABLE is in
+   the run queue; PARKING is between "I am about to switch out" and the carrier
+   having saved the context; PARKED is off every carrier and waiting; DONE is
+   finished and its stack is being released. */
+#define TY_VT_RUNNING 0
+#define TY_VT_RUNNABLE 1
+#define TY_VT_PARKING 2
+#define TY_VT_PARKED 3
+#define TY_VT_DONE 4
 
 extern _Thread_local tythread *ty_self;
 
@@ -839,6 +910,35 @@ void ty_thread_join_all(void);
    reaches the program's own run() without the runtime knowing the layout of a
    class it was not compiled against. */
 int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int32_t sel);
+
+/* The C half of Thread.ofVirtual().start(): the same arguments as
+   ty_thread_start0, without a daemon flag because a virtual thread is counted
+   as a user thread (the process waits for it) and cannot be made a daemon. It
+   creates the continuation and the stack, registers the thread, and hands it
+   to a carrier; it does not create an operating system thread. On Windows,
+   where the runtime has no fibers, it throws UnsupportedOperationException
+   rather than silently running the work on a platform thread. */
+int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel);
+
+/* ---- virtual thread waits ---------------------------------------------
+
+   The blocking primitives ask these instead of the platform layer's, so that a
+   virtual thread parks -- leaving its carrier free for other virtual threads --
+   where a platform thread would block. A platform thread's call is the same
+   platform call it made before.
+
+   ty_cond_wait and ty_cond_timedwait wait on a condition variable, releasing
+   `m` for the duration as pthread_cond_wait does. A negative timeout waits
+   forever. The timed form answers 1 when the timeout passed.
+
+   ty_wait_fd waits until `fd` is ready for reading (events == 0) or writing
+   (events == 1), or until timeout_ms passes (-1 waits forever). It answers 1
+   ready, 0 timed out, or a negative error code. */
+void ty_cond_wait(typlat_cond *c, typlat_mutex *m);
+int32_t ty_cond_timedwait(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns);
+void ty_cond_signal(typlat_cond *c);
+void ty_cond_broadcast(typlat_cond *c);
+int32_t ty_wait_fd(int32_t fd, int32_t events, int32_t timeout_ms);
 
 /* A thread's uncaught exception: the same line the main thread's handler
    prints, with the thread's name, after which the thread ends and the process

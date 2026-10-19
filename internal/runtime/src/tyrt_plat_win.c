@@ -404,6 +404,13 @@ int typlat_socket_timeout_ms(int32_t fd, int ms) {
              : 0;
 }
 
+int32_t typlat_socket_recv_timeout_ms(int32_t fd) {
+  DWORD v = 0;
+  int n = (int)sizeof v;
+  if (getsockopt(as_socket(fd), SOL_SOCKET, SO_RCVTIMEO, (char *)&v, &n) == SOCKET_ERROR) return 0;
+  return (int32_t)v;
+}
+
 int typlat_socket_wait(int32_t fd, int for_write, int timeout_ms) {
   WSAPOLLFD p;
   p.fd = as_socket(fd);

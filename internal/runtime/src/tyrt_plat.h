@@ -241,6 +241,11 @@ int typlat_socket_reuse(int32_t fd, int on);
 /* SO_RCVTIMEO: one read or accept call's deadline, not a whole exchange's.
    ms <= 0 clears it, which means "wait forever" in both APIs. */
 int typlat_socket_timeout_ms(int32_t fd, int ms);
+/* The receive timeout currently set on the socket, in milliseconds, or 0 for
+   none. A virtual thread waiting for a readable socket has to apply the same
+   deadline recv would have: it polls outside the call, and a poll without it
+   would turn a timed read into an endless one. */
+int32_t typlat_socket_recv_timeout_ms(int32_t fd);
 
 /* Wait until a socket is readable (for_write == 0) or writable. Returns a
    positive value when it is ready, 0 when the deadline passed, or a negative
