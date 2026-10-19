@@ -272,9 +272,26 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   ——clang 對這些形狀剛好由左至右——只有 `make ci`（§6）的**第二條腿**（`TEYRU_CC=gcc`）看得見，
   而它從未綠過；回歸測試是 `tests/programs/t260_eval_order.teyru`，它的 `.expected` 來自
   `t260_eval_order.java.ref` 在 OpenJDK 21 上的輸出。
-- checked exception 沒有編譯期檢查。
-- `sealed` 的 `permits` 子句沒有被驗證：沒有 `permits` 的 sealed 型別在 switch
-  窮盡性上被視為不可判定而要求 `default`。
+- checked exception 對**程式自己的程式碼**做編譯期檢查（JLS 11.2）：呼叫或 `throw`
+  一個受檢例外時，外層 `try` 的 catch 子句必須能接住它，或外圍方法／建構子／初始化器
+  必須宣告它；catch 子型別不涵蓋宣告的超型別、`finally` 不接例外，lambda 的 body 以
+  函式介面的 `throws` 為準。診斷是 `TY-TYP-0122`，測試是
+  `tests/programs/t288_checked_exceptions.teyru` 與
+  `tests/diagnostics/{uncaughtCheckedCall,uncaughtCheckedThrow,finallyDoesNotCatch,checkedInLambda}.teyru`。
+  標準程式庫**自己的 body** 不在這條規則內，因為它被當成已編譯的相依（javac 也不檢查
+  JDK 原始碼）：它的 140 個違規（12 個檔案；ZipException 51、IOException 26、
+  DataFormatException 16、EOFException 12、WebSocketProtocolException 8、
+  SocketException 7、UTFDataFormatException 5、ParseException 4，其餘 11 個分屬五類）是
+  整份程式庫例外模型的改寫，不是這條規則的一部分。程式庫**宣告**的受檢例外仍會在使用端
+  被要求處理（例如 `MessageFormat.parse` 的 `ParseException`）。未模型化的是 precise
+  rethrow（`catch (Exception e) { throw e; }` 只宣告 try 區塊實際會丟的型別）與方法參考的
+  `throws`；兩者都是從嚴拒絕，不會放過。
+- `sealed` 的 `permits` 子句會被驗證（JLS 8.1.6／9.1.4）：`permits` 只能指名直接子型別、
+  每個直接子型別都必須被允許（沒有 `permits` 時，同一個編譯單元裡的直接子型別就是隱式
+  允許，與 Java 相同）、每個被允許的子型別必須是 `final`、`sealed` 或 `non-sealed`。
+  因此沒有 `permits` 的 sealed 型別在 switch 窮盡性上不再不可判定：同檔案的直接子型別
+  就是 permit 集合。診斷是 `TY-TYP-0119`／`0120`／`0121`，測試是
+  `tests/programs/t289_sealed_permits.teyru` 與 `tests/diagnostics/sealed*.teyru`。
 - 反射在 `lib/26_reflect.teyru`：`Class`、`Field`、`Method`、`Constructor`、
   `Modifier`、`Array` 與 `java.lang.reflect` 的六個例外，讀的是編譯器為每個類別
   產生的靜態表（欄位、方法、修飾子、列舉常數），所以查一次資料是走一次陣列，
