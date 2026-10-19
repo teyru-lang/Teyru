@@ -577,6 +577,27 @@ struct tythread {
      thread's stack -- it outlives the thread -- so this, and not the operating
      system's idea of the thread, is what the program asks about. */
   int32_t finished;
+  /* Interrupt status: set by Thread.interrupt, read and cleared by the blocked
+     calls that throw InterruptedException and by Thread.interrupted(). It is
+     written by another thread, so every access goes through __atomic; the
+     blocking calls test it under the mutex of whatever they wait on, which is
+     what makes the wake-up and the test one operation rather than two. */
+  int32_t interrupted;
+  /* What this thread is waiting for, so that interrupt() can reach the
+     condition variable it is asleep on: the monitor it is inside Object.wait
+     for, or the registry entry it is joining. Both are published and read with
+     seq_cst atomics; see the comment on interrupt_wake in tyrt_thread.c for why
+     the lost-wakeup argument needs that and not a release store. */
+  void *wait_mon;
+  void *join_target;
+  /* Daemon status, as set before start(). The process ends when the last
+     non-daemon thread does, which is what ty_thread_join_all waits for. */
+  int32_t daemon;
+  /* Whether start() has run. A Thread object gets a registry entry when it is
+     built -- interrupt status is a property of the object, and java.lang.Thread
+     lets a program interrupt one that has not started -- and that entry is not
+     live until this is set. */
+  int32_t started;
   struct tythread *next;  /* the registry the collector walks */
 };
 
@@ -743,13 +764,31 @@ void *ty_thread_start(void *(*fn)(void *), void *arg);
    object was given when it was built, so Thread.getId() is the same number
    before and after start(). name is what an uncaught exception prints. Returns
    id. */
-int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, tystr *name);
-/* The id Thread.getId() reports for a Thread object that was never started: a
-   counter that only ever goes up, as java.lang.Thread's does. */
+int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, tystr *name,
+                        int32_t daemon);
+/* The id Thread.getId() reports for a Thread object, assigned when the object
+   is built: a counter that only ever goes up, as java.lang.Thread's does. It
+   also makes the object's registry entry, which is where interrupt status
+   lives before start(); the entry is not live until ty_thread_spawn runs. */
 int64_t ty_thread_next_id(void);
-void ty_thread_join(int64_t id);
+/* Wait for the thread to finish. Answers 1 when the calling thread was
+   interrupted instead, in which case the interrupt status is already cleared
+   and the prelude throws InterruptedException. */
+int32_t ty_thread_join(int64_t id);
 int32_t ty_thread_alive(int64_t id);
-void ty_thread_sleep_ms(int64_t millis);
+/* Sleep for the duration, or until interrupted. Answers 1 when interrupted, in
+   which case the interrupt status is cleared. */
+int32_t ty_thread_sleep_ms(int64_t millis);
+/* Set the thread's interrupt status and wake it out of sleep, join or
+   Object.wait. No effect on a thread that has finished or never started. */
+void ty_thread_interrupt(int64_t id);
+/* The thread's interrupt status, without clearing it. */
+int32_t ty_thread_is_interrupted(int64_t id);
+/* The calling thread's interrupt status, cleared. Thread.interrupted(). */
+int32_t ty_thread_clear_interrupted(void);
+/* The calling thread's daemon status, for a Thread object built inside a
+   daemon thread: java.lang.Thread inherits it from the thread that makes it. */
+int32_t ty_thread_current_daemon(void);
 int64_t ty_thread_current_id(void);
 void ty_thread_yield(void);
 /* The Teyru Thread object of the calling thread, or NULL when the calling
@@ -768,7 +807,7 @@ void ty_thread_join_all(void);
    to run, sel is the interface selector of Runnable.run, which is how a thread
    reaches the program's own run() without the runtime knowing the layout of a
    class it was not compiled against. */
-int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t sel);
+int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int32_t sel);
 
 /* A thread's uncaught exception: the same line the main thread's handler
    prints, with the thread's name, after which the thread ends and the process
@@ -787,7 +826,7 @@ void ty_uncaught_thread(void *e, tythread *t);
    needs is the same monitor, held or given up. */
 /* Object.wait/monitor's own semantics: release the monitor, wait for a notify
    or for `millis` to pass, take it back. A negative timeout waits forever. */
-void ty_mon_wait(void *obj, int64_t millis);
+int32_t ty_mon_wait(void *obj, int64_t millis);
 void ty_mon_notify(void *obj);
 void ty_mon_notify_all(void *obj);
 

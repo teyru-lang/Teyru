@@ -19,8 +19,19 @@ class Object {
      calling thread does not own the monitor, as java.lang.Object says.
 
      wait(long) is the whole of waiting here: the unbounded wait() and the
-     nanosecond form are not implemented, and nothing declares them. */
-  public final native void wait(long timeoutMillis)
+     nanosecond form are not implemented, and nothing declares them. It is a
+     Teyru method rather than a native one because the interrupt is: the native
+     half (wait0) answers whether the wait ended because the thread was
+     interrupted, and the throw below happens in Teyru code, which is what lets
+     the exception be an ordinary prelude class with no runtime handle of its
+     own. The monitor is held again by the time wait0 returns, so the throw
+     leaves the synchronized block owning it, exactly as the JDK's wait does. */
+  private static native boolean wait0(Object o, long timeoutMillis)
+  public final void wait(long timeoutMillis) {
+    if (Object.wait0(this, timeoutMillis)) {
+      throw new InterruptedException()
+    }
+  }
   public final native void notify()
   public final native void notifyAll()
 }

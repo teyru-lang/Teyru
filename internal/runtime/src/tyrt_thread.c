@@ -147,7 +147,9 @@ static tythread main_thread = {
    main thread, and set by the trampoline below for every other one. */
 _Thread_local tythread *ty_self = &main_thread;
 
-/* The registry: every thread this runtime started, and the main thread. Held
+/* The registry: every thread this runtime started, the main thread, and one
+   entry for every Thread object that has been built (an unstarted object's
+   entry is not live; it is where its interrupt status lives). Held
    head-inserted and never removed from; see the file comment. */
 static tythread *threads = NULL;
 /* How many registered threads have not finished, including the caller, and how
@@ -158,6 +160,10 @@ static tythread *threads = NULL;
    the wait harmless. */
 static int32_t n_live = 0;
 static int32_t n_stopped = 0;
+/* How many of the live threads are daemons. The program ends when the last
+   non-daemon thread does, so ty_thread_join_all waits on n_live - n_daemon;
+   this is the whole of daemon semantics on the runtime side. */
+static int32_t n_daemon = 0;
 
 /* The world lock. It guards the counters and the registry, and it is what
    stopped threads wait on. It is deliberately not the heap lock: the collector
@@ -296,12 +302,30 @@ tythread *ty_thread_list(void) {
 
 /* Add a fully built entry to the registry. The entry is complete before it is
    published, and readers walk the list with an acquire load, so the list can be
-   walked without the lock -- which is what the collector does. */
-static void registry_add(tythread *t) {
+   walked without the lock -- which is what the collector does.
+
+   `live` says whether the entry belongs to a running thread. A Thread object
+   that has not started has an entry too (see ty_thread_next_id), because
+   interrupt status lives on the object and is readable before start(); such an
+   entry is in the list -- interrupt() and isInterrupted() find it there -- but
+   is not counted as a thread the process has to wait for. */
+static void registry_insert(tythread *t, int32_t live) {
   typlat_mutex_lock(&world_mtx);
   t->next = __atomic_load_n(&threads, __ATOMIC_RELAXED);
   __atomic_store_n(&threads, t, __ATOMIC_RELEASE);
+  if (live) {
+    n_live++;
+    if (t->daemon) n_daemon++;
+  }
+  typlat_mutex_unlock(&world_mtx);
+}
+
+/* An entry that was registered when its Thread object was built becomes live
+   when start() runs. It is already in the list, so this only counts it. */
+static void registry_make_live(tythread *t) {
+  typlat_mutex_lock(&world_mtx);
   n_live++;
+  if (t->daemon) n_daemon++;
   typlat_mutex_unlock(&world_mtx);
 }
 
@@ -313,6 +337,7 @@ static void registry_finish(tythread *t) {
   if (t->state != TY_TH_RUNNING && t->state != TY_TH_DONE) n_stopped--;
   t->state = TY_TH_DONE;
   n_live--;
+  if (t->daemon) n_daemon--;
   typlat_cond_broadcast(&world_cv);
   typlat_mutex_unlock(&world_mtx);
 }
@@ -384,11 +409,16 @@ int ty_stack_fault(void *addr) {
 
 void ty_thread_init(void) {
   main_thread.tid = typlat_thread_self();
+  /* The main thread's entry is static, so its mutex and condition variable are
+     not initialised by ty_thread_spawn the way a spawned thread's are. Sleep,
+     join and interrupt use them for the main thread too. */
+  typlat_mutex_init(&main_thread.mtx);
+  typlat_cond_init(&main_thread.cv);
   /* The main thread's stack bounds are what ty_gc_init used to read for the one
      thread there was; they are now part of the thread's state, because a
      collection scans a different stack for every thread. */
   stack_limit_init();
-  registry_add(&main_thread);
+  registry_insert(&main_thread, 1);
 }
 
 /* ------------------------------------------------------------------ threads */
@@ -482,22 +512,39 @@ void *ty_thread_start(void *(*fn)(void *), void *arg) {
   return NULL;
 }
 
-int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, tystr *name) {
-  tythread *t = (tythread *)calloc(1, sizeof(tythread));
+int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, tystr *name,
+                        int32_t daemon) {
   spawn_packet *k = (spawn_packet *)malloc(sizeof(spawn_packet));
-  if (!t || !k) abort();
-  typlat_mutex_init(&t->mtx);
-  typlat_cond_init(&t->cv);
-  t->id = id;
+  if (!k) abort();
+  /* The entry was made when the Thread object was built. Reusing it keeps the
+     interrupt status that may have been set before start() -- which is what
+     java.lang.Thread does -- and avoids a second entry for one id. */
+  tythread *t = registry_find(id);
+  int32_t reused = t && !t->started;
+  if (!reused) {
+    t = (tythread *)calloc(1, sizeof(tythread));
+    if (!t) abort();
+    typlat_mutex_init(&t->mtx);
+    typlat_cond_init(&t->cv);
+    t->id = id;
+  }
   t->obj = obj;
   t->name = name;
+  t->daemon = daemon;
   /* Registered before the thread runs, so that join() called the instant after
      start() finds something to wait for. The thread's own fields -- its stack
      bounds, its shadow stack, where it parked -- are filled in by the thread
      itself, and are read by the collector only after the thread has stopped,
      which is after it filled them in. */
   t->state = TY_TH_RUNNING;
-  registry_add(t);
+  t->finished = 0;
+  t->started = 1;
+  if (reused) {
+    /* Already in the list: this is the entry ty_thread_next_id made. */
+    registry_make_live(t);
+  } else {
+    registry_insert(t, 1);
+  }
 
   k->t = t;
   k->fn = fn;
@@ -526,18 +573,55 @@ int64_t ty_thread_next_id(void) {
   typlat_mutex_lock(&world_mtx);
   id = ++thread_seq;
   typlat_mutex_unlock(&world_mtx);
+  /* The entry exists from construction, not from start(): java.lang.Thread's
+     interrupt status belongs to the Thread object, and a program may interrupt
+     one that has not started and read the status back. It is registered as not
+     live, so it neither keeps the process alive nor is scanned; start() makes
+     it live (ty_thread_spawn). */
+  tythread *t = (tythread *)calloc(1, sizeof(tythread));
+  if (!t) abort();
+  typlat_mutex_init(&t->mtx);
+  typlat_cond_init(&t->cv);
+  t->id = id;
+  t->state = TY_TH_DONE;
+  t->finished = 1;
+  registry_insert(t, 0);
   return id;
 }
 
-void ty_thread_join(int64_t id) {
+int32_t ty_thread_join(int64_t id) {
   tythread *t = registry_find(id);
-  if (!t) return; /* never started: java.lang.Thread.join returns at once */
+  if (!t) return 0; /* never started: java.lang.Thread.join returns at once */
+  tythread *self = ty_self;
+  int32_t intr = 0;
   TY_PARK_BEGIN();
   stopped_begin(TY_TH_BLOCKED);
   typlat_mutex_lock(&t->mtx);
-  while (!t->finished) typlat_cond_wait(&t->cv, &t->mtx);
+  /* Published so interrupt() can reach the condition variable this wait is
+     asleep on: the target's, which is not the joiner's own. A self-join has
+     nothing to publish -- the target's variable is already the one this thread
+     waits on -- and publishing it would take this thread's mutex twice. */
+  if (t != self) __atomic_store_n(&self->join_target, t, __ATOMIC_SEQ_CST);
+  int32_t waited = 0;
+  while (!t->finished) {
+    if (__atomic_load_n(&self->interrupted, __ATOMIC_SEQ_CST)) {
+      intr = 1;
+      break;
+    }
+    waited = 1;
+    typlat_cond_wait(&t->cv, &t->mtx);
+  }
+  if (t != self) __atomic_store_n(&self->join_target, NULL, __ATOMIC_SEQ_CST);
+  /* An interrupt that arrived as the target finished is still an interrupt:
+     java.lang.Thread.join throws when the status is set by the time a wait it
+     actually entered ends. A thread that was already finished when join() was
+     called never waited at all, and JDK's join leaves the status alone then --
+     it is a wait on the target object that throws, and there was none. */
+  if (waited && !intr && __atomic_load_n(&self->interrupted, __ATOMIC_SEQ_CST)) intr = 1;
+  if (intr) __atomic_store_n(&self->interrupted, 0, __ATOMIC_SEQ_CST);
   typlat_mutex_unlock(&t->mtx);
   stopped_end();
+  return intr;
 }
 
 int32_t ty_thread_alive(int64_t id) {
@@ -545,21 +629,78 @@ int32_t ty_thread_alive(int64_t id) {
   return t && !t->finished;
 }
 
-void ty_thread_sleep_ms(int64_t millis) {
+/* A forward declaration: the monitor struct is defined below, with the rest of
+   the monitor machinery, and this is the only thread function that has to look
+   inside it. */
+static void interrupt_wake(tythread *t);
+
+void ty_thread_interrupt(int64_t id) {
+  tythread *t = registry_find(id);
+  if (!t) return;
+  /* The status is a property of the Thread object, so it is set even when the
+     thread has not started or has finished -- java.lang.Thread does the same,
+     and isInterrupted() answers it. Only a live thread has something to wake. */
+  __atomic_store_n(&t->interrupted, 1, __ATOMIC_SEQ_CST);
+  typlat_mutex_lock(&t->mtx);
+  int32_t done = t->finished;
+  typlat_mutex_unlock(&t->mtx);
+  /* A thread that interrupts itself is not inside a blocking call that could
+     be woken -- it is running this -- and waking it would mean taking its own
+     mutex from under itself. */
+  if (!done && t != ty_self) interrupt_wake(t);
+}
+
+int32_t ty_thread_is_interrupted(int64_t id) {
+  tythread *t = registry_find(id);
+  if (!t) return 0;
+  return __atomic_load_n(&t->interrupted, __ATOMIC_SEQ_CST);
+}
+
+int32_t ty_thread_clear_interrupted(void) {
+  return __atomic_exchange_n(&ty_self->interrupted, 0, __ATOMIC_SEQ_CST);
+}
+
+int32_t ty_thread_current_daemon(void) { return ty_self->daemon; }
+
+int32_t ty_thread_sleep_ms(int64_t millis) {
   if (millis <= 0) {
     /* Java's own two cases: a negative duration is an IllegalArgumentException,
        and sleep(0) is a yield rather than a wait. */
     if (millis < 0) ty_throw(ty_illarg("timeout value is negative"));
     ty_thread_yield();
-    return;
+    /* sleep(0) is a yield, but it still notices an interrupt that is already
+       set: the JDK throws InterruptedException for sleep(0) on an interrupted
+       thread, and clears the status. */
+    return __atomic_exchange_n(&ty_self->interrupted, 0, __ATOMIC_SEQ_CST);
   }
+  tythread *self = ty_self;
+  int32_t intr = 0;
   TY_PARK_BEGIN();
   stopped_begin(TY_TH_BLOCKED);
-  /* The wait itself is the platform layer's: a millisecond argument is normal
-     here, and the whole duration is what Java's Thread.sleep promises, so the
-     layer restarts it after a signal rather than truncating it. */
-  typlat_sleep_ns(millis * 1000000);
+  /* The wait is on the thread's own condition variable rather than in the
+     platform layer's sleep, because interrupt() has to be able to end it: a
+     signal could do that too, but a predicate and a broadcast is the same
+     mechanism join() and Object.wait already use, and it needs no handler. The
+     deadline is recomputed every time round so that a wake-up that was not an
+     interrupt (a collection's broadcast, or the operating system) sleeps for
+     the part of the duration that is left rather than starting it again. */
+  typlat_mutex_lock(&self->mtx);
+  int64_t ns = millis > INT64_MAX / 1000000 ? INT64_MAX : millis * 1000000;
+  int64_t now = ty_nanos();
+  int64_t deadline = ns > INT64_MAX - now ? INT64_MAX : now + ns;
+  for (;;) {
+    if (__atomic_load_n(&self->interrupted, __ATOMIC_SEQ_CST)) {
+      intr = 1;
+      break;
+    }
+    int64_t left = deadline - ty_nanos();
+    if (left <= 0) break;
+    typlat_cond_timedwait(&self->cv, &self->mtx, left);
+  }
+  if (intr) __atomic_store_n(&self->interrupted, 0, __ATOMIC_SEQ_CST);
+  typlat_mutex_unlock(&self->mtx);
   stopped_end();
+  return intr;
 }
 
 int64_t ty_thread_current_id(void) { return ty_self->id; }
@@ -578,9 +719,11 @@ void ty_thread_join_all(void) {
   TY_PARK_BEGIN();
   stopped_begin(TY_TH_BLOCKED);
   typlat_mutex_lock(&world_mtx);
-  /* Every thread but this one. A thread that is started while this waits is
+  /* Every non-daemon thread but this one. A daemon that is still running when
+     the last non-daemon thread ends does not keep the process alive -- that is
+     what a daemon is for -- and a thread that is started while this waits is
      counted when it is registered, so the condition covers it too. */
-  while (n_live > 1) typlat_cond_wait(&world_cv, &world_mtx);
+  while (n_live - n_daemon > 1) typlat_cond_wait(&world_cv, &world_mtx);
   typlat_mutex_unlock(&world_mtx);
   stopped_end();
 }
@@ -605,12 +748,12 @@ static void *thread_body(void *p) {
   return NULL;
 }
 
-int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t sel) {
+int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int32_t sel) {
   body_args *b = (body_args *)malloc(sizeof(body_args));
   if (!b) abort();
   b->obj = obj;
   b->sel = sel;
-  return ty_thread_spawn(thread_body, b, obj, id, name);
+  return ty_thread_spawn(thread_body, b, obj, id, name, daemon);
 }
 
 /* ----------------------------------------------------------------- monitors */
@@ -725,6 +868,36 @@ static tymon *mon_get(void *obj) {
   }
 }
 
+/* Wake a thread that interrupt() has just marked. A blocked thread is asleep on
+   one of three condition variables, and this broadcasts the one it published:
+   its own (sleep), the monitor's (Object.wait), or the target's (join).
+
+   The publishes and the loads here are seq_cst rather than release/acquire
+   because the flag and the published wait are two variables written in
+   opposite orders by the two threads, and a release store plus an acquire load
+   would leave the classic store-buffer interleaving possible: the interrupter
+   stores the flag then reads a stale NULL, the waiter stores the monitor then
+   reads a stale zero, and the waiter sleeps through an interrupt that will
+   never be repeated. Seq_cst puts both stores in one total order, so at least
+   one of the two reads sees the other's store. */
+static void interrupt_wake(tythread *t) {
+  typlat_mutex_lock(&t->mtx);
+  typlat_cond_broadcast(&t->cv);
+  typlat_mutex_unlock(&t->mtx);
+  tymon *m = (tymon *)__atomic_load_n(&t->wait_mon, __ATOMIC_SEQ_CST);
+  if (m) {
+    typlat_mutex_lock(&m->mtx);
+    typlat_cond_broadcast(&m->wcv);
+    typlat_mutex_unlock(&m->mtx);
+  }
+  tythread *jt = (tythread *)__atomic_load_n(&t->join_target, __ATOMIC_SEQ_CST);
+  if (jt) {
+    typlat_mutex_lock(&jt->mtx);
+    typlat_cond_broadcast(&jt->cv);
+    typlat_mutex_unlock(&jt->mtx);
+  }
+}
+
 void ty_sync_enter(void *obj) {
   tymon *m = mon_get(obj);
   typlat_mutex_lock(&m->mtx);
@@ -757,12 +930,20 @@ void ty_sync_exit(void *obj) {
   typlat_mutex_unlock(&m->mtx);
 }
 
-void ty_mon_wait(void *obj, int64_t millis) {
+int32_t ty_mon_wait(void *obj, int64_t millis) {
   tymon *m = mon_get(obj);
   typlat_mutex_lock(&m->mtx);
   if (!m->owned || !typlat_thread_same(m->owner, typlat_thread_self())) {
     typlat_mutex_unlock(&m->mtx);
     ty_throw(ty_make_ex(TY_ILLMON, "current thread is not owner"));
+  }
+  /* An interrupt that arrived before the wait starts is thrown rather than
+     slept through, and the monitor is still held when this returns -- which is
+     where the caller's synchronized block expects it. */
+  if (__atomic_load_n(&ty_self->interrupted, __ATOMIC_SEQ_CST)) {
+    __atomic_store_n(&ty_self->interrupted, 0, __ATOMIC_SEQ_CST);
+    typlat_mutex_unlock(&m->mtx);
+    return 1;
   }
   /* wait() gives the monitor up: the notification can only arrive from another
      thread if this one is not holding the lock while it waits. */
@@ -784,14 +965,27 @@ void ty_mon_wait(void *obj, int64_t millis) {
      The root is exact rather than conservative because the runtime holds it in a
      register whose spill the scan of this stopped thread may not reach. */
   TY_ROOT_PUSH(obj);
+  /* Published so that interrupt() can broadcast this monitor's wait variable:
+     the waiter sleeps on the monitor's, not on its own. The store is seq_cst
+     and the interrupter's load of it is too, which is what makes one of the two
+     orderings below impossible: either this store is seen and the broadcast
+     arrives, or the interrupter's store of the flag is seen by the test in the
+     loop below before this thread sleeps. See interrupt_wake. */
+  __atomic_store_n(&ty_self->wait_mon, m, __ATOMIC_SEQ_CST);
   /* The deadline is on the monotonic clock, which is what a duration has to be
      measured against, and what is handed to the wait below is the part of it
      that is left. The layer turns that duration into a deadline on whatever
      clock the condition variable actually uses -- on Linux the same monotonic
      one, on Windows the wall clock winpthreads insists on -- so the two clocks
      never have to be reconciled here. */
+  int32_t intr = 0;
   int64_t deadline = millis < 0 ? -1 : ty_nanos() + millis * 1000000;
-  while (m->notified == mine) {
+  for (;;) {
+    if (__atomic_load_n(&ty_self->interrupted, __ATOMIC_SEQ_CST)) {
+      intr = 1;
+      break;
+    }
+    if (m->notified != mine) break;
     if (deadline < 0) {
       ty_thread_stopped_begin();
       typlat_cond_wait(&m->wcv, &m->mtx);
@@ -805,6 +999,7 @@ void ty_mon_wait(void *obj, int64_t millis) {
       if (timed_out) break;
     }
   }
+  __atomic_store_n(&ty_self->wait_mon, NULL, __ATOMIC_SEQ_CST);
   m->waiters--;
   TY_ROOT_POP();
   /* Take the monitor back, exactly as entering it does. */
@@ -816,7 +1011,20 @@ void ty_mon_wait(void *obj, int64_t millis) {
   m->owned = 1;
   m->owner = typlat_thread_self();
   m->count = saved;
+  /* Same rule as join: an interrupt that arrived while the monitor was being
+     taken back is thrown rather than left pending, and the monitor is held when
+     it is. */
+  if (!intr && __atomic_load_n(&ty_self->interrupted, __ATOMIC_SEQ_CST)) intr = 1;
   typlat_mutex_unlock(&m->mtx);
+  /* The status is cleared before the exception is thrown, as java.lang.Object
+     promises, and the monitor is held again when it is: this returns to a
+     Teyru `wait` wrapper, which throws while the synchronized block still owns
+     the monitor, exactly as the JDK's native wait does. */
+  if (intr) {
+    __atomic_store_n(&ty_self->interrupted, 0, __ATOMIC_SEQ_CST);
+    return 1;
+  }
+  return 0;
 }
 
 void ty_mon_notify(void *obj) {
