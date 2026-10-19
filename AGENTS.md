@@ -276,7 +276,7 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   一個受檢例外時，外層 `try` 的 catch 子句必須能接住它，或外圍方法／建構子／初始化器
   必須宣告它；catch 子型別不涵蓋宣告的超型別、`finally` 不接例外，lambda 的 body 以
   函式介面的 `throws` 為準。診斷是 `TY-TYP-0122`，測試是
-  `tests/programs/t288_checked_exceptions.teyru` 與
+  `tests/programs/t306_checked_exceptions.teyru` 與
   `tests/diagnostics/{uncaughtCheckedCall,uncaughtCheckedThrow,finallyDoesNotCatch,checkedInLambda}.teyru`。
   標準程式庫**自己的 body** 不在這條規則內，因為它被當成已編譯的相依（javac 也不檢查
   JDK 原始碼）：它的 140 個違規（12 個檔案；ZipException 51、IOException 26、
@@ -291,7 +291,7 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   允許，與 Java 相同）、每個被允許的子型別必須是 `final`、`sealed` 或 `non-sealed`。
   因此沒有 `permits` 的 sealed 型別在 switch 窮盡性上不再不可判定：同檔案的直接子型別
   就是 permit 集合。診斷是 `TY-TYP-0119`／`0120`／`0121`，測試是
-  `tests/programs/t289_sealed_permits.teyru` 與 `tests/diagnostics/sealed*.teyru`。
+  `tests/programs/t307_sealed_permits.teyru` 與 `tests/diagnostics/sealed*.teyru`。
 - 反射在 `lib/26_reflect.teyru`：`Class`、`Field`、`Method`、`Constructor`、
   `Modifier`、`Array` 與 `java.lang.reflect` 的六個例外，讀的是編譯器為每個類別
   產生的靜態表（欄位、方法、修飾子、列舉常數），所以查一次資料是走一次陣列，
