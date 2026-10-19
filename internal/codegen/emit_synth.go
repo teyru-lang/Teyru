@@ -222,6 +222,7 @@ func (e *Emitter) enumValues(cl *ast.Class, m *ast.Method) {
 		vals = append(vals, "((void*)G_"+mangle(cl.Full)+"_"+mangle(f.Name)+")")
 	}
 	e.line("tyarr* _a = ty_array_new(%d, 8);\n", len(vals))
+	e.line("_a->obj.cls = &%s;\n", e.arrayClassFor(&ast.ClassType{Class: cl}))
 	e.line("_a->refs = 1;\n")
 	for i, v := range vals {
 		e.line("((void**)_a->data)[%d] = %s;\n", i, v)

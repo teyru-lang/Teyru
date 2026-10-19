@@ -695,7 +695,8 @@ func (e *Emitter) packVarargs(parts []seqOperand, m *ast.Method) []seqOperand {
 	elem := m.Params[len(m.Params)-1].(*ast.ArrayType).Elem
 	es := e.elemSize(elem)
 	var b strings.Builder
-	b.WriteString("({ tyarr* _va = ty_array_new(" + fmt.Sprint(len(tail)) + ", " + es + ");")
+	b.WriteString("({ tyarr* _va = ty_array_new(" + fmt.Sprint(len(tail)) + ", " + es + "); _va->obj.cls = &" +
+		e.arrayClassFor(elem) + ";")
 	if e.isRef(elem) {
 		b.WriteString(" _va->refs = 1;")
 	}

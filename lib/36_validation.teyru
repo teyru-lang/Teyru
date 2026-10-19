@@ -81,6 +81,9 @@ class Validation {
     if (annos.length == 0) {
       return
     }
+    // A constraint is read off the field it was written on, and a bean's fields
+    // are usually private: the validator is the caller.
+    f.setAccessible(true)
     Object value = f.get(bean)
     Annotation a = BeanScanner.has(annos, "NotNull")
     if (a != null && value == null) {

@@ -145,6 +145,21 @@ typedef struct tyannotation {
   int32_t nargs;
 } tyannotation;
 
+/* A generic signature: the erased raw type and one level of type arguments,
+   which is all the language keeps (see internal/codegen/reflect.go).
+
+   nargs < 0 means the declaration is generic in a way this runtime cannot
+   represent -- a wildcard, a type variable, or a type argument that is itself
+   parameterized. Reflection refuses such a signature with
+   UnsupportedOperationException rather than answering the erased type, because
+   the erased type is a different answer and not a shorter one. */
+typedef struct tysig {
+  tyclass *raw;
+  const tyclass **args;
+  int32_t nargs;
+  const char *why; /* why the signature cannot be represented, when nargs < 0 */
+} tysig;
+
 typedef struct tyfield {
   const char *name;
   tyclass *type;
@@ -161,6 +176,9 @@ typedef struct tyfield {
      reader that only has the erased type reads it here
      (Field.getElementType, lib/26_reflect.teyru). */
   tyclass *elem;
+  /* the declared generic type: raw type plus one level of arguments, or NULL
+     when the declared type is not parameterized (Field.getGenericType). */
+  const tysig *gsig;
 } tyfield;
 
 typedef struct tymethod {
@@ -185,6 +203,11 @@ typedef struct tymethod {
      from: a route's @RequestParam takes the name the parameter was written
      with unless the annotation says otherwise. */
   const char *const *pnames;
+  /* the declared generic signature of the result and of each parameter, one
+     level deep (Method.getGenericReturnType/getGenericParameterTypes). A NULL
+     entry means the parameter's type is not parameterized. */
+  const tysig *gret;
+  const tysig *const *gparams;
 } tymethod;
 
 struct tyclass {
@@ -226,6 +249,14 @@ struct tyclass {
      binary name: that is what Class.forName looks a class up by, and a program
      may write either spelling there. */
   const char *jname;
+  /* The component class of an array class, NULL for everything else. It is
+     what Class.getComponentType answers. */
+  tyclass *comp;
+  /* The declared generic superclass: raw type plus one level of arguments, or
+     NULL when the superclass is not parameterized (Class.getGenericSuperclass).
+     It is written beside the class record rather than in the member tables
+     because it describes the class itself. */
+  const tysig *gsig;
 };
 
 /* Class handles installed by generated startup code. */
@@ -1067,6 +1098,28 @@ tystr *ty_class_simplename(int64_t cm);
 int32_t ty_class_enumcount(int64_t cm);
 void *ty_class_enumat(int64_t cm, int32_t i);
 int64_t ty_class_superof(int64_t cm);
+/* The component class of an array class, 0 for anything else. */
+int64_t ty_class_component(int64_t cm);
+/* The array class whose component is comp, from the table the program emits,
+   or NULL when that array class was not emitted. */
+tyclass *ty_prog_array_of(tyclass *comp);
+/* Class.arrayOf: the array class of a component, as a Class value (NULL when
+   the program carries no such array class). */
+void *ty_class_arrayof(void *c, tyclass *clscls);
+
+/* Generic signatures. Each takes the handle of a tysig record, which is static
+   data; 0 means "not parameterized", and the prelude answers the erased type
+   in that case. */
+int64_t ty_field_sig(int64_t cm, int32_t declared, int32_t i);
+int64_t ty_method_sigret(int64_t cm, int32_t declared, int32_t i);
+int64_t ty_method_sigparam(int64_t cm, int32_t declared, int32_t i, int32_t p);
+int64_t ty_ctor_sigparam(int64_t cm, int32_t i, int32_t p);
+int64_t ty_class_sig(int64_t cm);
+int64_t ty_sig_raw(int64_t sig);
+int32_t ty_sig_argcount(int64_t sig);
+int64_t ty_sig_arg(int64_t sig, int32_t i);
+int32_t ty_sig_ok(int64_t sig);
+tystr *ty_sig_why(int64_t sig);
 
 /* forName: the name is matched against the program's own class names, the
    binary names Java uses ("teyru.List", "main.Outer$Inner"). clscls is the

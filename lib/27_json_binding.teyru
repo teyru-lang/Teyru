@@ -48,6 +48,9 @@ class JsonFields {
     for (int i = 0 : i < all.length : i++) {
       if (bindable(all[i], config, forWrite)) {
         out[at] = all[i]
+        // Gson binds private and package-private fields, and reflection refuses
+        // a non-public member until the reader says it may have it.
+        out[at].setAccessible(true)
         at++
       }
     }
@@ -765,6 +768,9 @@ class ReflectReader implements JsonReader2 {
   private Object readRecord(JsonElement e) {
     JsonObject o = e.getAsJsonObject()
     Constructor ctor = type.getDeclaredConstructors()[0]
+    // A record's canonical constructor is as accessible as the record itself,
+    // which may be package-private.
+    ctor.setAccessible(true)
     Object[] args = new Object[fields.length]
     for (int i = 0 : i < fields.length : i++) {
       JsonElement v = memberOf(o, i)

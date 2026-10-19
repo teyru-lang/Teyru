@@ -882,6 +882,7 @@ func (c *Checker) resolveTypeNoDims(env *typeEnv, te *ast.TypeExpr) ast.Type {
 		c.ensureTypeParams(cl)
 		if len(cl.TypeParams) > 0 {
 			// raw type: use bounds
+			ct.Raw = true
 			for _, tv := range cl.TypeParams {
 				ct.Args = append(ct.Args, c.erasure(tv.Bound))
 			}

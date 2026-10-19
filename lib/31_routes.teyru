@@ -25,6 +25,9 @@ class RouteHandler implements Handler {
   public RouteHandler(Class owner, Method method) {
     this.owner = owner
     this.method = method
+    // A handler is a member of its controller, and a route is registered for it
+    // whatever its access is: the framework is the caller.
+    this.method.setAccessible(true)
   }
 
   public Object handle(ApplicationContext ctx, HttpRequest req, Map<String, String> vars) {

@@ -61,6 +61,12 @@ func (p *PrimType) IsIntegral() bool { return p.Kind >= Byte && p.Kind <= Long }
 type ClassType struct {
 	Class *Class
 	Args  []Type
+	// Raw is a class written without type arguments where it declares some:
+	// `List x`. The checker fills Args with the bounds so the rest of the
+	// compiler has a type to work with, and reflection needs the difference:
+	// Java answers the raw Class for a raw declaration and a ParameterizedType
+	// for an explicit one, even when the arguments erase to the same bounds.
+	Raw bool
 }
 
 // A type half-built by inference can reach String() with a nil Class or nil

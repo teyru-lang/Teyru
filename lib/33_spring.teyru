@@ -375,6 +375,9 @@ class WebAdvice {
         if (want.isAssignableFrom(e.getClass()) == false) {
           continue
         }
+        // The advice method is a member of the advice class, whatever its
+        // access is.
+        ms[i].setAccessible(true)
         Object out = ms[i].getParameterCount() == 0 ? ms[i].invoke(bean)
             : ms[i].invoke(bean, e)
         return RouteResponse.of(out)

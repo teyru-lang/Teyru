@@ -279,8 +279,11 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   `Modifier`、`Array` 與 `java.lang.reflect` 的六個例外，讀的是編譯器為每個類別
   產生的靜態表（欄位、方法、修飾子、列舉常數），所以查一次資料是走一次陣列，
   執行期不建表。與 Java 的差異（都已實測，不是未驗證）：
-  - 類別名是 Teyru 的：`String.class.getName()` 是 `teyru.String`，
-    `Class.forName` 兩種寫法都收（`java.lang.String` 會找到同一類別）。
+  - 類別名是 JDK 的（D8）：`String.class.getName()` 是 `java.lang.String`，
+    `Class.forName` 兩種寫法都收（`java.lang.String` 與 `teyru.String` 會找到
+    同一類別）。陣列的 `getName()` 是原始碼形式（`int[]`、`java.lang.String[]`，
+    等同 JDK 的 `getTypeName()`）；二元描述子（`[I`、`[Ljava.lang.String;`）
+    是 `Class.forName` 解析的名字。
   - 註解反射有，但元素是**按名字讀**：`Class`／`Field`／`Method`／`Constructor`
     上的 `getAnnotations()`、`getAnnotation(Class)`、`isAnnotationPresent(Class)` 是
     Java 的，`Annotation` 則沒有「每個註解型別一個實作類別」——所以要
@@ -288,14 +291,35 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
     `classValue`／`enumValue`，而不是 Java 的 `ann.value()`。沒寫的元素讀得到介面
     宣告的預設值（parser 保留 `default`）；`@Retention` 收得下但沒有作用；陣列型別
     的元素值不帶（讀它會說不支援）。
-  - 所有陣列共用一個類別，因此沒有 `getComponentType`、沒有每個元素型別的陣列
-    類別，`forName("[I")` 也沒有東西可回答。
-  - 沒有泛型型別參數的反射（`getGenericType` 等不存在）。
+  - 每個元素型別有自己的陣列類別：`int[].class`、`String[].class`、
+    `Person[].class` 是不同類別，`getComponentType()` 回答元素類別，
+    `forName("[I")`／`forName("[[I")`／`forName("[Ljava.lang.String;")` 解析
+    描述子。陣列值由產生程式碼與 `Array.newInstance` 建立時帶上自己的類別；
+    **執行期自己建的陣列**（例如 `String.toCharArray()`）仍帶共用的
+    `teyru.Array`，`Array.newInstance` 對一個沒有被發出的元素類別也退回它。
+    陣列類別只為可達的元素型別發出（`internal/codegen/arrayclass.go`，與成員表
+    同一套可達性分析），所以沒有反射、也沒有寫出陣列型別的程式不付這筆成本。
+    所有陣列類別的父類別是 `teyru.Array`，因此 `instanceof` 與轉型到陣列型別
+    的答案不變；`getSuperclass()` 依 Java 回答 `Object`。
+  - 泛型型別反射是**一層**：`Field.getGenericType()`、`Method` 的
+    `getGenericReturnType()`／`getGenericParameterTypes()`、
+    `Constructor.getGenericParameterTypes()` 與 `Class.getGenericSuperclass()`
+    回答 `ParameterizedType`（`getRawType()`／`getActualTypeArguments()`，
+    元素是 `Class`）。沒有型別引數的宣告回答它的 `Class`，raw 宣告也是。
+    **不能表示的就明確拒絕**：萬用字元、型別變數、超過一層的參數化型別都拋
+    `UnsupportedOperationException` 並說明原因，不會回傳抹除後的型別。
+    `java.lang.reflect.Type` 只有 `Class` 與 `ParameterizedType` 兩個實作，
+    沒有 `WildcardType`、`TypeVariable`、`GenericArrayType`。
   - 原生型別的取值器只收完全相符的裝箱型別，Java 的拓寬（例如對 `byte` 欄位
     呼叫 `getInt`）在這裡是 `IllegalArgumentException`。
-  - 存取控制不檢查：私有成員可以直接讀寫。final 一律攔，`setAccessible(true)`
-    之後可以寫 instance final，但 static final 一律拒絕（javac 也是這樣：JDK 不再
-    讓它通過，即使 setAccessible 過）。
+  - 存取控制會檢查：`Field.get`／`set`、`Method.invoke`、`Constructor.newInstance`
+    對 private／protected／package-private 成員拋 `IllegalAccessException`，
+    `setAccessible(true)` 之後放行。這裡沒有「呼叫者類別」可查，所以不像 Java
+    那樣允許同套件或子類別的存取——非 public 一律拒絕，直到程式明確放行。
+    final 一律攔，`setAccessible(true)` 之後可以寫 instance final，但 static
+    final 一律拒絕（javac 也是這樣：JDK 不再讓它通過，即使 setAccessible 過）。
+    標準程式庫自己讀私有成員的地方（Gson、容器注入、驗證、路由）都先呼叫
+    `setAccessible(true)`。
   - 內部類別與區域類別不能被反射建構（沒有外圍實例可用）。
   - 成員表（欄位、方法與 invoker）只在使用者程式真的可能用到反射時才寫進執行檔
     （`emit.go` 的 `reflectUsed`）：它們是唯一會指名別的類別的中繼資料，擺在檔案
