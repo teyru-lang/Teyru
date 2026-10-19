@@ -931,8 +931,8 @@ int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel
    `m` for the duration as pthread_cond_wait does. A negative timeout waits
    forever. The timed form answers 1 when the timeout passed.
 
-   ty_wait_fd waits until `fd` is ready for reading (events == 0) or writing
-   (events == 1), or until timeout_ms passes (-1 waits forever). It answers 1
+   ty_wait_fd waits until `fd` is ready for reading (events == 1) or writing
+   (events == 2), or until timeout_ms passes (-1 waits forever). It answers 1
    ready, 0 timed out, or a negative error code. */
 void ty_cond_wait(typlat_cond *c, typlat_mutex *m);
 int32_t ty_cond_timedwait(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns);

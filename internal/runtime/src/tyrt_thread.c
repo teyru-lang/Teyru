@@ -785,11 +785,11 @@ void ty_cond_broadcast(typlat_cond *c) {
 
 int32_t ty_wait_fd(int32_t fd, int32_t events, int32_t timeout_ms) {
   if (!ty_self->is_virtual) {
-#if !defined(_WIN32)
-    return typlat_socket_wait(fd, events != 0, timeout_ms);
-#else
-    return -EINVAL; /* no virtual threads on Windows, so no caller */
-#endif
+    /* events is 1 for readable and 2 for writable (the convention the virtual
+       path's poll set uses); the platform call takes a for_write flag. Getting
+       this backwards polls a listening socket for writability and then blocks
+       in accept, which is exactly the timeout t98_net_basic reported. */
+    return typlat_socket_wait(fd, events == 2, timeout_ms);
   }
   int64_t deadline = timeout_ms < 0 ? 0 : ty_nanos() + (int64_t)timeout_ms * 1000000;
   if (vt_park(fd, events, deadline)) return 0;
