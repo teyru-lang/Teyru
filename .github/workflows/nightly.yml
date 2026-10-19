@@ -1,0 +1,51 @@
+name: nightly
+
+# What this catches: the gcc leg of the C back end. The compiler prefers clang
+# when both are installed, so every other workflow and a developer's machine
+# build with clang and a gcc-only break -- a diagnostic difference, a GNU
+# extension assumed away, a construct gcc rejects -- would reach a release
+# unseen. This runs the same build, vet and suite as ci.yml once a day, and by
+# hand, with the C compiler forced to gcc and a longer deadline because the
+# runner's gcc links the suite more slowly.
+#
+# TEYRU_CC is what the compiler reads (internal/driver.findCC), and CC is what
+# tests/run.sh reads; both are set so that a build started either way uses gcc.
+
+on:
+  schedule:
+    # Daily, off the hour so the run does not compete with the scheduled jobs
+    # every other repository starts at :00.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build, vet and test with gcc
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+      TEYRU_CC: gcc
+    steps:
+      - name: check out the tree and the suite submodule
+        uses: actions/checkout@v4
+        with:
+          # tests/ is the teyru-lang/tests submodule and the suite is its data
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: the whole suite through go test, building with gcc
+        timeout-minutes: 90
+        run: go test ./... -count=1 -timeout 90m
