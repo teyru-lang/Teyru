@@ -69,12 +69,11 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 		return e.arrayMethod(f, c)
 	}
 	if e.needsReflection(f, m) {
-		// The C back end writes the member tables when a call site like this
-		// exists; this back end does not write them at all, so the program is
-		// refused here rather than built into one whose reflection answers
-		// NoSuchMethodException at run time -- which is a wrong answer, not a
-		// missing feature.
-		e.refuse(c.GetPos(), "a reflective call (%s.%s): the llvm back end does not write the member tables java.lang.reflect reads", m.Owner.Full, m.Name)
+		// The member tables are written, but the invoker convention behind
+		// these calls is not lowered here: a descriptor's `fn` is a stub. The
+		// program is refused at compile time rather than built into one whose
+		// reflective call stops at that stub.
+		e.refuse(c.GetPos(), "a reflective call (%s.%s): the llvm back end does not lower the boxed-argument invoker these calls use", m.Owner.Full, m.Name)
 	}
 	recv := ""
 	if !m.IsStatic() {
@@ -104,6 +103,27 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 		// a direct call to a body this back end has not verified.
 		if c.Super {
 			e.refuse(c.GetPos(), "Iface.super.%s(): the llvm back end does not lower a call to a specific interface's default (it dispatches through the receiver, which would reach an override)", m.Name)
+		}
+		// When every class in the program answers this selector with one
+		// implementation, the interface map lookup can only find it: bind the
+		// call. The C back end makes the same decision from the same scan
+		// (Emitter.devirtInterface), so the two back ends call the same
+		// function for the same program.
+		impl := e.devirtInterface(m)
+		if impl == nil && c.Recv != nil {
+			// A final receiver's static type is its dynamic type, so the one
+			// implementation is the class's interface-table entry even when
+			// other implementors of the interface disagree.
+			impl = e.cEmitter().finalReceiverImpl(m, c.Recv.GetType())
+		}
+		if impl != nil {
+			recvArg := recv
+			if c.Recv == nil {
+				recvArg = e.selfOperand(f)
+			} else {
+				e.nullCheck(f, recvArg, e.npeInvoke(m), callRecvCause(c))
+			}
+			return e.directCall(f, impl, recvArg, e.callArgs(f, impl, c, c.Args))
 		}
 		if c.Recv == nil {
 			return e.ifaceDispatch(f, m, value(e.selfOperand(f), e.refType()), e.callArgs(f, m, c, c.Args), c)
@@ -150,22 +170,70 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 			e.nullCheck(f, recv, e.npeInvoke(m), e.npeCause(c.Recv))
 			return e.directCall(f, m, recv, args)
 		}
+		if impl := e.cEmitter().finalReceiverImpl(m, c.Recv.GetType()); impl != nil {
+			e.nullCheck(f, recv, e.npeInvoke(m), e.npeCause(c.Recv))
+			return e.directCall(f, impl, recv, args)
+		}
 		return e.virtualCall(f, m, value(recv, c.Recv.GetType()), args, c)
 	}
 	return e.directCall(f, m, recv, args)
 }
 
-// needsReflection reports whether a call site can reach a member table. It is
-// the C back end's own predicate -- the one that decides whether the tables
-// ship -- asked at this back end's call sites, so that the two agree on which
-// programs are reflection users. The emitter state it needs (the class the call
-// is written in) is the one the C back end has at the same point.
+// devirtInterface is the C back end's whole-program interface decision, cached
+// here because each of its answers walks every class in the program.
+func (e *llvmEmitter) devirtInterface(m *ast.Method) *ast.Method {
+	if got, ok := e.ifaceDevirt[m]; ok {
+		return got
+	}
+	got := e.cEmitter().devirtInterface(m)
+	if e.ifaceDevirt == nil {
+		e.ifaceDevirt = map[*ast.Method]*ast.Method{}
+	}
+	e.ifaceDevirt[m] = got
+	return got
+}
+
+// needsReflection reports whether a call site is one this back end cannot
+// lower, even though the member tables it reads are written now.
+//
+// Reading the tables -- getDeclaredField, getMethod, getAnnotations and the
+// rest -- is supported: the tables are emitted (llvm_meta.go) and the runtime
+// reads them the same way in either build. What is not supported is the
+// invoker convention: Method.invoke and Constructor.newInstance call a method
+// with boxed arguments, and the descriptors' `fn` slots are stubs here (see
+// invokerTrap). A program that would call one is refused by name rather than
+// built into one whose call stops at the stub.
+//
+// Array's reflective entry points and the framework classes are refused for
+// their own reasons: Array.newInstance needs a class the backend does not
+// build, and the frameworks reflect on classes only their callers name, which
+// this back end has not been taught to follow.
+
 func (e *llvmEmitter) needsReflection(f *fb, m *ast.Method) bool {
+	if m == nil {
+		return false
+	}
 	ce := &Emitter{prog: e.p}
 	if f != nil && f.fn != nil {
 		ce.curClass = f.fn.Owner
 	}
-	return ce.reflectionCall(m)
+	// A call written inside the library is the library's business: the API's
+	// own bodies read tables the caller named, and refusing them would refuse
+	// every program that reflects at all.
+	if ce.curClass != nil && strings.HasPrefix(ce.curClass.Full, "teyru.") {
+		return false
+	}
+	switch m.Owner.Name {
+	case "Method":
+		return m.Name == "invoke"
+	case "Constructor":
+		return m.Name == "newInstance"
+	case "Array":
+		return true
+	case "Gson", "Application", "ApplicationContext", "BeanRegistry":
+		return true
+	}
+	return false
 }
 
 // ifaceMethod is the interface method of a given name and arity, or nil when the

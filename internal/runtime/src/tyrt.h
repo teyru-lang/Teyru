@@ -145,6 +145,21 @@ typedef struct tyannotation {
   int32_t nargs;
 } tyannotation;
 
+/* A generic signature: the erased raw type and one level of type arguments,
+   which is all the language keeps (see internal/codegen/reflect.go).
+
+   nargs < 0 means the declaration is generic in a way this runtime cannot
+   represent -- a wildcard, a type variable, or a type argument that is itself
+   parameterized. Reflection refuses such a signature with
+   UnsupportedOperationException rather than answering the erased type, because
+   the erased type is a different answer and not a shorter one. */
+typedef struct tysig {
+  tyclass *raw;
+  const tyclass **args;
+  int32_t nargs;
+  const char *why; /* why the signature cannot be represented, when nargs < 0 */
+} tysig;
+
 typedef struct tyfield {
   const char *name;
   tyclass *type;
@@ -161,6 +176,9 @@ typedef struct tyfield {
      reader that only has the erased type reads it here
      (Field.getElementType, lib/26_reflect.teyru). */
   tyclass *elem;
+  /* the declared generic type: raw type plus one level of arguments, or NULL
+     when the declared type is not parameterized (Field.getGenericType). */
+  const tysig *gsig;
 } tyfield;
 
 typedef struct tymethod {
@@ -185,6 +203,11 @@ typedef struct tymethod {
      from: a route's @RequestParam takes the name the parameter was written
      with unless the annotation says otherwise. */
   const char *const *pnames;
+  /* the declared generic signature of the result and of each parameter, one
+     level deep (Method.getGenericReturnType/getGenericParameterTypes). A NULL
+     entry means the parameter's type is not parameterized. */
+  const tysig *gret;
+  const tysig *const *gparams;
 } tymethod;
 
 struct tyclass {
@@ -226,6 +249,14 @@ struct tyclass {
      binary name: that is what Class.forName looks a class up by, and a program
      may write either spelling there. */
   const char *jname;
+  /* The component class of an array class, NULL for everything else. It is
+     what Class.getComponentType answers. */
+  tyclass *comp;
+  /* The declared generic superclass: raw type plus one level of arguments, or
+     NULL when the superclass is not parameterized (Class.getGenericSuperclass).
+     It is written beside the class record rather than in the member tables
+     because it describes the class itself. */
+  const tysig *gsig;
 };
 
 /* Class handles installed by generated startup code. */
@@ -577,6 +608,88 @@ struct tythread {
      thread's stack -- it outlives the thread -- so this, and not the operating
      system's idea of the thread, is what the program asks about. */
   int32_t finished;
+  /* Interrupt status: set by Thread.interrupt, read and cleared by the blocked
+     calls that throw InterruptedException and by Thread.interrupted(). It is
+     written by another thread, so every access goes through __atomic; the
+     blocking calls test it under the mutex of whatever they wait on, which is
+     what makes the wake-up and the test one operation rather than two. */
+  int32_t interrupted;
+  /* What this thread is waiting for, so that interrupt() can reach the
+     condition variable it is asleep on: the monitor it is inside Object.wait
+     for, or the registry entry it is joining. Both are published and read with
+     seq_cst atomics; see the comment on interrupt_wake in tyrt_thread.c for why
+     the lost-wakeup argument needs that and not a release store. */
+  void *wait_mon;
+  void *join_target;
+  /* Daemon status, as set before start(). The process ends when the last
+     non-daemon thread does, which is what ty_thread_join_all waits for. */
+  int32_t daemon;
+  /* Whether start() has run. A Thread object gets a registry entry when it is
+     built -- interrupt status is a property of the object, and java.lang.Thread
+     lets a program interrupt one that has not started -- and that entry is not
+     live until this is set. */
+  int32_t started;
+  /* ---- virtual threads (tyrt_thread.c) ---------------------------------
+
+     A virtual thread is a registry entry like any other -- it has an id, a
+     name, a Thread object, interrupt status, and a stack the collector scans --
+     but it is not an operating system thread. It runs on a carrier, and when
+     it blocks it is switched off that carrier and left here with `vstate`
+     saying what it is waiting for. The fields below are the scheduler's; the
+     stop-the-world protocol uses the ordinary ones above (`park_sp`,
+     `stack_base`, `stack_top`, `frames`, `stop_depth`, `state`) exactly as it
+     does for a platform thread, because a parked virtual thread is a stopped
+     thread with a stack that does not move.
+
+     `is_virtual` is the one flag every other file may read: the blocking
+     primitives ask it to decide whether to park or to wait on the platform. */
+  int32_t is_virtual;
+  /* TY_VT_* below. Guarded by the scheduler lock in tyrt_thread.c. */
+  int32_t vstate;
+  /* Set when a wake arrives while the thread is still running: the park it is
+     about to perform must return without switching out. */
+  int32_t vwake_pending;
+  /* Set by the scheduler when it made the thread runnable because its deadline
+     passed, and read by the blocking call when it resumes. */
+  int32_t vt_timedout;
+  /* What the parked thread waits for: a descriptor (-1 for none), the poll
+     events for it, and a monotonic deadline in nanoseconds (0 for none). */
+  int32_t vfd;
+  int32_t vevents;
+  int64_t vdeadline;
+  /* Links: the scheduler's run queue and blocked list use vprev/vnext, and a
+     condition variable's list of virtual waiters uses vwprev/vwnext. A thread
+     is on at most one scheduler list and at most one condition list at a time. */
+  struct tythread *vprev, *vnext;
+  struct tythread *vwprev, *vwnext;
+  /* A carrier's private batch of runnable threads, taken from the shared run
+     queue a handful at a time so that the queue's lock is not touched once per
+     switch. Only the carrier that owns the batch touches these. */
+  struct tythread *vlocal_head, *vlocal_tail;
+  /* The condition variable this thread is parked on, or NULL. Kept so that a
+     wake that is not a notification -- an interrupt, or a deadline -- can take
+     the thread off that variable's list, rather than leaving a notification to
+     be spent on a thread that is no longer waiting. */
+  void *vwait_cv;
+  /* The waiter-list entry for vwait_cv, so taking the thread off that list is
+     a pointer write rather than a hash lookup. */
+  void *vwait_q;
+  /* The continuation: a ucontext_t on POSIX (NULL on Windows, where virtual
+     threads are refused), and the mmap'd stack it runs on. */
+  void *vctx;
+  char *vstack;
+  size_t vstack_bytes;
+  /* The carrier this thread is running on, or ran on last. Written by the
+     carrier before it switches in and read by the thread when it parks. */
+  struct tythread *vcarrier;
+  /* Saved across a context switch: the exception handler chain, and this
+     thread's stack limit (ty_stack_limit is per thread and a carrier serves
+     many). `frames` above is the third one, published by park_point. */
+  void *catch_chain;
+  char *stack_limit;
+  /* The interface selector of Runnable.run, which the virtual thread's entry
+     uses to reach the program's own run() the way thread_body does. */
+  int32_t vsel;
   struct tythread *next;  /* the registry the collector walks */
 };
 
@@ -590,6 +703,16 @@ struct tythread {
 #define TY_TH_PARKED 1
 #define TY_TH_BLOCKED 2
 #define TY_TH_DONE 3
+
+/* A virtual thread's scheduler state. RUNNING is on a carrier; RUNNABLE is in
+   the run queue; PARKING is between "I am about to switch out" and the carrier
+   having saved the context; PARKED is off every carrier and waiting; DONE is
+   finished and its stack is being released. */
+#define TY_VT_RUNNING 0
+#define TY_VT_RUNNABLE 1
+#define TY_VT_PARKING 2
+#define TY_VT_PARKED 3
+#define TY_VT_DONE 4
 
 extern _Thread_local tythread *ty_self;
 
@@ -743,13 +866,31 @@ void *ty_thread_start(void *(*fn)(void *), void *arg);
    object was given when it was built, so Thread.getId() is the same number
    before and after start(). name is what an uncaught exception prints. Returns
    id. */
-int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, tystr *name);
-/* The id Thread.getId() reports for a Thread object that was never started: a
-   counter that only ever goes up, as java.lang.Thread's does. */
+int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, tystr *name,
+                        int32_t daemon);
+/* The id Thread.getId() reports for a Thread object, assigned when the object
+   is built: a counter that only ever goes up, as java.lang.Thread's does. It
+   also makes the object's registry entry, which is where interrupt status
+   lives before start(); the entry is not live until ty_thread_spawn runs. */
 int64_t ty_thread_next_id(void);
-void ty_thread_join(int64_t id);
+/* Wait for the thread to finish. Answers 1 when the calling thread was
+   interrupted instead, in which case the interrupt status is already cleared
+   and the prelude throws InterruptedException. */
+int32_t ty_thread_join(int64_t id);
 int32_t ty_thread_alive(int64_t id);
-void ty_thread_sleep_ms(int64_t millis);
+/* Sleep for the duration, or until interrupted. Answers 1 when interrupted, in
+   which case the interrupt status is cleared. */
+int32_t ty_thread_sleep_ms(int64_t millis);
+/* Set the thread's interrupt status and wake it out of sleep, join or
+   Object.wait. No effect on a thread that has finished or never started. */
+void ty_thread_interrupt(int64_t id);
+/* The thread's interrupt status, without clearing it. */
+int32_t ty_thread_is_interrupted(int64_t id);
+/* The calling thread's interrupt status, cleared. Thread.interrupted(). */
+int32_t ty_thread_clear_interrupted(void);
+/* The calling thread's daemon status, for a Thread object built inside a
+   daemon thread: java.lang.Thread inherits it from the thread that makes it. */
+int32_t ty_thread_current_daemon(void);
 int64_t ty_thread_current_id(void);
 void ty_thread_yield(void);
 /* The Teyru Thread object of the calling thread, or NULL when the calling
@@ -768,7 +909,36 @@ void ty_thread_join_all(void);
    to run, sel is the interface selector of Runnable.run, which is how a thread
    reaches the program's own run() without the runtime knowing the layout of a
    class it was not compiled against. */
-int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t sel);
+int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int32_t sel);
+
+/* The C half of Thread.ofVirtual().start(): the same arguments as
+   ty_thread_start0, without a daemon flag because a virtual thread is counted
+   as a user thread (the process waits for it) and cannot be made a daemon. It
+   creates the continuation and the stack, registers the thread, and hands it
+   to a carrier; it does not create an operating system thread. On Windows,
+   where the runtime has no fibers, it throws UnsupportedOperationException
+   rather than silently running the work on a platform thread. */
+int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel);
+
+/* ---- virtual thread waits ---------------------------------------------
+
+   The blocking primitives ask these instead of the platform layer's, so that a
+   virtual thread parks -- leaving its carrier free for other virtual threads --
+   where a platform thread would block. A platform thread's call is the same
+   platform call it made before.
+
+   ty_cond_wait and ty_cond_timedwait wait on a condition variable, releasing
+   `m` for the duration as pthread_cond_wait does. A negative timeout waits
+   forever. The timed form answers 1 when the timeout passed.
+
+   ty_wait_fd waits until `fd` is ready for reading (events == 1) or writing
+   (events == 2), or until timeout_ms passes (-1 waits forever). It answers 1
+   ready, 0 timed out, or a negative error code. */
+void ty_cond_wait(typlat_cond *c, typlat_mutex *m);
+int32_t ty_cond_timedwait(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns);
+void ty_cond_signal(typlat_cond *c);
+void ty_cond_broadcast(typlat_cond *c);
+int32_t ty_wait_fd(int32_t fd, int32_t events, int32_t timeout_ms);
 
 /* A thread's uncaught exception: the same line the main thread's handler
    prints, with the thread's name, after which the thread ends and the process
@@ -787,7 +957,7 @@ void ty_uncaught_thread(void *e, tythread *t);
    needs is the same monitor, held or given up. */
 /* Object.wait/monitor's own semantics: release the monitor, wait for a notify
    or for `millis` to pass, take it back. A negative timeout waits forever. */
-void ty_mon_wait(void *obj, int64_t millis);
+int32_t ty_mon_wait(void *obj, int64_t millis);
 void ty_mon_notify(void *obj);
 void ty_mon_notify_all(void *obj);
 
@@ -816,6 +986,7 @@ tystr *ty_str_of_bytes_all(tyarr *b);
 int64_t ty_str_len(tystr *s);
 int64_t ty_str_blen(tystr *s);
 tystr *ty_str_concat(tystr *a, tystr *b);
+tystr *ty_str_concatN(int64_t n, tystr **parts);
 int32_t ty_str_eq(tystr *a, tystr *b);
 int32_t ty_str_cmp(tystr *a, tystr *b);
 int32_t ty_str_hash(tystr *s);
@@ -1028,6 +1199,28 @@ tystr *ty_class_simplename(int64_t cm);
 int32_t ty_class_enumcount(int64_t cm);
 void *ty_class_enumat(int64_t cm, int32_t i);
 int64_t ty_class_superof(int64_t cm);
+/* The component class of an array class, 0 for anything else. */
+int64_t ty_class_component(int64_t cm);
+/* The array class whose component is comp, from the table the program emits,
+   or NULL when that array class was not emitted. */
+tyclass *ty_prog_array_of(tyclass *comp);
+/* Class.arrayOf: the array class of a component, as a Class value (NULL when
+   the program carries no such array class). */
+void *ty_class_arrayof(void *c, tyclass *clscls);
+
+/* Generic signatures. Each takes the handle of a tysig record, which is static
+   data; 0 means "not parameterized", and the prelude answers the erased type
+   in that case. */
+int64_t ty_field_sig(int64_t cm, int32_t declared, int32_t i);
+int64_t ty_method_sigret(int64_t cm, int32_t declared, int32_t i);
+int64_t ty_method_sigparam(int64_t cm, int32_t declared, int32_t i, int32_t p);
+int64_t ty_ctor_sigparam(int64_t cm, int32_t i, int32_t p);
+int64_t ty_class_sig(int64_t cm);
+int64_t ty_sig_raw(int64_t sig);
+int32_t ty_sig_argcount(int64_t sig);
+int64_t ty_sig_arg(int64_t sig, int32_t i);
+int32_t ty_sig_ok(int64_t sig);
+tystr *ty_sig_why(int64_t sig);
 
 /* forName: the name is matched against the program's own class names, the
    binary names Java uses ("teyru.List", "main.Outer$Inner"). clscls is the

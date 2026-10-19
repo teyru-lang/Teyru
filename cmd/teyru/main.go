@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/teyru-lang/Teyru/internal/driver"
+	teyrufmt "github.com/teyru-lang/Teyru/internal/format"
+	"github.com/teyru-lang/Teyru/internal/lsp"
 	"github.com/teyru-lang/Teyru/internal/mod"
+	"github.com/teyru-lang/Teyru/internal/testrun"
 )
 
 const usage = `teyru - the Teyru compiler
@@ -22,9 +25,12 @@ usage:
   teyru emit  [flags] <paths...>   print the generated C
   teyru emit-llvm [flags] <paths...>  print the LLVM IR the backend feeds to LLVM
   teyru emit-java [flags] <paths...>  print the equivalent Java source
+  teyru test  [paths...]           compile and run the package's tests
   teyru get <module>@<version>     fetch a module into the cache and require it
   teyru mod init <module-path>     write teyru.mod for a new module
   teyru mod tidy                   make teyru.mod and teyru.sum match the sources
+  teyru fmt [-w] [paths...]        format Teyru sources in the canonical style
+  teyru lsp                        run the language server on stdin/stdout
   teyru version                    print the version
 
 paths:
@@ -50,6 +56,10 @@ flags:
                 -O1 the standard library is compiled once into the user cache
                 and linked, instead of the whole program being optimised as
                 one; -O2 and above keep the whole-program build
+  -g            include source-level debug information (DWARF): the generated
+                C carries #line directives back to the .teyru files and the C
+                compiler is given -g, so a debugger stops at Teyru source
+                lines. The c back end only; the llvm back end refuses -g
   --llvm-ir <p> write the LLVM IR module to <p> (the backend is clang/LLVM)
   --backend <b> c (default) or llvm: which back end compiles the program.
                 The llvm back end emits the program's own LLVM module and
@@ -93,6 +103,15 @@ func run() int {
 		return runMod(args)
 	case "get":
 		return runGet(args)
+	case "fmt":
+		return runFmt(args)
+	case "lsp":
+		return runLSP(args)
+	case "test":
+		// The test command takes paths and no compiler flags: the package is
+		// compiled the way `teyru run` compiles it, with a generated entry
+		// point in place of the program's own main.
+		return testrun.Run(args)
 	}
 	opts := driver.Options{Out: "a.out"}
 	var files []string
@@ -123,6 +142,8 @@ func run() int {
 			}
 		case a == "--no-lto":
 			opts.NoLTO = true
+		case a == "-g":
+			opts.Debug = true
 		case a == "-v":
 			opts.Verbose = true
 		case a == "--native":
@@ -480,4 +501,77 @@ func loadGraph(dir string) (*mod.Graph, error) {
 		return nil, err
 	}
 	return g, nil
+}
+
+// runFmt implements `teyru fmt [-w] [paths...]`.
+func runFmt(args []string) int {
+	write := false
+	var paths []string
+	for _, a := range args {
+		switch {
+		case a == "-w":
+			write = true
+		case a == "--":
+			// the rest are paths, which cannot start with '-' anyway
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(os.Stderr, "teyru: fmt: unknown flag %q\n", a)
+			return 2
+		default:
+			paths = append(paths, a)
+		}
+	}
+	files, err := teyrufmt.Collect(paths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "teyru: fmt: %v\n", err)
+		return 1
+	}
+	if len(files) == 0 {
+		return 0
+	}
+	if !write && len(files) != 1 {
+		fmt.Fprintf(os.Stderr, "teyru: fmt without -w writes one file to stdout; %d file(s) matched\n", len(files))
+		return 2
+	}
+	status := 0
+	for _, path := range files {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "teyru: fmt: %v\n", err)
+			status = 1
+			continue
+		}
+		out, err := teyrufmt.Source(path, string(src))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "teyru: fmt: %s: %v\n", path, err)
+			status = 1
+			continue
+		}
+		if !write {
+			os.Stdout.WriteString(out)
+			continue
+		}
+		if out == string(src) {
+			continue
+		}
+		st, err := os.Stat(path)
+		mode := os.FileMode(0o644)
+		if err == nil {
+			mode = st.Mode().Perm()
+		}
+		if err := os.WriteFile(path, []byte(out), mode); err != nil {
+			fmt.Fprintf(os.Stderr, "teyru: fmt: %v\n", err)
+			status = 1
+		}
+	}
+	return status
+}
+
+// runLSP implements `teyru lsp`: the language server speaks JSON-RPC on
+// stdin/stdout, and the exit code is the one the protocol asks for.
+func runLSP(args []string) int {
+	if len(args) != 0 {
+		fmt.Fprint(os.Stderr, "teyru: lsp takes no arguments\n")
+		return 2
+	}
+	return lsp.Serve(os.Stdin, os.Stdout)
 }

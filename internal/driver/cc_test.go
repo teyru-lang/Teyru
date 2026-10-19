@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -309,5 +310,110 @@ func TestBuildCompilesEveryUnitSeparately(t *testing.T) {
 				t.Errorf("only %d compiler ran at once for %d units on a %d-CPU machine", max, len(compiles), runtime.NumCPU())
 			}
 		})
+	}
+}
+
+// TestCompilerFamily pins which LTO spelling a compiler path is asked for. The
+// path is all the driver has, so it is what the test varies: clang and gcc
+// spell parallel LTO differently, and anything else is asked for the one both
+// families accept and retried with the plain form if it says no.
+func TestCompilerFamily(t *testing.T) {
+	for _, tc := range []struct {
+		cc   string
+		want ccFamily
+	}{
+		{"clang", familyClang},
+		{"/usr/bin/clang", familyClang},
+		{"/usr/bin/clang-22", familyClang},
+		{"gcc", familyGCC},
+		{"/usr/bin/gcc", familyGCC},
+		{"/usr/bin/x86_64-linux-gnu-gcc-16", familyGCC},
+		{"cc", familyUnknown},
+		{"tcc", familyUnknown},
+	} {
+		if got := compilerFamily(tc.cc); got != tc.want {
+			t.Errorf("compilerFamily(%q) = %d, want %d", tc.cc, got, tc.want)
+		}
+	}
+}
+
+// TestLTOFlags pins what each mode adds to the two command lines: the compile
+// gets what writes the intermediate representation, the link gets what
+// optimises across the units, and only the link gets the linker choice and its
+// partition count.
+func TestLTOFlags(t *testing.T) {
+	jobs := compileJobs(runtime.NumCPU())
+	partitions := "-Wl,--lto-partitions=" + strconv.Itoa(jobs)
+	for _, tc := range []struct {
+		name   string
+		cc     string
+		target string
+		mode   ltoMode
+		wantCF []string
+		wantLD []string
+	}{
+		{
+			name: "off adds nothing", cc: "clang", target: "linux/amd64", mode: ltoOff,
+		},
+		{
+			name: "plain is -flto on both halves", cc: "clang", target: "linux/amd64", mode: ltoPlain,
+			wantCF: []string{"-flto"}, wantLD: []string{"-flto"},
+		},
+		{
+			name: "gcc parallel is -flto=auto", cc: "gcc", target: "linux/amd64", mode: ltoParallel,
+			wantCF: []string{"-flto=auto"}, wantLD: []string{"-flto=auto"},
+		},
+	} {
+		gotCF, gotLD := ltoFlags(tc.cc, tc.target, runtime.NumCPU(), tc.mode)
+		if !sameStrings(gotCF, tc.wantCF) || !sameStrings(gotLD, tc.wantLD) {
+			t.Errorf("%s: ltoFlags(%q, %q) = %v, %v, want %v, %v",
+				tc.name, tc.cc, tc.target, gotCF, gotLD, tc.wantCF, tc.wantLD)
+		}
+	}
+	// clang's parallel form is lld's, and it is only asked for where lld is
+	// there and the target is an ELF one: elsewhere the link must be the same
+	// command line as the plain form's.
+	gotCF, gotLD := ltoFlags("clang", "linux/amd64", jobs, ltoParallel)
+	if !hasLLD() {
+		if !sameStrings(gotCF, []string{"-flto=auto"}) || !sameStrings(gotLD, []string{"-flto=auto"}) {
+			t.Errorf("without lld, clang's parallel form = %v, %v, want -flto=auto", gotCF, gotLD)
+		}
+	} else {
+		if !sameStrings(gotCF, []string{"-flto"}) {
+			t.Errorf("clang's compile flags = %v, want [-flto]", gotCF)
+		}
+		if !sameStrings(gotLD, []string{"-flto", "-fuse-ld=lld", partitions}) {
+			t.Errorf("clang's link flags = %v, want -flto -fuse-ld=lld %s", gotLD, partitions)
+		}
+	}
+	// A target that is not ELF keeps the default linker: lld's partition flag
+	// and -fuse-ld=lld are not flags every platform's linker understands.
+	for _, target := range []string{"darwin/arm64", "windows/amd64"} {
+		cf, ld := ltoFlags("clang", target, jobs, ltoParallel)
+		if !sameStrings(cf, []string{"-flto=auto"}) || !sameStrings(ld, []string{"-flto=auto"}) {
+			t.Errorf("clang on %s = %v, %v, want -flto=auto", target, cf, ld)
+		}
+	}
+}
+
+// TestLTOAttempts pins the retry order: the parallel form, the plain one when
+// it is a different command line, then no LTO. --no-lto skips straight to the
+// last one.
+func TestLTOAttempts(t *testing.T) {
+	jobs := compileJobs(runtime.NumCPU())
+	if got := ltoAttempts("clang", "linux/amd64", jobs, false); len(got) != 1 || got[0] != ltoOff {
+		t.Errorf("ltoAttempts with LTO off = %v, want [ltoOff]", got)
+	}
+	for _, cc := range []string{"clang", "gcc", "cc"} {
+		got := ltoAttempts(cc, "linux/amd64", jobs, true)
+		want := []ltoMode{ltoParallel, ltoPlain, ltoOff}
+		if len(got) != len(want) {
+			t.Fatalf("%s: ltoAttempts = %v, want %v", cc, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: ltoAttempts = %v, want %v", cc, got, want)
+			}
+		}
 	}
 }

@@ -46,6 +46,23 @@ type methodCtx struct {
 	// resolve it twice from inside its own resolution; the one in progress is
 	// what will type it, so the second visit is left to it.
 	deferred []ast.Expr
+	// caught is one entry per try statement whose body is being checked, each
+	// holding the types its catch clauses can catch. A checked exception a call
+	// declares is handled when a clause in any entry is a supertype of it: the
+	// clause may belong to an enclosing try, since the exception propagates
+	// outward. A catch clause's own body is not covered by its own entry --
+	// javac rejects `catch (IOException e) { throw e; }` in a method that does
+	// not declare it -- and a finally clause catches nothing, so neither is
+	// pushed.
+	caught [][]ast.Type
+	// declared is the throws clause of the method, constructor or initializer
+	// being checked, resolved. For a lambda it is the throws clause of the
+	// functional interface's abstract method.
+	declared []ast.Type
+	// synthetic marks a body the compiler generated (Lombok and the other
+	// annotation-driven passes). The checked-exception rule is a rule about
+	// source, and that source was never written.
+	synthetic bool
 }
 
 // helperRef is one @Helper local class in scope and the instance it is used
@@ -209,10 +226,11 @@ func canCompleteNormally(s ast.Stmt) bool {
 //     decides, and a label with no statements after it falls out of the switch.
 //
 // A pattern switch whose coverage is not decidable here is the one case left to
-// the reader: it is answered "cannot complete normally", the permissive reading,
-// because a sealed type without a permits clause is undecidable for this
-// checker (AGENTS.md §10) and rejecting a switch that does cover every value
-// would be the worse error.
+// the reader: it is answered "cannot complete normally", the permissive reading.
+// The permit set is known for a sealed selector now -- explicitly, or implicitly
+// from the subtypes in its compilation unit -- but a selector that is not sealed
+// still has no decidable value set, and rejecting a switch that does cover every
+// value would be the worse error.
 func switchCanCompleteNormally(s *ast.Switch) bool {
 	total := false
 	for _, cs := range s.Cases {
@@ -330,6 +348,8 @@ func (c *Checker) newCtx(cl *ast.Class, m *ast.Method) *methodCtx {
 	ctx.props = c.Props
 	ctx.push()
 	if m != nil {
+		ctx.synthetic = m.Anno != "" || m.SynthKind != ""
+		ctx.declared = c.methodThrows(m)
 		for i, p := range m.ParamNames {
 			v := ctx.declare(p, m.Params[i], m.Pos)
 			m.ParamVars = append(m.ParamVars, v)
@@ -675,11 +695,16 @@ func (ctx *methodCtx) checkStmt(s ast.Stmt) {
 		}
 	case *ast.Throw:
 		ctx.checkExpr(v.X, nil)
-		if t := v.X.GetType(); t != nil && !c.isSubtype(t, &ast.ClassType{Class: c.b.Throwable}) && !ast.IsError(t) {
+		t := v.X.GetType()
+		if t != nil && !c.isSubtype(t, &ast.ClassType{Class: c.b.Throwable}) && !ast.IsError(t) {
 			if _, isNull := t.(ast.NullType); !isNull {
 				ctx.errf(v.Pos, "TY-TYP-0024", "thrown value must be a Throwable, found %s", t)
 			}
 		}
+		// A throw of a checked exception follows the same rule as a call that
+		// declares one (JLS 11.2.2): some enclosing try has to catch it, or the
+		// enclosing method, constructor or initializer has to declare it.
+		ctx.checkThrown(v.Pos, []ast.Type{t})
 	case *ast.Try:
 		ctx.checkTry(v)
 	case *ast.Switch:
@@ -877,16 +902,29 @@ func (ctx *methodCtx) checkTry(v *ast.Try) {
 			}
 		}
 	}
-	ctx.checkBlock(v.Body, true)
-	for _, cat := range v.Catches {
-		ctx.push()
+	// The catch types are resolved before the body is checked, because the body
+	// is checked against them; resolving them again below would report an
+	// unknown type twice. Only the body is covered by them -- a catch clause's
+	// own body is not, which is what javac enforces, and a finally clause
+	// catches nothing.
+	caught := make([][]ast.Type, len(v.Catches))
+	var catchable []ast.Type
+	for i, cat := range v.Catches {
 		for _, te := range cat.Types {
 			t := c.resolveType(ctx.env, te)
 			if !c.isSubtype(t, &ast.ClassType{Class: c.b.Throwable}) && !ast.IsError(t) {
 				ctx.errf(te.Pos, "TY-TYP-0034", "catch type must be a Throwable, found %s", t)
 			}
+			caught[i] = append(caught[i], t)
+			catchable = append(catchable, t)
 		}
-		ct := c.resolveType(ctx.env, cat.Types[0])
+	}
+	ctx.caught = append(ctx.caught, catchable)
+	ctx.checkBlock(v.Body, true)
+	ctx.caught = ctx.caught[:len(ctx.caught)-1]
+	for i, cat := range v.Catches {
+		ctx.push()
+		ct := caught[i][0]
 		cat.Sym = ctx.declare(cat.Name, ct, cat.Pos)
 		if cat.Name == "_" {
 			cat.Unnamed = true
@@ -896,6 +934,109 @@ func (ctx *methodCtx) checkTry(v *ast.Try) {
 	}
 	if v.Finally != nil {
 		ctx.checkBlock(v.Finally, true)
+	}
+}
+
+// ------------------------------------------------- checked exceptions (JLS 11)
+
+// methodThrows resolves the throws clause of m where the method was declared,
+// not where it is called: a simple name in the clause means what it means in
+// m's own file. The resolved types are cached on the TypeExpr, so a method
+// whose body was checked first is not resolved twice.
+func (c *Checker) methodThrows(m *ast.Method) []ast.Type {
+	if m == nil || m.Decl == nil || m.Owner == nil || len(m.Decl.Throws) == 0 {
+		return nil
+	}
+	env := c.classEnv(m.Owner)
+	out := make([]ast.Type, 0, len(m.Decl.Throws))
+	for _, te := range m.Decl.Throws {
+		t := te.Resolved
+		if t == nil {
+			t = c.resolveType(env, te)
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// isCheckedException reports whether t is a checked exception type: a subtype
+// of Exception that is not a subtype of RuntimeException or Error (JLS 11.1.1).
+// A type variable, a primitive, an array, null and an error type are not
+// checked exceptions here; a variable bounded by Exception is a case this
+// checker leaves alone rather than guess at.
+func (c *Checker) isCheckedException(t ast.Type) bool {
+	switch t.(type) {
+	case nil, ast.ErrorType, ast.NullType, *ast.PrimType, *ast.ArrayType, *ast.TypeVarType:
+		return false
+	}
+	if ast.IsError(t) {
+		return false
+	}
+	if !c.isSubtype(t, &ast.ClassType{Class: c.b.Exception}) {
+		return false
+	}
+	if c.isSubtype(t, &ast.ClassType{Class: c.b.RuntimeException}) {
+		return false
+	}
+	return !c.isSubtype(t, &ast.ClassType{Class: c.b.Err})
+}
+
+// caughtHere reports whether an enclosing try clause can catch t. A clause
+// catches every subtype of its type, so the test is the other way round from
+// assignability: a declared IOException is caught by `catch (Exception e)` and
+// not by `catch (FileNotFoundException e)`.
+func (ctx *methodCtx) caughtHere(t ast.Type) bool {
+	for _, list := range ctx.caught {
+		for _, ct := range list {
+			if ct != nil && ctx.c.isSubtype(t, ct) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// declaredHere reports whether the enclosing method, constructor, initializer
+// or functional interface declares t (or a supertype of it).
+func (ctx *methodCtx) declaredHere(t ast.Type) bool {
+	for _, dt := range ctx.declared {
+		if dt != nil && ctx.c.isSubtype(t, dt) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkThrown checks the checked exceptions a declaration names against what
+// the current context handles. Synthetic bodies are exempt: the rule is about
+// code a person wrote.
+//
+// Precise rethrow (JLS 11.2.2: `catch (Exception e) { throw e; }` in a method
+// that declares only what the try block can throw) is not modelled: the type of
+// the thrown expression is its declared catch type, so a method that declares
+// less than that is rejected where javac accepts it. That reading is stricter,
+// never more permissive, and no program in the suite relies on it.
+//
+// The standard library is exempt too, and for the same reason: it is the
+// compiler's pre-compiled dependency, not the program under compilation. Its
+// bodies predate this rule and declare `throws` in one place, so checking them
+// would report 140 errors across 12 files (ZipException 51, IOException 26,
+// DataFormatException 16, EOFException 12, WebSocketProtocolException 8,
+// SocketException 7, UTFDataFormatException 5, ParseException 4, and eleven
+// more across five types) that are a rewrite of the library's exception model
+// rather than part of this rule. What a user class calls is still checked: only the
+// library's own bodies are exempt, and a prelude method that declares a checked
+// exception still requires the caller to handle it.
+func (ctx *methodCtx) checkThrown(pos source.Pos, thrown []ast.Type) {
+	if ctx.synthetic || (ctx.cl != nil && ctx.cl.Prelude()) {
+		return
+	}
+	for _, t := range thrown {
+		if !ctx.c.isCheckedException(t) || ctx.caughtHere(t) || ctx.declaredHere(t) {
+			continue
+		}
+		ctx.errf(pos, "TY-TYP-0122",
+			"unreported exception %s; must be caught or declared to be thrown", t)
 	}
 }
 
@@ -1090,8 +1231,9 @@ func (ctx *methodCtx) patternsExhaustive(s *ast.Switch, xt ast.Type) bool {
 
 // patternsCover reports whether pats cover every value of t: some pattern is a
 // supertype of t, or t is sealed and every one of its permitted subtypes is
-// covered in turn. seen breaks a `permits` cycle, which is illegal Java but is
-// not something the sealed-type checks this compiler lacks would have caught.
+// covered in turn. seen keeps the walk finite: a permits clause is validated
+// against the inheritance edges now, so a cycle cannot be built, but the walk
+// is cheap to guard and the guard costs nothing when the hierarchy is sane.
 func (ctx *methodCtx) patternsCover(pats []ast.Type, t ast.Type, seen map[*ast.Class]bool) bool {
 	c := ctx.c
 	for _, p := range pats {
@@ -1108,8 +1250,8 @@ func (ctx *methodCtx) patternsCover(pats []ast.Type, t ast.Type, seen map[*ast.C
 	seen[cl.Class] = true
 	permits := c.permittedSubtypes(ctx.env, cl.Class)
 	if len(permits) == 0 {
-		// A sealed type that names no permitted subclass says nothing about the
-		// values it can take, so exhaustiveness cannot be shown for it.
+		// A sealed type that permits nothing says nothing about the values it
+		// can take, so exhaustiveness cannot be shown for it.
 		return false
 	}
 	for _, pc := range permits {
@@ -1120,10 +1262,91 @@ func (ctx *methodCtx) patternsCover(pats []ast.Type, t ast.Type, seen map[*ast.C
 	return true
 }
 
-// permittedSubtypes returns the classes a sealed type's permits clause names.
-// A name that does not resolve is left out: the caller can then only answer
-// conservatively, and reporting a bad name belongs to the sealed-type checks
-// this compiler does not have yet (AGENTS.md §10).
+// checkSealedTypes validates the sealed hierarchies of the program: JLS 8.1.6
+// for classes, JLS 9.1.4 for interfaces.
+//
+//   - every type a permits clause names is a direct subtype of the sealed type;
+//   - every direct subtype is permitted. Java's implicit permits clause is
+//     matched exactly: a sealed type with no permits clause permits the direct
+//     subtypes declared in the same compilation unit, and nothing else;
+//   - every permitted subtype is final, sealed, or non-sealed, since a member
+//     of the hierarchy that is none of the three could grow outside the set a
+//     switch's exhaustiveness check relies on.
+//
+// It runs once the headers are resolved (so Super and Ifaces are filled in) and
+// before any body is checked, so the permit set a switch sees cannot depend on
+// the order the bodies happen to be visited in.
+func (c *Checker) checkSealedTypes() {
+	for _, cl := range c.classes {
+		if cl.Decl == nil || !cl.Mods.Has(ast.ModSealed) {
+			continue
+		}
+		env := c.classEnv(cl)
+		permitted := map[*ast.Class]bool{}
+		for _, te := range cl.Decl.Permits {
+			t := c.resolveType(env, te)
+			ct, ok := c.erasure(t).(*ast.ClassType)
+			if !ok || ct.Class == nil {
+				if !ast.IsError(t) {
+					c.errf(te.Pos, "TY-TYP-0119",
+						"invalid permits clause: %s is not a direct subtype of %s", t, cl.Name)
+				}
+				// otherwise resolveType already reported the name that does not
+				// resolve
+				continue
+			}
+			pc := ct.Class
+			if !directSubtype(pc, cl) {
+				c.errf(te.Pos, "TY-TYP-0119",
+					"invalid permits clause: %s is not a direct subtype of %s", pc.Name, cl.Name)
+				continue
+			}
+			permitted[pc] = true
+			if !pc.Mods.Has(ast.ModFinal) && !pc.Mods.Has(ast.ModSealed) && !pc.Mods.Has(ast.ModNonSealed) {
+				c.errf(te.Pos, "TY-TYP-0121",
+					"permitted subtype %s of sealed type %s must be final, sealed, or non-sealed", pc.Name, cl.Name)
+			}
+		}
+		for _, sub := range c.classes {
+			if sub.Decl == nil || !directSubtype(sub, cl) || permitted[sub] {
+				continue
+			}
+			if len(cl.Decl.Permits) == 0 && sub.File == cl.File {
+				// Java's implicit permits clause: a sealed type with no permits
+				// clause permits its direct subtypes declared in the same
+				// compilation unit, and only those.
+				permitted[sub] = true
+				continue
+			}
+			c.errf(sub.Decl.Pos, "TY-TYP-0120",
+				"subtype %s of sealed type %s must be listed in its permits clause", sub.Name, cl.Name)
+		}
+	}
+}
+
+// directSubtype reports whether sub names cl as its superclass or as one of its
+// super interfaces: sub is then a direct subtype of cl, which is what a permits
+// clause has to name.
+func directSubtype(sub, cl *ast.Class) bool {
+	if sub == nil || cl == nil || sub == cl {
+		return false
+	}
+	if sub.Super != nil && sub.Super.Class == cl {
+		return true
+	}
+	for _, i := range sub.Ifaces {
+		if i.Class == cl {
+			return true
+		}
+	}
+	return false
+}
+
+// permittedSubtypes returns the classes a sealed type permits: the ones its
+// permits clause names, or, when it has no permits clause, the direct subtypes
+// declared in the same compilation unit (JLS 8.1.6). A name that does not
+// resolve is left out; checkSealedTypes has already reported it, and the caller
+// can only answer conservatively.
 func (c *Checker) permittedSubtypes(env *typeEnv, cl *ast.Class) []*ast.Class {
 	if cl.Decl == nil {
 		return nil
@@ -1132,6 +1355,13 @@ func (c *Checker) permittedSubtypes(env *typeEnv, cl *ast.Class) []*ast.Class {
 	for _, te := range cl.Decl.Permits {
 		if pc := c.lookupClassName(env, te.Name); pc != nil {
 			out = append(out, pc)
+		}
+	}
+	if len(cl.Decl.Permits) == 0 {
+		for _, sub := range c.classes {
+			if sub.Decl != nil && sub.File == cl.File && directSubtype(sub, cl) {
+				out = append(out, sub)
+			}
 		}
 	}
 	return out
@@ -2383,6 +2613,11 @@ func (ctx *methodCtx) checkArrayInit(v *ast.ArrayInit, want ast.Type) {
 
 func (ctx *methodCtx) checkNew(v *ast.New, want ast.Type) {
 	c := ctx.c
+	// The constructor the `new` resolves to may be replaced by the anonymous
+	// class's forwarding constructor below; the target is what declares the
+	// checked exceptions the expression has to handle.
+	var target *ast.Method
+	defer func() { ctx.checkThrown(v.Pos, c.methodThrows(target)) }()
 	if v.Outer != nil && v.Type != nil && !strings.Contains(v.Type.Name, ".") {
 		// `outer.new Inner()`: the simple name is a member type of the
 		// qualifier's class, not a name in the lexical scope
@@ -2436,7 +2671,7 @@ func (ctx *methodCtx) checkNew(v *ast.New, want ast.Type) {
 		ctorType = pt
 	}
 	ctor := c.resolveCtor(ctx, ctorType, v, cl, want)
-	_ = ctor
+	target = ctor
 	// outer instance for inner classes
 	if cl.Inner && !ctx.inScopeOf(cl) {
 		if v.Outer != nil {
@@ -3493,6 +3728,11 @@ func (ctx *methodCtx) lambdaActual(lam *ast.Lambda) ast.Type {
 }
 
 func (ctx *methodCtx) checkCall(v *ast.Call, want ast.Type) {
+	// a call that declares checked exceptions requires each of them to be
+	// caught by an enclosing try or declared by the enclosing method; the
+	// deferred call is what makes every path through the resolution below --
+	// static, instance, array, extension, this(...), super(...) -- checked once
+	defer func() { ctx.checkThrown(v.Pos, ctx.c.methodThrows(v.Method)) }()
 	if len(v.TypeArgs) > 0 {
 		var ts []ast.Type
 		for _, te := range v.TypeArgs {
@@ -4318,6 +4558,11 @@ func (ctx *methodCtx) checkLambda(lam *ast.Lambda, want ast.Type) {
 	// check the body in the lambda's scope
 	lam.Outer = ctx.lambda
 	lctx := &methodCtx{c: c, cl: ctx.cl, m: m, env: ctx.env, lambda: lam, noThis: !ctx.hasThis()}
+	// A lambda body's checked exceptions are those of the functional
+	// interface's throws clause and nothing else: an enclosing try around the
+	// lambda expression does not catch them, so lctx.caught starts empty.
+	lctx.declared = c.methodThrows(sam)
+	lctx.synthetic = ctx.synthetic
 	lctx.push()
 	outerLocals := ctx.scopes
 	lctx.scopes = append(append([]map[string]*ast.Var{}, outerLocals...), map[string]*ast.Var{})

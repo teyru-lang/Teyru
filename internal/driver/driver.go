@@ -51,9 +51,14 @@ type Options struct {
 	// the C without leaving a binary behind.
 	CSourceOnly bool
 	NoLTO       bool // disable link-time optimisation (on by default)
-	Verbose     bool
-	ExtraCC     []string
-	KeptTemp    bool
+	// Debug is -g: the generated C carries #line directives back to the .teyru
+	// sources, and the C compiler is asked for DWARF. The c back end implements
+	// it; the llvm back end refuses it rather than accepting it and writing no
+	// debug information (see compileLLVM).
+	Debug    bool
+	Verbose  bool
+	ExtraCC  []string
+	KeptTemp bool
 	// Native lists C sources that implement the program's native methods; they
 	// are compiled together with the generated program.
 	Native []string
@@ -63,6 +68,15 @@ type Options struct {
 	// NativeHeader, when set, receives a C header declaring every native
 	// method the program expects to be implemented.
 	NativeHeader string
+	// TestEntry, when set, is an extra compilation unit compiled as part of
+	// the package named by TestEntryBase. `teyru test` generates the entry
+	// point that runs a package's tests this way, so the generated file never
+	// has to be written into the user's tree.
+	TestEntry string
+	// TestEntryBase names a source file of the package TestEntry belongs to.
+	// The entry takes that file's package identity, which inside a module is
+	// the package's import path rather than the name written in the file.
+	TestEntryBase string
 }
 
 // Result reports the outcome of a compilation.
@@ -151,7 +165,16 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	}
 
 	astFiles := parsePrelude(diags)
-	program := make([]*ast.File, 0, len(files))
+	program := make([]*ast.File, 0, len(files)+1)
+	var testEntry *ast.File
+	if opts.TestEntry != "" {
+		// The entry is the first compilation unit after the prelude, which is
+		// what makes it the program's main when the package under test has a
+		// main of its own: the checker keeps the first of two static mains,
+		// so a test run never calls the user's.
+		testEntry = parseSource("<test>/__TeyruTestMain.teyru", opts.TestEntry, diags)
+		program = append(program, testEntry)
+	}
 	for _, f := range files {
 		program = append(program, parseFile(f, diags))
 	}
@@ -163,6 +186,20 @@ func Compile(paths []string, opts Options) (*Result, error) {
 		astFiles = append(astFiles, resolveImports(graph, program, diags)...)
 	} else {
 		astFiles = append(astFiles, program...)
+	}
+	if testEntry != nil && opts.TestEntryBase != "" {
+		// resolveImports has given every file of the package its identity by
+		// now, which inside a module is the import path. The generated entry
+		// is not a file of the module, so it adopts the identity of a real one
+		// instead of guessing it from the package clause.
+		base := absPath(opts.TestEntryBase)
+		for _, f := range program[1:] {
+			if absPath(f.Src.Path) == base {
+				testEntry.Package = f.Package
+				testEntry.DeclaredPackage = f.DeclaredPackage
+				break
+			}
+		}
 	}
 	if diags.HasErrors() {
 		return &Result{Diags: diags}, fmt.Errorf("parse errors")
@@ -216,14 +253,6 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	if debugOpt(opt) {
 		return compileSplit(prog, opts, tgt, opt, cc)
 	}
-	csrc, link := codegen.Emit(prog)
-	// A program whose reachable code can call the TLS layer has to be linked
-	// against OpenSSL, and a target that has no OpenSSL for it is refused here,
-	// by name and before anything is written, rather than by the linker later.
-	if err := checkTLS(tgt, link); err != nil {
-		return nil, err
-	}
-
 	rtDir, err := os.MkdirTemp("", "teyru-rt-")
 	if err != nil {
 		return nil, err
@@ -238,6 +267,15 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	cfile := opts.CFile
 	if cfile == "" {
 		cfile = filepath.Join(rtDir, "program.c")
+	}
+	// The generated path goes with the debug request: it is the file every
+	// #line region returns to, and the line numbers are the assembled file's.
+	csrc, link := codegen.Emit(prog, codegen.Debug{On: opts.Debug, CFile: cfile})
+	// A program whose reachable code can call the TLS layer has to be linked
+	// against OpenSSL, and a target that has no OpenSSL for it is refused here,
+	// by name and before anything is written, rather than by the linker later.
+	if err := checkTLS(tgt, link); err != nil {
+		return nil, err
 	}
 	dir := filepath.Dir(cfile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -298,10 +336,20 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	// The link names the objects where the compile named the sources, and the
 	// libraries come after them, which is the order a static link needs.
 	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
-	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, targetCflags(tgt, cc)...)
+	if opts.Debug {
+		// The compiler writes the DWARF; the emitter has already put the line
+		// mapping in the C it is given.
+		cflags = append(cflags, "-g")
+	}
 	cflags = append(cflags, opts.ExtraCC...)
 	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
 	ldflags = append(ldflags, tgt.cflags...)
+	if opts.Debug {
+		// The link is where link-time optimisation produces the debug info of
+		// the code it inlines, so it is asked for there as well.
+		ldflags = append(ldflags, "-g")
+	}
 	// The target's own flags, before the libraries: -static has to be seen
 	// before the -l that follows it, or the library it is meant to apply to is
 	// taken from the dynamic import library instead and the program needs a
@@ -321,21 +369,25 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	}
 	ldflags = append(ldflags, opts.Link...)
 	ldflags = append(ldflags, opts.ExtraCC...)
-	// Link-time optimisation lets clang inline runtime helpers (string ops, the
-	// allocation fast path) into the generated program. It is on by default and
-	// retried without it when the toolchain has no LTO support: only the flags
-	// differ between the two attempts, so a retry is a successful build like
-	// any other.
-	if err := compileAndLink(cc, cflags, ldflags, units, !opts.NoLTO, opts.Verbose); err != nil {
-		if opts.NoLTO {
-			return res, err
+	// Link-time optimisation lets the C compiler inline runtime helpers (string
+	// ops, the allocation fast path) into the generated program. It is on by
+	// default, and it is asked for in its parallel form first: gcc's -flto=auto
+	// or clang's -flto linked by lld, whose code generation runs in one
+	// partition per CPU. The plain form is the retry for a toolchain that does
+	// not know the parallel spelling and no LTO the retry for one with none:
+	// only the flags differ between the attempts, so a later attempt is a
+	// successful build like any other.
+	modes := ltoAttempts(cc, tgt.name, compileJobs(len(units)), !opts.NoLTO)
+	for i, mode := range modes {
+		if err = compileAndLink(cc, cflags, ldflags, units, tgt.name, mode, opts.Verbose); err == nil {
+			break
 		}
-		if opts.Verbose {
-			fmt.Fprintln(os.Stderr, "teyru: retrying without -flto")
+		if opts.Verbose && i+1 < len(modes) {
+			fmt.Fprintf(os.Stderr, "teyru: retrying with %s\n", ltoName(modes[i+1]))
 		}
-		if err2 := compileAndLink(cc, cflags, ldflags, units, false, opts.Verbose); err2 != nil {
-			return res, err
-		}
+	}
+	if err != nil {
+		return res, err
 	}
 	res.Exe = exe
 	return res, nil
@@ -377,17 +429,24 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	if !opts.KeptTemp {
 		defer os.RemoveAll(rtDir)
 	}
+	// The generated path is what a debug build's #line regions return to, and
+	// the emitter needs it before it writes a line: see codegen.Debug.
+	cfile := opts.CFile
+	if cfile == "" {
+		cfile = filepath.Join(rtDir, "program.c")
+	}
+	dbg := codegen.Debug{On: opts.Debug, CFile: cfile}
 	// The program's unit first: it is where the reflection tables go, whatever
 	// class they belong to, and both units have to agree on which of them
 	// defines a string literal, which is what the second argument is for.
 	start := time.Now()
-	unit := codegen.EmitProgram(prog)
-	entry := preludeEntry(tgt, opt, cc)
+	unit := codegen.EmitProgram(prog, dbg)
+	entry := preludeEntry(tgt, opt, cc, opts.Debug)
 	if opts.Verbose {
 		fmt.Fprintf(os.Stderr, "teyru: the program's unit: %s\n", time.Since(start).Round(time.Millisecond))
 		start = time.Now()
 	}
-	libSrc, libObj, err := libraryUnit(entry, rtDir, cc, tgt, opt, unit)
+	libSrc, libObj, err := libraryUnit(entry, rtDir, cc, tgt, opt, unit, opts.Debug)
 	if err != nil {
 		return nil, err
 	}
@@ -406,10 +465,6 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 		return nil, err
 	}
 	rtC := writeRuntime(rtDir, tgt, link)
-	cfile := opts.CFile
-	if cfile == "" {
-		cfile = filepath.Join(rtDir, "program.c")
-	}
 	if err := os.MkdirAll(filepath.Dir(cfile), 0o755); err != nil {
 		return nil, err
 	}
@@ -456,10 +511,16 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 	}
 	cflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
 		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
-	cflags = append(cflags, tgt.cflags...)
+	cflags = append(cflags, targetCflags(tgt, cc)...)
+	if opts.Debug {
+		cflags = append(cflags, "-g")
+	}
 	cflags = append(cflags, opts.ExtraCC...)
 	ldflags := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w", "-I", rtDir}
 	ldflags = append(ldflags, tgt.cflags...)
+	if opts.Debug {
+		ldflags = append(ldflags, "-g")
+	}
 	ldflags = append(ldflags, tgt.ldflags...)
 	ldflags = append(ldflags, gcSectionsFlag(tgt)...)
 	// The objects in the order the sources were named in before the driver
@@ -504,7 +565,7 @@ func compileSplit(prog *sema.Program, opts Options, tgt *target, opt, cc string)
 // program's unit was not emitted for, which is the failure a cache must not
 // have. The entry is keyed by everything they were built from, and a file is
 // published by rename, so what is read is a whole artifact of some build.
-func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, unit codegen.Program) (string, string, error) {
+func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, unit codegen.Program, debug bool) (string, string, error) {
 	writeRuntimeHeaders(rtDir)
 	if entry.Has(preludeHeader, "prelude.c", "prelude.o") {
 		hdr, ok := entry.Get(preludeHeader)
@@ -530,13 +591,16 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	if diags.HasErrors() {
 		return "", "", fmt.Errorf("the standard library does not check on its own: %s", diags.String())
 	}
-	lib := codegen.EmitLibrary(pa)
+	srcFile := filepath.Join(rtDir, "prelude.c")
+	// The standard library's sources are embedded in the compiler, so they
+	// carry no #line directives; the path is named anyway, because a debug
+	// build's regions have to return to the file they are compiled from.
+	lib := codegen.EmitLibrary(pa, codegen.Debug{On: debug, CFile: srcFile})
 	if !sameStrings(lib.Literals, unit.PreludeLiterals) {
 		return "", "", fmt.Errorf("internal error: the standard library's string literals and the program's unit disagree "+
 			"(%d against %d); a literal is one object only if both agree which unit defines it. This is a compiler bug",
 			len(lib.Literals), len(unit.PreludeLiterals))
 	}
-	srcFile := filepath.Join(rtDir, "prelude.c")
 	hdrFile := filepath.Join(rtDir, preludeHeader)
 	if err := os.WriteFile(srcFile, []byte(lib.Source), 0o644); err != nil {
 		return "", "", err
@@ -547,7 +611,14 @@ func libraryUnit(entry *cache.Entry, rtDir, cc string, tgt *target, opt string, 
 	objFile := filepath.Join(rtDir, "prelude.o")
 	args := []string{opt, "-std=gnu11", "-fwrapv", "-fno-strict-aliasing", "-w",
 		"-ffunction-sections", "-fdata-sections", "-I", rtDir}
-	args = append(args, tgt.cflags...)
+	args = append(args, targetCflags(tgt, cc)...)
+	if debug {
+		// The standard library's sources are embedded in the compiler, so they
+		// carry no #line directives (see codegen.Debug); the object is still
+		// compiled with DWARF so that a frame in it has line information of its
+		// own rather than none.
+		args = append(args, "-g")
+	}
 	// One unit, compiled through the same path the program's own units take, so
 	// that there is one place in the driver that runs a C compiler on generated
 	// C -- and so that the compiler's own diagnostics reach stderr, which is
@@ -587,7 +658,13 @@ const preludeHeader = "typrelude.h"
 
 // preludeEntry is the cache entry the standard library's unit and object live
 // in for one build's settings.
-func preludeEntry(tgt *target, opt, cc string) *cache.Entry {
+func preludeEntry(tgt *target, opt, cc string, debug bool) *cache.Entry {
+	// The object differs when the build asks for debug information, so the
+	// entry does too. A build without -g keeps the key it always had.
+	variant := fmt.Sprintf("cc=%s", filepath.Base(cc))
+	if debug {
+		variant += ";debug=1"
+	}
 	return cache.Open().Lookup(cache.Key{
 		Compiler: cache.Build(version),
 		Runtime:  runtimeHash(tgt),
@@ -600,7 +677,7 @@ func preludeEntry(tgt *target, opt, cc string) *cache.Entry {
 		// from the same source. Reflection is not one of them any more: neither
 		// reflection table is written into the library's unit, so one entry
 		// serves every program (see codegen.EmitLibrary).
-		Variant: fmt.Sprintf("cc=%s", filepath.Base(cc)),
+		Variant: variant,
 	})
 }
 
@@ -637,6 +714,23 @@ func runtimeHash(tgt *target) string {
 func writeRuntimeHeaders(dir string) {
 	must(os.WriteFile(filepath.Join(dir, "tyrt.h"), []byte(tyrt.Header), 0o644))
 	must(os.WriteFile(filepath.Join(dir, "tyrt_plat.h"), []byte(tyrt.PlatHeader), 0o644))
+}
+
+// targetCflags is tgt.cflags plus whatever this particular compiler needs.
+//
+// MinGW's assembler refuses an object with more than 32,767 COFF sections, and
+// the standard library's unit compiled with -ffunction-sections passes that
+// once the library grows past a few thousand functions: the cold-cache build
+// of t93_json failed with "too many sections (35655)". -Wa,-mbig-obj lifts the
+// limit. clang's integrated assembler does not take that option, so it is
+// added only for a MinGW gcc; any other windows compiler gets the plain flags
+// and, if it has a limit of its own, says so itself.
+func targetCflags(tgt *target, cc string) []string {
+	out := append([]string{}, tgt.cflags...)
+	if strings.Contains(strings.ToLower(filepath.Base(cc)), "mingw") {
+		out = append(out, "-Wa,-mbig-obj")
+	}
+	return out
 }
 
 // gcSectionsFlag is how a target's linker is told to drop what nothing
@@ -676,6 +770,16 @@ const (
 // runtime, which is C. A refusal is a diagnostic, not a fallback.
 func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*Result, error) {
 	res := &Result{Diags: diags}
+	// Debug information is the C back end's: its emitter writes the #line
+	// mapping and the C compiler turns it into DWARF. The module this back end
+	// writes carries no !dbg metadata, and accepting -g here would produce a
+	// binary a debugger has nothing to say about, which is worse than saying so
+	// before anything is built.
+	if opts.Debug {
+		diags.Errorf(source.Pos{}, "TY-INT-0103",
+			"the llvm back end does not emit debug information yet: -g is supported by the c back end only")
+		return res, fmt.Errorf("the llvm backend does not support -g")
+	}
 	// The target decides which half of the runtime is compiled beside the module
 	// and what the output is called, exactly as it does for the C back end.
 	tgt, err := resolveTarget(opts.Target, opts.CC)
@@ -790,15 +894,16 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 	}
 	ldflags = append(ldflags, opts.Link...)
 	ldflags = append(ldflags, opts.ExtraCC...)
-	// Link-time optimisation lets clang inline the runtime's helpers (the
-	// allocation fast path's slow half, the string operations) into the module,
-	// which is what the C backend's build gets. It is retried without it when
-	// the toolchain has no LTO support: only the flags differ.
-	build := func(lto bool) error {
+	// Link-time optimisation lets the C compiler inline the runtime's helpers
+	// (the allocation fast path's slow half, the string operations) into the
+	// module, which is what the C backend's build gets. It is asked for in the
+	// same order the C backend asks for it: the parallel form first, the plain
+	// form for a toolchain that does not know it, and no LTO for one with none.
+	build := func(mode ltoMode) error {
 		cf, ld := cflags, ldflags
-		if lto {
-			cf = append([]string{"-flto"}, cflags...)
-			ld = append([]string{"-flto"}, ldflags...)
+		if cfExtra, ldExtra := ltoFlags(cc, tgt.name, compileJobs(len(units)), mode); len(cfExtra) > 0 || len(ldExtra) > 0 {
+			cf = append(append([]string{}, cfExtra...), cflags...)
+			ld = append(append([]string{}, ldExtra...), ldflags...)
 		}
 		if err := compileUnits(cc, cf, units, opts.Verbose); err != nil {
 			return err
@@ -813,16 +918,17 @@ func compileLLVM(prog *sema.Program, opts Options, diags *source.Diagnostics) (*
 		}
 		return nil
 	}
-	if err := build(!opts.NoLTO); err != nil {
-		if opts.NoLTO {
-			return res, backendFailure(err, mfile)
+	modes := ltoAttempts(cc, tgt.name, compileJobs(len(units)), !opts.NoLTO)
+	for i, mode := range modes {
+		if err = build(mode); err == nil {
+			break
 		}
-		if opts.Verbose {
-			fmt.Fprintln(os.Stderr, "teyru: retrying without -flto")
+		if opts.Verbose && i+1 < len(modes) {
+			fmt.Fprintf(os.Stderr, "teyru: llvm backend: retrying with %s\n", ltoName(modes[i+1]))
 		}
-		if err2 := build(false); err2 != nil {
-			return res, backendFailure(err, mfile)
-		}
+	}
+	if err != nil {
+		return res, backendFailure(err, mfile)
 	}
 	res.Exe = exe
 	return res, nil
@@ -894,6 +1000,28 @@ func parseFile(path string, diags *source.Diagnostics) *ast.File {
 		return &ast.File{Src: source.NewFile(path, "")}
 	}
 	return parseSource(path, string(data), diags)
+}
+
+// Analyze runs the front end on one source file: the standard library and the
+// file are parsed, and the checker runs over both. It returns the diagnostics
+// that belong to the file (the library's own are not the editor's business)
+// together with the file's syntax tree, whose resolved references are what a
+// definition lookup reads.
+//
+// This is the same parse-and-check path Compile takes, without the back end.
+func Analyze(path, text string) (*source.Diagnostics, *ast.File) {
+	all := &source.Diagnostics{}
+	files := parsePrelude(all)
+	f := parseSource(path, text, all)
+	files = append(files, f)
+	sema.Check(files, all)
+	out := &source.Diagnostics{}
+	for _, d := range all.List {
+		if d.Pos.File == f.Src {
+			out.List = append(out.List, d)
+		}
+	}
+	return out, f
 }
 
 func parseSource(path, text string, diags *source.Diagnostics) *ast.File {

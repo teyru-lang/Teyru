@@ -502,6 +502,7 @@ func (s *reflectScan) read(cl *ast.Class) {
 				// wherever the call is written: the program may reach this
 				// library body, and then the load happens.
 				s.names.add(s.lookupName(name))
+				s.registerArrayName(name)
 				return
 			}
 			if lib && api {
@@ -1323,6 +1324,21 @@ func (s *reflectScan) ifacesOf(set clsSet) clsSet {
 // to nothing -- Class.forName("Nope") -- names no class, and the table needs no
 // entry for it.
 func (s *reflectScan) lookupName(name string) *ast.Class {
+	// An array descriptor names its component: forName("[Ljava.lang.String;")
+	// is answered by the array class of the class the component names, so that
+	// class is what the table has to carry. A primitive component names no
+	// class at all -- its array class is emitted for every program.
+	if strings.HasPrefix(name, "[") {
+		i := 0
+		for i < len(name) && name[i] == '[' {
+			i++
+		}
+		rest := name[i:]
+		if len(rest) >= 2 && rest[0] == 'L' && rest[len(rest)-1] == ';' {
+			return s.lookupName(rest[1 : len(rest)-1])
+		}
+		return nil
+	}
 	if cl := s.e.prog.LookupClass(name); cl != nil {
 		return cl
 	}
@@ -1337,6 +1353,58 @@ func (s *reflectScan) lookupName(name string) *ast.Class {
 		return cl
 	}
 	return s.e.prog.ProgramClass(simple)
+}
+
+// registerArrayName emits the array class a forName descriptor names. The
+// class table carries the component, not the descriptor (Class.forName parses
+// a "[" name itself), but the array class has to exist: forName("[I") and
+// forName("[[Ljava.lang.String;") answer with it, and the reachability scan is
+// the only place that reads the name before the table is written.
+func (s *reflectScan) registerArrayName(name string) {
+	t := s.descriptorType(name)
+	if t == nil {
+		return
+	}
+	if at, ok := t.(*ast.ArrayType); ok {
+		s.e.arrayClassFor(at.Elem)
+	}
+}
+
+// descriptorType parses a JVM array descriptor into the array type it names,
+// or nil for anything that is not one.
+func (s *reflectScan) descriptorType(name string) ast.Type {
+	dims := 0
+	for dims < len(name) && name[dims] == '[' {
+		dims++
+	}
+	if dims == 0 {
+		return nil
+	}
+	rest := name[dims:]
+	var elem ast.Type
+	if len(rest) == 1 {
+		kinds := map[byte]ast.PrimKind{
+			'Z': ast.Boolean, 'B': ast.Byte, 'S': ast.Short, 'C': ast.Char,
+			'I': ast.Int, 'J': ast.Long, 'F': ast.Float, 'D': ast.Double,
+		}
+		k, ok := kinds[rest[0]]
+		if !ok {
+			return nil
+		}
+		elem = &ast.PrimType{Kind: k}
+	} else if len(rest) >= 2 && rest[0] == 'L' && rest[len(rest)-1] == ';' {
+		cl := s.lookupName(rest[1 : len(rest)-1])
+		if cl == nil {
+			return nil
+		}
+		elem = &ast.ClassType{Class: cl}
+	} else {
+		return nil
+	}
+	for range dims {
+		elem = &ast.ArrayType{Elem: elem}
+	}
+	return elem
 }
 
 // constString answers the compile-time string a Class.forName argument is, or

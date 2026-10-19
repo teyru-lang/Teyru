@@ -145,6 +145,8 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, eq, end int, ok
 		return body[ns:k], true, -1, k + 1, true
 	}
 	// a run of type words: identifiers separated by whitespace
+	typeStart := j
+	typeEnd := j
 	words := 0
 	for {
 		k := j
@@ -155,6 +157,7 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, eq, end int, ok
 			break
 		}
 		words++
+		typeEnd = k
 		if k < len(body) && (body[k] == ' ' || body[k] == '\t') {
 			j = k
 			for j < len(body) && (body[j] == ' ' || body[j] == '\t') {
@@ -166,6 +169,16 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, eq, end int, ok
 		break
 	}
 	if words == 0 {
+		return "", false, 0, 0, false
+	}
+	/* A pointer to a C primitive is not a reference: it points at a local, at
+	   a loop counter, or into the middle of an array whose owner is named
+	   somewhere else. Registering it costs the program twice -- the variable's
+	   address is taken, so the C compiler can no longer keep a loop counter in
+	   a register, and the collector is handed a word that can only ever fail
+	   its validity test. `void*` is not in the list: it is how the emitter
+	   carries a reference across an expression. */
+	if isPrimitiveCType(body[typeStart:typeEnd]) {
 		return "", false, 0, 0, false
 	}
 	// then a pointer: one or more `*` (with optional space), then an optional
@@ -232,6 +245,27 @@ func frameDeclAt(body string, i int) (name string, isCatch bool, eq, end int, ok
 		return "", false, 0, 0, false
 	}
 	return name, false, k, end, true
+}
+
+// isPrimitiveCType reports whether a declaration's type words name a C
+// primitive. The last word is the base type, so `unsigned char` and
+// `long long` answer by it.
+func isPrimitiveCType(t string) bool {
+	fields := strings.Fields(t)
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[len(fields)-1] {
+	case "int8_t", "int16_t", "int32_t", "int64_t",
+		"uint8_t", "uint16_t", "uint32_t", "uint64_t",
+		"short", "int", "long", "float", "double",
+		"size_t", "intptr_t", "uintptr_t", "ptrdiff_t":
+		return true
+	}
+	/* `char *` is deliberately not in the list: it is how a program holds the
+	   bytes of a string, and the string is a heap object the word may be the
+	   only name for. A pointer to an int or a double never points at one. */
+	return false
 }
 
 // isQualifier reports whether a word between a declaration's stars and its name

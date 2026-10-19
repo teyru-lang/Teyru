@@ -128,7 +128,7 @@ func EmitLLVM(p *sema.Program) (ir string, ref *Refusal) {
 // exception machinery read what it writes. The offsets were taken from a probe
 // program compiled against internal/runtime/src/tyrt.h (clang 22, x86-64 Linux):
 //
-//	jmp_buf 200          tycatch { buf 0, prev 200, ex 208 }              216
+//	jmp_buf 200          tycatch { buf 0, prev 200, ex 208, frames 216 } 224
 //	tystr  { obj 0, blen 8, ulen 16, flags 20 }                           24
 //	tyarr  { obj 0, len 8, data 16, esize 24, refs 28, elemcls 32 }       40
 //	tymap  { sel 0, fn 8 }                                                16
@@ -231,6 +231,13 @@ var tycatchLayout = []rtField{
 	{"buf", "[200 x i8]", 0},
 	{"prev", "ptr", 200},
 	{"ex", "ptr", 208},
+	// The frame chain as it was when the catch was armed. ty_throw rewinds
+	// ty_frames to it before the longjmp, because the frames between the throw
+	// and the landing pad are stack storage the jump just freed. A frame that
+	// did not write this field makes ty_throw rewind the chain to whatever was
+	// beside it -- a chain the collector then walks, which is a missing root
+	// rather than retention.
+	{"frames", "ptr", 216},
 }
 
 var tythreadLayout = []rtField{
@@ -358,6 +365,9 @@ type llvmEmitter struct {
 
 	trapNames map[string]string // a vtable slot's signature -> its trap
 	trapOrder []string
+	// ifaceDevirt caches the C back end's whole-program devirtualization
+	// answer per interface method (see Emitter.devirtInterface).
+	ifaceDevirt map[*ast.Method]*ast.Method
 
 	// classWraps interns the object a class literal is built from, one per
 	// class a literal names.
@@ -386,6 +396,28 @@ type llvmEmitter struct {
 	tyclassEntries []structEntry
 	tyclassIdx     map[string]int
 
+	// The reflection tables' struct types, and the class sets the C back end's
+	// reachability scan says they have to cover (see reflectset.go).
+	tyannoargEntries    []structEntry
+	tyannotationEntries []structEntry
+	tyfieldEntries      []structEntry
+	tymethodEntries     []structEntry
+	reflTables          *reflectSet
+	// meta holds the table each class's record names: its annotations, its
+	// fields and its methods.
+	meta map[*ast.Class]*classMeta
+	// reflBoxes is set once a member table has shipped: Field.get may build a
+	// wrapper the program's own code never boxes into, so every box is then
+	// installed.
+	reflBoxes bool
+
+	// invNames and invOrder are the reflective invoker stubs, one per method
+	// table entry. A program this back end compiles cannot reach one (Method
+	// .invoke and Constructor.newInstance are refused), so the stub is the
+	// table's shape rather than a call path.
+	invNames map[string]string
+	invOrder []string
+
 	// rtCtx names the runtime call whose arguments are being converted, so that
 	// a conversion this back end cannot make says which call it was for.
 	rtCtx string
@@ -408,11 +440,17 @@ func newLLVMEmitter(p *sema.Program) *llvmEmitter {
 		capIdx:      map[*ast.Class]map[string]int{},
 		classWraps:  map[string]string{},
 		primClasses: map[ast.PrimKind]bool{},
+		meta:        map[*ast.Class]*classMeta{},
+		invNames:    map[string]string{},
 	}
 	// The tyclass type's fields, computed once: the record initializer and the
 	// vtable lookup both walk them, and they come from the same walk that writes
 	// the type itself.
 	_, e.tyclassEntries, e.tyclassIdx = structDecl("tyclass", tyclassLayout)
+	_, e.tyannoargEntries, _ = structDecl("tyannoarg", tyannoargLayout)
+	_, e.tyannotationEntries, _ = structDecl("tyannotation", tyannotationLayout)
+	_, e.tyfieldEntries, _ = structDecl("tyfield", tyfieldLayout)
+	_, e.tymethodEntries, _ = structDecl("tymethod", tymethodLayout)
 	return e
 }
 
@@ -445,17 +483,27 @@ func (e *llvmEmitter) run() {
 	if e.p.Main != nil {
 		e.needMethod(e.p.Main)
 	}
-	// A program whose own declarations carry a library annotation is read
-	// through the annotation tables at run time, and this back end writes no
-	// tables. The C back end decides the same thing with the same predicate.
-	if ce := (&Emitter{prog: e.p}); ce.programUsesAnnotations() {
-		e.refuse(noPos, "an annotation on the program's own declaration: the llvm back end does not write the annotation tables reflection reads")
-	}
+	// Which classes the reflection tables have to cover, decided by the same
+	// scan the C back end runs (reflectset.go): a table is data that names
+	// classes, and written for every class it would pin the whole library into
+	// a program that never reflects. The scan answers with the classes a
+	// program's call sites can reach, or every class when it cannot bound them.
+	e.reflTables, _ = (&Emitter{prog: e.p}).reflectionReach()
 	// The work queue grows while it is drained: a method body names classes,
 	// which bring their constructors, their static initializers and their
 	// vtable's methods.
-	for i := 0; i < len(e.mqueue); i++ {
-		e.emitMethodBody(e.mqueue[i])
+	for i := 0; ; {
+		for ; i < len(e.mqueue); i++ {
+			e.emitMethodBody(e.mqueue[i])
+		}
+		// A member table names the classes of the types it records -- a field's
+		// type, a method's result and parameters, an annotation and what its
+		// elements name -- and those classes have to be written before the
+		// table that points at them. Bringing them in can add a class whose own
+		// table names more, so this repeats until nothing new arrives.
+		if !e.needReflectionClasses() {
+			break
+		}
 	}
 	e.entry()
 	e.emitClassTables()
@@ -505,12 +553,6 @@ func (e *llvmEmitter) needClass(cl *ast.Class) {
 	if cl == nil || e.classes[cl] {
 		return
 	}
-	if cl.Kind == ast.KindAnnotation {
-		// annotations need the tables reflection reads, which this back end
-		// does not write; an enum or a record needs members, which it does
-		e.refuse(noPos, "an annotation (%s): the llvm back end does not write the annotation tables its members are read from", cl.Full)
-	}
-
 	if cl.Inner || cl.OuterField != nil {
 		// An inner class reaches its enclosing instance through a field the
 		// compiler adds, and every unqualified name in it may have to walk that
@@ -546,16 +588,19 @@ func (e *llvmEmitter) instantiate(cl *ast.Class) {
 	if e.inst[cl] {
 		return
 	}
-	if th := e.p.LookupClass("teyru.Thread"); th != nil && isSubclass(cl, th) {
-		// A thread's run() is dispatched by the runtime's thread start, not by a
-		// call site in the program: the slot it dispatches through is one no
-		// call site names, and a slot this back end did not fill is a stub that
-		// stops with a message. Threads are outside this back end's subset --
-		// the C back end lowers them through ty_thread_start's selector -- so a
-		// program that starts one is refused here rather than run into that stub.
-		e.refuse(noPos, "a thread (%s): the llvm back end does not lower the runtime's thread start, which is what dispatches run()", cl.Full)
-	}
 	e.inst[cl] = true
+	// The runtime starts a thread by calling the object's Runnable.run through
+	// the selector the start site handed it (ty_thread_start0), and no call site
+	// in the program names that method. The slot it dispatches through is
+	// therefore one this back end has to fill by itself: a slot it left a trap
+	// in would stop the thread with a message the program never wrote.
+	if r := e.p.LookupClass("teyru.Runnable"); r != nil {
+		for _, m := range r.Methods["run"] {
+			if impl := e.p.Implements(cl, m); impl != nil {
+				e.needMethod(impl)
+			}
+		}
+	}
 	// Slots 0, 1 and 2 are toString, hashCode and equals. The collector does not
 	// read the vtable, but print_uncaught, ty_obj_hash and ty_obj_equal do, on
 	// whatever object they are handed, so these three answer for every class
@@ -1150,7 +1195,13 @@ func (e *llvmEmitter) emitBody(f *fb, m *ast.Method) {
 		e.ctorBody(f, m.Owner, m, body)
 		e.finishBody(f)
 	case body != nil:
-		e.block(f, body)
+		if m.Mods.Has(ast.ModSynchronized) {
+			// A synchronized method holds its monitor for the whole body, as
+			// Java's does, and gives it back on every way out.
+			e.syncMethodBody(f, m, body)
+		} else {
+			e.block(f, body)
+		}
 		e.finishBody(f)
 	case m.SynthKind != "" && e.synthBody(f, m, m.SynthKind):
 		// the member is written above; a synthesized body returns for itself
@@ -1317,6 +1368,11 @@ func (e *llvmEmitter) emitClassTables() {
 		e.emitRefOffsets(cl)
 		e.emitIfaces(cl)
 		e.emitName(cl)
+	}
+	// The member tables come before the records that name them, so that a
+	// record's initializer is written once, with the table it points at.
+	for _, cl := range e.classOrder {
+		e.emitClassMeta(cl)
 	}
 	for _, cl := range e.classOrder {
 		e.emitClassRecord(cl)
@@ -1509,9 +1565,16 @@ func (e *llvmEmitter) emitClassRecord(cl *ast.Class) {
 		vtable, nvt = "ptr @vt_"+n, len(cl.VTable)
 	}
 	imap, nsel := e.emitImap(cl)
-	// The reflection tables are not written: this back end refuses
-	// java.lang.reflect, and a table nothing can reach is dead weight in every
-	// executable.
+	// The reflection tables the class record names, or the null table a class
+	// the reachability scan left out keeps.
+	m := e.meta[cl]
+	fields, nfields, methods, nmethods := "ptr null", 0, "ptr null", 0
+	annos, nannos := "ptr null", 0
+	if m != nil {
+		fields, nfields = m.fields, m.nfields
+		methods, nmethods = m.methods, m.nmethods
+		annos, nannos = m.annos, m.nannos
+	}
 	vals := map[string]string{
 		"name":     "ptr @.cn" + n,
 		"id":       fmt.Sprintf("i32 %d", cl.ID),
@@ -1531,14 +1594,14 @@ func (e *llvmEmitter) emitClassRecord(cl *ast.Class) {
 		"refoffs":  "ptr @refs_" + n,
 		"mods":     fmt.Sprintf("i32 %d", (&Emitter{prog: e.p}).classMods(cl)),
 		"prim":     "i32 0",
-		"fields":   "ptr null",
-		"nfields":  "i32 0",
-		"methods":  "ptr null",
-		"nmethods": "i32 0",
+		"fields":   fields,
+		"nfields":  fmt.Sprintf("i32 %d", nfields),
+		"methods":  methods,
+		"nmethods": fmt.Sprintf("i32 %d", nmethods),
 		"consts":   "ptr null",
 		"nconsts":  "i32 0",
-		"annos":    "ptr null",
-		"nannos":   "i32 0",
+		"annos":    annos,
+		"nannos":   fmt.Sprintf("i32 %d", nannos),
 	}
 	if j := util.JavaName(cl.Full); j != cl.Full {
 		vals["jname"] = "ptr @.jn" + n
@@ -2063,6 +2126,10 @@ func (e *llvmEmitter) emitTypes() {
 		{"tymap", tymapLayout},
 		{"tycatch", tycatchLayout},
 		{"tythread", tythreadLayout},
+		{"tyannoarg", tyannoargLayout},
+		{"tyannotation", tyannotationLayout},
+		{"tyfield", tyfieldLayout},
+		{"tymethod", tymethodLayout},
 	} {
 		decl, _, _ := structDecl(st.name, st.layout)
 		e.types.WriteString(decl)

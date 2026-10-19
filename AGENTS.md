@@ -144,6 +144,15 @@ source → lexer → parser → ast → sema → codegen
   而函式庫對它拿到的那個檔案在**兩種佈局下都讀對**（vanguard 與 rearguard 對愛爾蘭給出相同的
   offset 與縮寫、相反的 `isdst`），所以沒有任何固定的期望能同時滿足兩者；差一點就去改讀取程式
   那一邊，而該改的是測試。
+- **跨平台的整套要給 `TEYRU_RUNNER`**：`TEYRU_TARGET=windows/amd64` 配
+  `TEYRU_RUNNER=wine`，arm64 配 `qemu-aarch64`。**不要用 binfmt 代替**：核心的 `P` 旗標
+  會把執行檔路徑同時當成 argv[0] 與第一個參數，`t08_args` 因此回報多一個參數——那是
+  執行方式錯了，不是程式錯了。MinGW 的組譯器另外有 32,767 個 COFF section 的上限，
+  冷快取的標準庫單元會超過它（`t93_json` 是 35,655），所以 mingw 的旗標裡有
+  `-Wa,-mbig-obj`（`targetCflags`）。
+- **Teyru 自己的測試**：語言層級的單元測試用 `teyru test`（`@Test`／`@BeforeEach`／
+  `Assert`，見〈工具鏈〉），放在 `tests/test-framework/`。它驗的是**標準庫與語言語意**；
+  編譯器本身的 Go 測試仍用 `go test`，兩者不互相取代。
 - **端到端**：在 `tests/programs/` 放 `xxx.teyru` 與 `xxx.expected`。
   需要命令列參數時另外放 `xxx.args`（每行一個）。`go test` 會自動編譯並比對輸出。
   `tests/` 是 `teyru-lang/tests` 的 submodule：改測試要在**那個**倉庫提交，這裡只會
@@ -174,6 +183,11 @@ source → lexer → parser → ast → sema → codegen
 - 效能相關的改動要附上 `sh scripts/bench.sh` 的前後數字。
 
 ---
+
+**CI 是必需的路徑，不是可選的。** `.github/workflows/ci.yml` 在每個 push 與 PR 上跑
+`go build`、`go vet` 與整套 `go test`，`nightly.yml` 每天以 `CC=gcc` 跑同一套。
+本機的 pre-commit hook 跑的是同一條路徑；略過它（`TEYRU_SKIP_HOOKS=1`）時，
+必須在同一個提交前自己跑過同樣的檢查，並在回報裡說明。
 
 ## 7. 診斷碼規範
 
@@ -213,6 +227,7 @@ source → lexer → parser → ast → sema → codegen
 | `teyru-lang/docs` 的〈原生互通〉 | 以 C 實作 native 方法、符號命名與型別對應 | native 介面或 CLI 旗標改變時 |
 | `teyru-lang/docs` 的〈架構〉 | 編譯流程與執行期模型 | 架構改變時 |
 | `teyru-lang/docs` 的〈JSON〉／〈Web 框架〉／〈模組〉 | 各主題的完整說明 | 該主題行為改變時 |
+| `teyru-lang/docs` 的〈工具鏈〉 | `teyru fmt`／`lsp`／`test`、`-g` 與 CI 的用法與限制 | 任一工具的行為、旗標或限制改變時 |
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
 
@@ -272,15 +287,35 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   ——clang 對這些形狀剛好由左至右——只有 `make ci`（§6）的**第二條腿**（`TEYRU_CC=gcc`）看得見，
   而它從未綠過；回歸測試是 `tests/programs/t260_eval_order.teyru`，它的 `.expected` 來自
   `t260_eval_order.java.ref` 在 OpenJDK 21 上的輸出。
-- checked exception 沒有編譯期檢查。
-- `sealed` 的 `permits` 子句沒有被驗證：沒有 `permits` 的 sealed 型別在 switch
-  窮盡性上被視為不可判定而要求 `default`。
+- checked exception 對**程式自己的程式碼**做編譯期檢查（JLS 11.2）：呼叫或 `throw`
+  一個受檢例外時，外層 `try` 的 catch 子句必須能接住它，或外圍方法／建構子／初始化器
+  必須宣告它；catch 子型別不涵蓋宣告的超型別、`finally` 不接例外，lambda 的 body 以
+  函式介面的 `throws` 為準。診斷是 `TY-TYP-0122`，測試是
+  `tests/programs/t306_checked_exceptions.teyru` 與
+  `tests/diagnostics/{uncaughtCheckedCall,uncaughtCheckedThrow,finallyDoesNotCatch,checkedInLambda}.teyru`。
+  標準程式庫**自己的 body** 不在這條規則內，因為它被當成已編譯的相依（javac 也不檢查
+  JDK 原始碼）：它的 140 個違規（12 個檔案；ZipException 51、IOException 26、
+  DataFormatException 16、EOFException 12、WebSocketProtocolException 8、
+  SocketException 7、UTFDataFormatException 5、ParseException 4，其餘 11 個分屬五類）是
+  整份程式庫例外模型的改寫，不是這條規則的一部分。程式庫**宣告**的受檢例外仍會在使用端
+  被要求處理（例如 `MessageFormat.parse` 的 `ParseException`）。未模型化的是 precise
+  rethrow（`catch (Exception e) { throw e; }` 只宣告 try 區塊實際會丟的型別）與方法參考的
+  `throws`；兩者都是從嚴拒絕，不會放過。
+- `sealed` 的 `permits` 子句會被驗證（JLS 8.1.6／9.1.4）：`permits` 只能指名直接子型別、
+  每個直接子型別都必須被允許（沒有 `permits` 時，同一個編譯單元裡的直接子型別就是隱式
+  允許，與 Java 相同）、每個被允許的子型別必須是 `final`、`sealed` 或 `non-sealed`。
+  因此沒有 `permits` 的 sealed 型別在 switch 窮盡性上不再不可判定：同檔案的直接子型別
+  就是 permit 集合。診斷是 `TY-TYP-0119`／`0120`／`0121`，測試是
+  `tests/programs/t307_sealed_permits.teyru` 與 `tests/diagnostics/sealed*.teyru`。
 - 反射在 `lib/26_reflect.teyru`：`Class`、`Field`、`Method`、`Constructor`、
   `Modifier`、`Array` 與 `java.lang.reflect` 的六個例外，讀的是編譯器為每個類別
   產生的靜態表（欄位、方法、修飾子、列舉常數），所以查一次資料是走一次陣列，
   執行期不建表。與 Java 的差異（都已實測，不是未驗證）：
-  - 類別名是 Teyru 的：`String.class.getName()` 是 `teyru.String`，
-    `Class.forName` 兩種寫法都收（`java.lang.String` 會找到同一類別）。
+  - 類別名是 JDK 的（D8）：`String.class.getName()` 是 `java.lang.String`，
+    `Class.forName` 兩種寫法都收（`java.lang.String` 與 `teyru.String` 會找到
+    同一類別）。陣列的 `getName()` 是原始碼形式（`int[]`、`java.lang.String[]`，
+    等同 JDK 的 `getTypeName()`）；二元描述子（`[I`、`[Ljava.lang.String;`）
+    是 `Class.forName` 解析的名字。
   - 註解反射有，但元素是**按名字讀**：`Class`／`Field`／`Method`／`Constructor`
     上的 `getAnnotations()`、`getAnnotation(Class)`、`isAnnotationPresent(Class)` 是
     Java 的，`Annotation` 則沒有「每個註解型別一個實作類別」——所以要
@@ -288,14 +323,35 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
     `classValue`／`enumValue`，而不是 Java 的 `ann.value()`。沒寫的元素讀得到介面
     宣告的預設值（parser 保留 `default`）；`@Retention` 收得下但沒有作用；陣列型別
     的元素值不帶（讀它會說不支援）。
-  - 所有陣列共用一個類別，因此沒有 `getComponentType`、沒有每個元素型別的陣列
-    類別，`forName("[I")` 也沒有東西可回答。
-  - 沒有泛型型別參數的反射（`getGenericType` 等不存在）。
+  - 每個元素型別有自己的陣列類別：`int[].class`、`String[].class`、
+    `Person[].class` 是不同類別，`getComponentType()` 回答元素類別，
+    `forName("[I")`／`forName("[[I")`／`forName("[Ljava.lang.String;")` 解析
+    描述子。陣列值由產生程式碼與 `Array.newInstance` 建立時帶上自己的類別；
+    **執行期自己建的陣列**（例如 `String.toCharArray()`）仍帶共用的
+    `teyru.Array`，`Array.newInstance` 對一個沒有被發出的元素類別也退回它。
+    陣列類別只為可達的元素型別發出（`internal/codegen/arrayclass.go`，與成員表
+    同一套可達性分析），所以沒有反射、也沒有寫出陣列型別的程式不付這筆成本。
+    所有陣列類別的父類別是 `teyru.Array`，因此 `instanceof` 與轉型到陣列型別
+    的答案不變；`getSuperclass()` 依 Java 回答 `Object`。
+  - 泛型型別反射是**一層**：`Field.getGenericType()`、`Method` 的
+    `getGenericReturnType()`／`getGenericParameterTypes()`、
+    `Constructor.getGenericParameterTypes()` 與 `Class.getGenericSuperclass()`
+    回答 `ParameterizedType`（`getRawType()`／`getActualTypeArguments()`，
+    元素是 `Class`）。沒有型別引數的宣告回答它的 `Class`，raw 宣告也是。
+    **不能表示的就明確拒絕**：萬用字元、型別變數、超過一層的參數化型別都拋
+    `UnsupportedOperationException` 並說明原因，不會回傳抹除後的型別。
+    `java.lang.reflect.Type` 只有 `Class` 與 `ParameterizedType` 兩個實作，
+    沒有 `WildcardType`、`TypeVariable`、`GenericArrayType`。
   - 原生型別的取值器只收完全相符的裝箱型別，Java 的拓寬（例如對 `byte` 欄位
     呼叫 `getInt`）在這裡是 `IllegalArgumentException`。
-  - 存取控制不檢查：私有成員可以直接讀寫。final 一律攔，`setAccessible(true)`
-    之後可以寫 instance final，但 static final 一律拒絕（javac 也是這樣：JDK 不再
-    讓它通過，即使 setAccessible 過）。
+  - 存取控制會檢查：`Field.get`／`set`、`Method.invoke`、`Constructor.newInstance`
+    對 private／protected／package-private 成員拋 `IllegalAccessException`，
+    `setAccessible(true)` 之後放行。這裡沒有「呼叫者類別」可查，所以不像 Java
+    那樣允許同套件或子類別的存取——非 public 一律拒絕，直到程式明確放行。
+    final 一律攔，`setAccessible(true)` 之後可以寫 instance final，但 static
+    final 一律拒絕（javac 也是這樣：JDK 不再讓它通過，即使 setAccessible 過）。
+    標準程式庫自己讀私有成員的地方（Gson、容器注入、驗證、路由）都先呼叫
+    `setAccessible(true)`。
   - 內部類別與區域類別不能被反射建構（沒有外圍實例可用）。
   - 成員表（欄位、方法與 invoker）只在使用者程式真的可能用到反射時才寫進執行檔
     （`emit.go` 的 `reflectUsed`）：它們是唯一會指名別的類別的中繼資料，擺在檔案
@@ -331,9 +387,37 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   `currentThread`／`getId`／`getName`／`isAlive`）、真的 `synchronized`（含
   `synchronized` 方法修飾子，方法會持有監視器整段）與 `Object.wait`／`notify`／
   `notifyAll`。執行期在 `internal/runtime/src/tyrt_thread.c`，端到端測試是
-  `tests/programs/t159_threads.teyru`。**沒有的**：`interrupt`、daemon、優先權、
-  `ThreadGroup`、`ThreadLocal`、堆疊大小與逾時的 `join(long)`，以及未處理例外的
+  `tests/programs/t159_threads.teyru`。
+  中斷與 daemon 已實作：`interrupt`／`isInterrupted`／`Thread.interrupted`（狀態
+  在每個執行緒的執行期條目裡；`sleep`、`join`、`Object.wait`／`wait(long)` 用各自的
+  條件變數等待並在醒來時檢查，所以不需要 signal；被中斷時清除旗標並丟
+  `InterruptedException`；阻塞的檔案與 socket I/O 不可中斷，與 classic `java.io`
+  相同）、`setDaemon`／`isDaemon`（`start` 之後丟
+  `IllegalThreadStateException`；建構時繼承建立者的 daemon 狀態；行程在最後一個
+  非 daemon 執行緒結束時結束，`ty_thread_join_all` 等的是
+  `n_live - n_daemon`）。`ThreadLocal` 是純 Teyru：值放在 `Thread` 物件自己的
+  `HashMap` 欄位，GC 看到的是普通引用，執行期不參與。端到端測試是
+  `tests/programs/t288_interrupt.teyru`、`t289_interrupt_status.teyru`、
+  `t290_daemon_exit.teyru`、`t291_thread_local.teyru`。**沒有的**：優先權、
+  `ThreadGroup`、堆疊大小與逾時的 `join(long)`、中斷阻塞 I/O，以及未處理例外的
   handler（執行期印出 Java 預設處理常式那一行，然後結束那個執行緒、行程繼續）。
+  **虛擬執行緒**（`Thread.startVirtualThread`／`Thread.ofVirtual()`／`isVirtual()`）
+  是 ucontext 上的 M:N：每個虛擬執行緒有自己的堆疊，停在執行期自己的阻塞點
+  （`sleep`、`join`、`wait`、socket 與檔案的讀寫、accept／connect）時讓出 carrier，
+  carrier 的數量由 `TEYRU_VTHREAD_CARRIERS` 指定（預設是 CPU 數）。停在停車場的
+  堆疊以保守掃描註冊成 root，所以只有它指到的物件活著。實測 10,000 條各睡 50 ms：
+  虛擬 0.11–0.12 s／約 94 MB，平台執行緒 0.24–0.25 s／約 156 MB。**Windows 以具名
+  例外拒絕**（沒有 ucontext），虛擬堆疊沒有自己的 guard page（靠既有的 256 KB
+  stack-check 餘裕），TLS 的 I/O 還不會 parking。測試是 `t314`–`t317`。
+  **精確 frame map 的代價要記在這裡。** 每一個指標型別的 C 物件都會被登記成一個
+  root，而登記就是把那個變數的位址交給收集器——被取位址的迴圈變數進不了暫存器。
+  `bench_loop`（2000 萬次內迴圈）在 `130565a` 是 1.13 s，frame map 落地之後是 2.91 s；
+  拿掉原生型別指標（`int32_t *` 這種只會指向堆疊的）與「指標暫存變數」的登記、並讓
+  `x op= y`／`x++` 對純區域變數直接寫回之後是 **2.01 s**。剩下的差額是迴圈裡的陣列暫存
+  變數被登記，還沒解。`TEYRU_NO_FRAME_MAPS=1` 可以量到沒有 map 的版本（1.13 s），
+  它是**量測開關**，不是可以拿去出貨的設定：關掉之後根只有保守掃描，`t245` 就會退步。
+  **不要把 `ty_frame_put` 內聯進 `tyrt.h`**：執行期沒有變快，而 clang 編
+  `t114_stream` 的單元從 40 秒變成九分鐘以上（每個呼叫點都展開一次）。
   GC 是**合作式**停止世界：安全點在每個迴圈回邊（產生器會放）、配置慢路徑、等
   heap 鎖，以及執行期自己每個會等的呼叫——socket 的讀、寫、accept 與 connect 等待，TLS
   的握手與讀寫，檔案與管線的讀寫迴圈，stdin 讀一行，以及 sleep、join、monitor wait
@@ -1259,6 +1343,8 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
 ## 11. 送出前檢查清單
 
 - [ ] `go build ./...`、`go vet ./...`、`go test ./... -count=1` 全綠（`tests/` submodule 已 checkout）
+- [ ] 改了 `.teyru` 就 `teyru fmt -w`（`fmt` 是冪等的，輸出會被 CI 與測試比對）
+- [ ] 新增的診斷碼已在 docs 的〈診斷碼〉三個 locale 各有一列
 - [ ] 新功能有端到端測試；新診斷碼有拒絕測試
 - [ ] 沒有多行 TODO 或空殼實作；未實作路徑會明確失敗
 - [ ] 共用邏輯在 `internal/util`，沒有兩份實作

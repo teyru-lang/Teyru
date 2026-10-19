@@ -136,27 +136,38 @@ var nativeTable = map[string]nativeFn{
 	// the one ty_sync_enter takes on the same receiver, so a thread that is
 	// inside wait() has given up the monitor of the object it is notified
 	// through. tyrt_thread.c has the monitor itself.
-	"Object.wait(J)":     {fn: "ty_mon_wait", recv: "void*"},
-	"Object.notify()":    {fn: "ty_mon_notify", recv: "void*"},
-	"Object.notifyAll()": {fn: "ty_mon_notify_all", recv: "void*"},
-	"Class.getName()":    {fn: "ty_class_name", recv: "void*"},
+	"Object.wait0(Object,J)": {fn: "ty_mon_wait", recv: "void*"},
+	"Object.notify()":        {fn: "ty_mon_notify", recv: "void*"},
+	"Object.notifyAll()":     {fn: "ty_mon_notify_all", recv: "void*"},
+	"Class.getName()":        {fn: "ty_class_name", recv: "void*"},
 
 	// ---- java.lang.Thread
 	//
 	// lib/35_thread.teyru declares these. start0 is the one entry that needs a
 	// selector as well as its arguments: it runs the thread, and the thread runs
 	// the program's own run(), which only the compiler knows how to dispatch.
-	"Thread.start0(Thread,J,String)": {
+	"Thread.start0(Thread,J,String,Z)": {
 		fn: "ty_thread_start0", selClass: "teyru.Runnable", selMethod: "run",
 	},
-	"Thread.join0(J)":      {fn: "ty_thread_join"},
-	"Thread.alive0(J)":     {fn: "ty_thread_alive"},
-	"Thread.nextId0()":     {fn: "ty_thread_next_id"},
-	"Thread.current0()":    {fn: "ty_thread_current_obj"},
-	"Thread.currentId0()":  {fn: "ty_thread_current_id"},
-	"Thread.bind0(Thread)": {fn: "ty_thread_bind"},
-	"Thread.sleep(J)":      {fn: "ty_thread_sleep_ms"},
-	"Thread.yield()":       {fn: "ty_thread_yield"},
+	/* The virtual-thread half of the same start. The runtime creates a
+	   continuation and hands it to a carrier instead of creating an operating
+	   system thread; the selector is the same one start0 needs, for the same
+	   reason. */
+	"Thread.startVirtual0(Thread,J,String)": {
+		fn: "ty_thread_start_virtual0", selClass: "teyru.Runnable", selMethod: "run",
+	},
+	"Thread.join0(J)":            {fn: "ty_thread_join"},
+	"Thread.alive0(J)":           {fn: "ty_thread_alive"},
+	"Thread.nextId0()":           {fn: "ty_thread_next_id"},
+	"Thread.current0()":          {fn: "ty_thread_current_obj"},
+	"Thread.currentId0()":        {fn: "ty_thread_current_id"},
+	"Thread.bind0(Thread)":       {fn: "ty_thread_bind"},
+	"Thread.sleep0(J)":           {fn: "ty_thread_sleep_ms"},
+	"Thread.interrupt0(J)":       {fn: "ty_thread_interrupt"},
+	"Thread.isInterrupted0(J)":   {fn: "ty_thread_is_interrupted"},
+	"Thread.clearInterrupted0()": {fn: "ty_thread_clear_interrupted"},
+	"Thread.currentDaemon0()":    {fn: "ty_thread_current_daemon"},
+	"Thread.yield()":             {fn: "ty_thread_yield"},
 
 	// ---- java.lang.reflect
 	//
@@ -227,6 +238,18 @@ var nativeTable = map[string]nativeFn{
 	"Annotation.argIndexOf(J,String)":            {fn: "ty_ann_argindex"},
 	"Annotation.sameOf(J,J)":                     {fn: "ty_ann_same"},
 	"Class.makeOf(J)":                            {fn: "ty_class_make", clsArg: "teyru.Class"},
+	"Class.componentOf(J)":                       {fn: "ty_class_component"},
+	"Class.arrayOf(Class)":                       {fn: "ty_class_arrayof", clsArg: "teyru.Class"},
+	"Class.fieldSigOf(J,Z,I)":                    {fn: "ty_field_sig"},
+	"Class.methodSigRetOf(J,Z,I)":                {fn: "ty_method_sigret"},
+	"Class.methodSigParamOf(J,Z,I,I)":            {fn: "ty_method_sigparam"},
+	"Class.ctorSigParamOf(J,I,I)":                {fn: "ty_ctor_sigparam"},
+	"Class.classSigOf(J)":                        {fn: "ty_class_sig"},
+	"Class.sigRawOf(J)":                          {fn: "ty_sig_raw"},
+	"Class.sigArgCountOf(J)":                     {fn: "ty_sig_argcount"},
+	"Class.sigArgOf(J,I)":                        {fn: "ty_sig_arg"},
+	"Class.sigOkOf(J)":                           {fn: "ty_sig_ok"},
+	"Class.sigWhyOf(J)":                          {fn: "ty_sig_why"},
 	"Array.newArrayOf(J,I)":                      {fn: "ty_reflect_array_new"},
 	"Array.lengthOf(Object)":                     {fn: "ty_reflect_array_len"},
 	"Array.getOf(Object,I)":                      {fn: "ty_reflect_array_get"},

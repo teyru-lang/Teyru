@@ -1,0 +1,73 @@
+name: ci
+
+# What this catches: every push to main and every pull request gets the
+# compiler's own checks -- build, vet, and the whole end-to-end suite through
+# `go test` -- and, in a second job, the same suite through tests/run.sh.
+#
+# release.yml runs only when a tag is published, so without this file a commit
+# that broke the driver, the diagnostics or the suite data would stay unseen
+# until someone cut a release. The two jobs are separate because they fail for
+# different reasons: `build` is the Go packages and the harness, `suite` is the
+# script that the tests repository ships, which is exercised by a binary built
+# here rather than by `go test`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out the tree and the suite submodule
+        uses: actions/checkout@v4
+        with:
+          # tests/ is the teyru-lang/tests submodule and the suite is its data
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: the whole suite through go test
+        # The deadline is raised because the suite compiles and links every
+        # program under tests/programs, and Go's default ten minutes is not
+        # enough for that on a shared runner.
+        run: go test ./... -count=1 -timeout 60m
+
+  suite:
+    name: the suite through tests/run.sh
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out the tree and the suite submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build the compiler
+        run: go build -o teyru ./cmd/teyru
+
+      - name: run the suite
+        # run.sh takes the compiler from TEYRU, not from PATH, and is started
+        # from the repository root; the script cds to its own directory, so the
+        # suite data beside it is found either way. It builds and runs every
+        # program the submodule holds, which is why it gets its own deadline.
+        timeout-minutes: 60
+        run: TEYRU=$PWD/teyru sh tests/run.sh

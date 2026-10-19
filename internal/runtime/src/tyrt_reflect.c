@@ -448,6 +448,10 @@ int32_t ty_class_isinterface(int64_t cm) {
 int64_t ty_class_superof(int64_t cm) {
   tyclass *k = T(cm);
   if (k->flags & 1) return 0;
+  /* Every array's superclass is Object, as it is in Java. The component array
+     classes point at the one array class so that instanceof and casts to an
+     array type keep working, and the answer a program reads is Java's. */
+  if (k->flags & TY_CLS_ARRAY) return H(TY_OBJECT);
   return H(k->super);
 }
 
@@ -505,12 +509,37 @@ int64_t ty_class_ifaceat(int64_t cm, int32_t i) {
 tystr *ty_class_simplename(int64_t cm) {
   tyclass *k = T(cm);
   if (!k || !k->name) return NULL;
+  /* An array's simple name is its component's simple name followed by "[]",
+     which is what Java answers for int[] and String[]. */
+  if ((k->flags & TY_CLS_ARRAY) && k->comp) {
+    tystr *inner = ty_class_simplename(H(k->comp));
+    size_t n = inner ? (size_t)inner->blen : 0;
+    char *buf = (char *)malloc(n + 3);
+    if (!buf) return NULL;
+    if (n > 0) memcpy(buf, TY_STR_DATA(inner), n);
+    memcpy(buf + n, "[]", 2);
+    tystr *out = ty_str_new(buf, (int64_t)(n + 2));
+    free(buf);
+    return out;
+  }
   const char *n = k->name;
   const char *dot = strrchr(n, '.');
   const char *base = dot ? dot + 1 : n;
   const char *dollar = strrchr(base, '$');
   if (dollar && dollar[1]) base = dollar + 1;
   return ty_str_new(base, (int64_t)strlen(base));
+}
+
+int64_t ty_class_component(int64_t cm) {
+  tyclass *k = T(cm);
+  return H(k ? k->comp : NULL);
+}
+
+void *ty_class_arrayof(void *c, tyclass *clscls) {
+  tyclass *k = ty_class_target(c);
+  if (!k) return NULL;
+  tyclass *arr = ty_prog_array_of(k);
+  return arr ? ty_class_make(H(arr), clscls) : NULL;
 }
 
 int32_t ty_class_enumcount(int64_t cm) {
@@ -577,6 +606,41 @@ int64_t ty_field_owner(int64_t cm, int32_t declared, int32_t i) {
 
 int32_t ty_field_mods(int64_t cm, int32_t declared, int32_t i) {
   return field_at(T(cm), declared, i)->mods;
+}
+
+int64_t ty_field_sig(int64_t cm, int32_t declared, int32_t i) {
+  return H(field_at(T(cm), declared, i)->gsig);
+}
+
+/* The signature handle is a pointer to static data, carried in a long the way
+   a class handle is. 0 means the declaration carries no parameterized type. */
+static const tysig *sig_at(int64_t sig) { return (const tysig *)(intptr_t)sig; }
+
+int64_t ty_sig_raw(int64_t sig) {
+  const tysig *s = sig_at(sig);
+  return s ? H(s->raw) : 0;
+}
+
+int32_t ty_sig_argcount(int64_t sig) {
+  const tysig *s = sig_at(sig);
+  return s && s->nargs > 0 ? s->nargs : 0;
+}
+
+int64_t ty_sig_arg(int64_t sig, int32_t i) {
+  const tysig *s = sig_at(sig);
+  if (!s || !s->args || i < 0 || i >= s->nargs) return 0;
+  return H(s->args[i]);
+}
+
+int32_t ty_sig_ok(int64_t sig) {
+  const tysig *s = sig_at(sig);
+  return s && s->nargs >= 0;
+}
+
+tystr *ty_sig_why(int64_t sig) {
+  const tysig *s = sig_at(sig);
+  if (!s || !s->why) return NULL;
+  return ty_str_new(s->why, (int64_t)strlen(s->why));
 }
 
 static void *field_addr(const tyfield *f, void *self) {
@@ -684,6 +748,16 @@ int64_t ty_method_ret(int64_t cm, int32_t declared, int32_t i) {
   return H(method_at(T(cm), declared, i)->ret);
 }
 
+int64_t ty_method_sigret(int64_t cm, int32_t declared, int32_t i) {
+  return H(method_at(T(cm), declared, i)->gret);
+}
+
+int64_t ty_method_sigparam(int64_t cm, int32_t declared, int32_t i, int32_t p) {
+  const tymethod *m = method_at(T(cm), declared, i);
+  if (!m->gparams || p < 0 || p >= m->nparams) return 0;
+  return H(m->gparams[p]);
+}
+
 int32_t ty_method_paramcount(int64_t cm, int32_t declared, int32_t i) {
   return method_at(T(cm), declared, i)->nparams;
 }
@@ -727,6 +801,17 @@ int64_t ty_ctor_param(int64_t cm, int32_t i, int32_t p) {
   const tymethod *m = ctor_at(T(cm), i);
   if (p < 0 || p >= m->nparams) return 0;
   return H(m->params[p]);
+}
+
+int64_t ty_ctor_sigparam(int64_t cm, int32_t i, int32_t p) {
+  const tymethod *m = ctor_at(T(cm), i);
+  if (!m->gparams || p < 0 || p >= m->nparams) return 0;
+  return H(m->gparams[p]);
+}
+
+int64_t ty_class_sig(int64_t cm) {
+  tyclass *k = T(cm);
+  return H(k ? k->gsig : NULL);
 }
 
 void *ty_ctor_new(int64_t cm, int32_t i, tyarr *args) {
@@ -775,6 +860,12 @@ void *ty_reflect_array_new(int64_t component, int32_t len) {
   tyarr *a = ty_array_new(len, es);
   a->refs = k->prim ? 0 : 1;
   a->elemcls = k;
+  /* Array.newInstance builds the same array type the generated code for
+     `new T[n]` builds, so its getClass() answers T[]. The program emits one
+     array class per component it can reach; a component it does not reach
+     keeps the shared class, which is still an array but has no component. */
+  tyclass *arr = ty_prog_array_of(k);
+  if (arr) a->obj.cls = arr;
   return a;
 }
 

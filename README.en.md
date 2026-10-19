@@ -35,7 +35,7 @@ they get two columns:
 | Target | Build | Run |
 |---|---|---|
 | linux/amd64 | ✅ | ✅ native; the whole test suite runs here (`go test ./...`, `TEYRU=<compiler> sh tests/run.sh`) |
-| windows/amd64 | ✅ cross-compiled with `x86_64-w64-mingw32-gcc`; **except programs that touch TLS**, which are named rejections (mingw-w64 has no OpenSSL) | ✅ runs under Wine; measured on 2026-10-17 over the **302** programs in `tests/programs`: **290 produce byte-for-byte identical output (stdout, stderr, exit code)**, **11 touch TLS and are rejected by name**, **1 (`t99_file_shell_meta`) is skipped because NTFS cannot hold that file name** — **0 mismatches**. The whole set was built with `-O0` (302 programs in about 3 minutes); with `-O1`, mingw's `cc1` takes more than two hours on the largest programs, which is toolchain build time, not a behavioural difference |
+| windows/amd64 | ✅ cross-compiled with `x86_64-w64-mingw32-gcc`; **except programs that touch TLS**, which are named rejections (mingw-w64 has no OpenSSL) | ✅ runs under Wine; measured 2026-10-20 over the **318** programs in `tests/programs`: **302 produce byte-for-byte identical output (stdout, stderr, exit code)**, **11 touch TLS and cannot be linked (refused by name)**, **4 skip because Windows has no ucontext for virtual threads**, **1 (`t99_file_shell_meta`) is skipped because NTFS cannot hold that file name** — **0 mismatches**. Built at `-O1` and run with `TEYRU_RUNNER=wine` |
 | linux/arm64 | ✅ needs a compiler pointed at an arm64 sysroot (`CC=aarch64-linux-gnu-gcc` plus `QEMU_LD_PREFIX`; the recipe is in `AGENTS.md` §10) | ✅ runs under qemu: the whole suite **passes 250 of 250 items, 0 mismatches** (222 programs + 3 packages + 23 diagnostics + 2 native), measured 2026-09-17 |
 | darwin/amd64, darwin/arm64 | ✅ with `--cc <zig cc -target <arch>-macos>` (`resolveTarget` now looks at the compiler that will actually be used this time) | ❌ there is no macOS here: **not a single line of any program has ever run on it**, it goes only as far as "compiles and links" |
 
@@ -69,8 +69,10 @@ reflects and never touches TLS does **not** link OpenSSL — `tests/programs/t24
 and `TestTLSReachability` in `link_test.go` guard this cell; when reflection really does call a TLS
 method at runtime, what it gets is a named failure from the runtime weak stub, not a jump to NULL.
 
-There is currently **no CI** — no GitHub Actions at all: every row in this table was produced on this
-one linux/amd64 machine, so "it compiles" and "it runs" are two questions here.
+CI runs `go build`, `go vet` and the whole `go test` suite on every push to `main` and every pull
+request (`.github/workflows/ci.yml`), with the `CC=gcc` leg once a day (`nightly.yml`). Every row in
+this table is still produced on this one linux/amd64 machine: CI guards against silent regressions,
+it does not measure every platform.
 
 ## Standard library
 
@@ -92,89 +94,95 @@ one linux/amd64 machine, so "it compiles" and "it runs" are two questions here.
   `@PreDestroy`, `@ControllerAdvice` + `@ExceptionHandler`, `HandlerInterceptor`, static files,
   CORS, `ResponseEntity`, `MockServer`, sessions and timeouts, validation annotations.
 * **Concurrency**: real OS threads (`Thread`, `Runnable`, real `synchronized`,
-  `Object.wait`/`notify`), and the shape of `java.util.concurrent` — `Executors`,
+  `Object.wait`/`notify`, `interrupt`, daemons, `ThreadLocal`), **virtual threads**
+  (`Thread.startVirtualThread` / `Thread.ofVirtual()`, M:N on ucontext; refused by name on
+  Windows), and the shape of `java.util.concurrent` — `Executors`,
   `ExecutorService`, `Future`, `Callable`, `CountDownLatch`, `AtomicInteger`/`AtomicLong`,
   `ConcurrentHashMap`.
 * **Other**: `MessageDigest` (MD5, SHA-1/224/256/384/512), `CRC32`, `Adler32`, deflate/inflate and
   gzip, `BigInteger`/`BigDecimal`, reflection (the shape of `java.lang.reflect`, including annotation
   metadata), `java.util.logging`-shaped logging.
 
+## Tooling
+
+Four tools live inside the same `teyru`, not in plugins:
+
+| Tool | What it does |
+|---|---|
+| `teyru fmt [-w]` | Formats in the canonical style; idempotent, comments preserved byte for byte, same program output before and after |
+| `teyru lsp` | A language server on stdin/stdout: `TY-*` diagnostics and same-file go-to-definition |
+| `teyru test` | `@Test` / `@BeforeEach` / `Assert`; exit code 0/1/2; the package's own `main` is not called |
+| `teyru build -g` | The generated C carries `#line` and DWARF points back at the `.teyru`; without `-g` the output is byte-identical |
+
+CI runs `go build`, `go vet` and the whole `go test` suite on every push and pull request, and the
+`CC=gcc` leg once a day. Details in <https://docs.teyru.dev/en/docs/tooling>.
+
 ## Measurements
 
 The full table is at <https://docs.teyru.dev>; the method is `RUNS=5 sh scripts/bench.sh` (best of
-five, **wall clock of the whole program, including process startup**, `-O2`), both sides receive
-**the same size parameter**, and the comparison is against HotSpot (OpenJDK 21, default flags) on the
-same machine. The script prints which tree it measured, on which machine, and the 1/5/15-minute load
-averages on entering and on leaving each of the two tables — this machine is shared, and nobody can
-tell whether a wall-clock table with no load figures was measured while the machine was busy. Below
-is one run from 2026-09-17 on `nobara-pc` (Ryzen 7 5700X, 16 threads, clang 22.1.8), with the
-compiler taken from `130565a`: 1-minute load 2.73 on entering the two tables and 2.79 on leaving, and
-all 13 samples taken during the run below 1. For rows where the two sides print different answers,
-the ratio column is `!(out)` rather than a number — a ratio in such a row is not comparing two
-implementations.
+five, **whole-program wall clock including process startup**, `-O2`), both sides get **the same
+scale parameter**, and the comparison is against HotSpot (OpenJDK 21, default flags) on the same
+machine. The script prints which tree it measured, on which machine, and the load averages on
+entering and leaving each table. This is one run from **2026-10-20** on `nobara-pc` (Ryzen 7 5700X,
+16 threads, clang 22.1.8) with the compiler at `6cb64d6`: 1-minute load 3.33 entering, 2.97 leaving.
 
-**The script prints two tables because one number cannot answer two questions.** Short scale is each
-program's own default size (rows from 6 to 410 ms), and JVM startup takes most of that number: it
-describes startup and small programs, **not throughput**. What the README used to say —
-"`bench_fib`/`bench_oop`/`bench_string` are 3.5 to 5 times faster" — is that set (**short scale**,
-measuring 3.51/4.27/3.81 times today), and reading short scale as throughput is exactly that
-mistake. Long scale enlarges the same program to **at least a few hundred milliseconds per row**
-(five rows over 1 second, the two string rows between 0.3 and 0.8 seconds); with the JVM warmed up,
-the answer is the program's:
+**Short scale** (each program's own default; the JVM's startup is most of this number, so it is a
+statement about startup and small programs, **not throughput**):
 
-| Long scale (at least a few hundred ms per row) | Teyru | Java | Faster |
+| Program | Teyru | Java | Teyru/Java |
 |---|---|---|---|
-| `bench_fib` (fib(44)) | 1.877 s | 1.800 s | Tie (Java 4% faster) |
-| `bench_loop` (1 million rounds) | 1.134 s | 1.007 s | Java 1.13 times |
-| `bench_oop` (500 thousand rounds) | 1.002 s | 0.357 s | **Java 2.8 times** |
-| `bench_string` (16 million concatenations, 1600 × 10,000) | 0.750 s | 0.285 s | **Java 2.6 times** |
-| `bench_string_cjk` (4 million, see below) | 0.30 s | 0.15 s | **Java 2.0 times** |
-| `bench_alloc` (800 million allocations) | 1.398 s | 0.204 s | **Java 6.8 times** |
-| `bench_invoke` (200 million reflective calls) | 4.066 s | 1.859 s | **Java 2.2 times** |
+| `bench_alloc` | 0.1920 s | 0.0327 s | 0.17x the time |
+| `bench_escape` | 0.4571 s | 0.1070 s | 0.23x |
+| `bench_fib` | 0.0080 s | 0.0288 s | **3.60x faster** |
+| `bench_invoke` | 1.7531 s | 0.2592 s | 0.15x |
+| `bench_loop` | 0.0431 s | 0.0474 s | 1.10x faster |
+| `bench_oop` | 0.0146 s | 0.0288 s | 1.97x faster |
+| `bench_string` | 0.0120 s | 0.0569 s | **4.74x faster** |
+| `bench_string_cjk` | 0.0146 s | 0.0806 s | **5.52x faster** |
 
-**No row at long scale is won by Teyru; `bench_fib` is the only tie.** The three rows it won at short
-scale become a tie, 2.8 times slower and 2.6 times slower at long scale: the same two
-implementations, only with the work scaled up, and the gap reverses.
+**Long scale** (every row at least a few hundred milliseconds; the JVM is warm, so the answer is
+about the program):
 
-**The `bench_alloc` row has nothing to do with the collector.** `TEYRU_GCTRACE=1` measured **zero
-collections** across 800 million allocations: the compiler's escape analysis keeps `Cell` on the
-stack and then promotes its fields to registers (`AGENTS.md` §10), so this row measures the loop
-itself, not the allocator — which means its 6.8 times slowdown is not something "slow GC" can
-explain.
+| Long scale | Teyru | Java | Who wins | Peak RSS (Teyru) |
+|---|---|---|---|---|
+| `bench_alloc` (800M allocations) | 7.6013 s | 0.2054 s | **Java 37x** (below) | 4,240 kB |
+| `bench_escape` | 0.9186 s | 0.1539 s | **Java 6.0x** | 8,604 kB |
+| `bench_fib` (fib(44)) | 1.8511 s | 1.8044 s | a tie (Java 2.6% faster) | 4,292 kB |
+| `bench_invoke` (200M reflective calls) | 17.6147 s | 1.8807 s | **Java 9.4x** | 8,664 kB |
+| `bench_loop` (1M rounds) | 2.0201 s | 1.0075 s | **Java 2.0x** | 4,292 kB |
+| `bench_oop` (500k rounds) | 3.0662 s | 0.3657 s | **Java 8.4x** | 4,364 kB |
+| `bench_string` (16M concatenations) | 0.5242 s | 0.3826 s | **Java 1.4x** | 8,600 kB |
+| `bench_string_cjk` (4M) | 0.1783 s | 0.1610 s | Java 1.1x | 8,856 kB |
 
-**`bench_invoke` is 2.2 times slower, and the expensive part is allocation, not reflection.** The
-short-scale version (20 million calls, 2000 × 10,000) is 1.63 times slower (0.4094 s against
-0.2517 s). Broken down, Teyru's own **direct call** loop is already 2.6 times slower than Java
-(26 ms against 10 ms for 20 million calls), and reflection adds mechanism cost on top; each
-reflective call is 19 ns (the program itself prints 3.798 s for 200 million, and the 4.066 s in the
-table is that plus the direct-call loop). The elimination breakdown in `AGENTS.md` §10 measured the
-expensive part as the two allocations the `Object` API forces (argument boxing at the call site,
-result boxing inside the runtime invoker thunk), and Java pays those two allocations as well — the
-difference is the allocator and the object size (Teyru's `new Object()` is 32 bytes, Java's is 16).
-**That breakdown was measured on the old overall cost (27 ns per call, 540 to 601 ms for 20M
-calls); this run is 19 ns, and the breakdown itself has not been re-measured.**
+**On long runs Teyru wins no column; `bench_fib` is the only tie.** The short scale says the
+opposite because most of that number is JVM startup (about 20 ms against 0.75 ms on this machine) —
+a difference in startup, not in throughput.
 
-**The `bench_string_cjk` row is a comparison now, and it used not to be.** Back then `String` here
-was still UTF-8 bytes and `charAt` read a byte rather than a character, so the two sides took the
-same size parameter and did **different work** — at 4 million (400 × 10,000), Teyru printed
-`walked=0` and Java printed `walked=1000` — so the script printed `!(out)` for it instead of a
-ratio (a table comparing two implementations cannot have a row comparing two different things).
-After string semantics (W5) landed, both sides print **the same line**
-(`concat=88890 walked=1000 sliced=4`, byte-for-byte identical at both the 10,000 and the 4,000,000
-sizes), so it is a ratio row: **Teyru 0.30 s, Java 0.15 s, Java 2.0 times faster** (local
-linux/amd64, load 0.77, best of five, 2026-10-16). This row is one of the most expensive in the set,
-because every index needs a UTF-16 to WTF-8 conversion — and that is precisely why it exists.
+**This version's long-run numbers are much worse than the 2026-09-17 set, and the reason is a
+correctness trade that was made on purpose.** That set (`130565a`) was `bench_alloc` 1.398 s,
+`bench_oop` 1.002 s, `bench_invoke` 4.066 s, `bench_loop` 1.134 s; today they are 7.60, 3.07, 17.61
+and 2.02. The difference is precise GC roots: every function that can allocate registers its frame
+with the collector (a frame map), and **a function with a frame cannot be inlined** — its frame
+address is part of the map, and an inlined copy would describe somebody else's frame.
+`bench_alloc`'s inner loop calls `new Cell(i)` and `Cell.value()` every iteration; those two small
+methods used to be inlined by clang and are now real calls. `TEYRU_NO_FRAME_MAPS=1` (a measurement
+switch, not a shippable setting) measures 1.39 s on the same tree, which is the version without the
+map. What has been fixed: pointers to C primitives and pointers to objects laid out in the frame are
+no longer registered, which took `bench_loop` from 2.91 s back to 2.02 s. The rest is the next
+performance item, and `AGENTS.md` section 10 says how to measure it.
 
-**The three rows that are not programs**: startup, 100 runs, 0.0763 s against 2.1093 s (**27.6
-times**); the hello executable **66,808 bytes** (`-O2`; the same program at `-O1` is 85,440 and at
-`-O3` is 70,248; this number moves on almost every landing, so it belongs to the tree above —
-**re-measured on 2026-10-16 on today's tree it is 97,888 bytes**, with `-O0` 233,680, `-O1` 209,472
-and `-O3` 106,032, the difference being the design cost of the frame maps plus a since-fixed
-`CharSequence` regression, see the size section of <https://docs.teyru.dev>); peak memory 4,348 kB
-against 51,420 kB (**11.8 times less**). The memory row takes the **largest** of five runs, not the
-smallest: the smallest reflects a round that never touched the heap into memory, not a program that
-needs less (of twenty runs of the same hello, one measured 2,116 kB and the rest sat between 4,150
-and 4,450).
+**`bench_string` got faster instead**: 0.750 s to 0.524 s. A concatenation chain now computes the
+total length once and fills one buffer (`ty_str_concatN`) instead of allocating an intermediate
+string per `+`; `bench_string_cjk` went from 0.30 s to 0.178 s on the same change.
+
+**The `bench_alloc` row has nothing to do with the collector.** `TEYRU_GCTRACE=1` reports **zero
+collections** at 800M allocations: escape analysis keeps `Cell` on the stack, so that row measures
+calls and the loop, not the allocator and not the GC.
+
+**The three rows that are not programs**: startup over 100 runs 0.0744 s against 2.0684 s
+(**27.8x**); the hello executable **105,416 bytes** (`-O2`); peak RSS 4,400 kB against 51,436 kB
+(**11.7x less**). The memory row takes the **largest** of five runs, not the smallest: the smallest
+reflects a run that never touched the heap rather than a program that needs less.
 
 ## Install and build
 

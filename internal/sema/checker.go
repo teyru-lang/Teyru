@@ -59,9 +59,14 @@ type Builtins struct {
 	// ExceptionInInitializerError. The runtime walks a throwable's superclass
 	// chain to it, so it is installed like the rest.
 	Err *ast.Class
-	// java.lang.reflect's checked exceptions. Teyru does not check them --
-	// nothing here is checked -- but they are the classes the runtime throws
-	// and a program catches, so they are named like the rest.
+	// Exception and RuntimeException are the two classes the checked-exception
+	// rule is stated with: a checked exception is a subtype of Exception that
+	// is not a subtype of RuntimeException or Error (JLS 11.1.1). They are
+	// builtins because the rule is asked of every call and every throw.
+	Exception, RuntimeException *ast.Class
+	// java.lang.reflect's checked exceptions. They are the classes the runtime
+	// throws and a program catches, so they are named like the rest; being
+	// subtypes of Exception they are checked like any other.
 	ClassNotFound, NoSuchField, NoSuchMethod, IllAccess, Invocation, Instantiation *ast.Class
 	Boxes                                                                          map[ast.PrimKind]*ast.Class
 	Unbox                                                                          map[*ast.Class]ast.PrimKind
@@ -146,6 +151,10 @@ func Check(files []*ast.File, diags *source.Diagnostics) *Program {
 		}
 		c.resolveImports(env0, f)
 	}
+	// the sealed hierarchy is settled before any body is checked: what a switch
+	// may rely on is the permit set, and it must not depend on which class's
+	// body happened to be visited first
+	c.checkSealedTypes()
 	c.applyLombokToProgram()
 	// the container pass runs after Lombok: a member Lombok generated is then
 	// already there to be injected into, and its annotations are readable
@@ -508,13 +517,15 @@ func (c *Checker) initBuiltins() {
 		IllMon:     get("IllegalMonitorStateException"),
 		ArrayStore: get("ArrayStoreException"),
 		NPE:        get("NullPointerException"), AIOOBE: get("ArrayIndexOutOfBoundsException"),
-		SIOOBE:        get("StringIndexOutOfBoundsException"),
-		IOOBE:         get("IndexOutOfBoundsException"),
-		SOE:           get("StackOverflowError"),
-		EIIE:          get("ExceptionInInitializerError"),
-		NCDFE:         get("NoClassDefFoundError"),
-		Err:           get("Error"),
-		ClassNotFound: get("ClassNotFoundException"), NoSuchField: get("NoSuchFieldException"),
+		SIOOBE:           get("StringIndexOutOfBoundsException"),
+		IOOBE:            get("IndexOutOfBoundsException"),
+		SOE:              get("StackOverflowError"),
+		EIIE:             get("ExceptionInInitializerError"),
+		NCDFE:            get("NoClassDefFoundError"),
+		Err:              get("Error"),
+		Exception:        get("Exception"),
+		RuntimeException: get("RuntimeException"),
+		ClassNotFound:    get("ClassNotFoundException"), NoSuchField: get("NoSuchFieldException"),
 		NoSuchMethod: get("NoSuchMethodException"), IllAccess: get("IllegalAccessException"),
 		Invocation: get("InvocationTargetException"), Instantiation: get("InstantiationException"),
 		Arith: get("ArithmeticException"), CCE: get("ClassCastException"),
@@ -882,6 +893,7 @@ func (c *Checker) resolveTypeNoDims(env *typeEnv, te *ast.TypeExpr) ast.Type {
 		c.ensureTypeParams(cl)
 		if len(cl.TypeParams) > 0 {
 			// raw type: use bounds
+			ct.Raw = true
 			for _, tv := range cl.TypeParams {
 				ct.Args = append(ct.Args, c.erasure(tv.Bound))
 			}

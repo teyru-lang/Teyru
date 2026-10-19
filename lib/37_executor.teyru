@@ -46,12 +46,12 @@ package teyru
  *     notifyAll releasing them all is the pattern that matters there, and it is
  *     the one this runtime is built to carry.
  *
- *   - There is no interrupt. Nothing in this language can stop a thread that is
- *     inside a task, so shutdownNow() cannot mean what it means in Java: it
- *     drops the tasks that have not started and hands them back, and the tasks
- *     that are running run to their end. Its comment says so, and no method
- *     here takes Java's mayInterruptIfRunning flag, because a flag that
- *     silently did nothing would mislead exactly the reader it was for.
+ *   - This pool does not interrupt. Threads can be interrupted now
+ *     (Thread.interrupt), but nothing here uses it: shutdownNow() drops the
+ *     tasks that have not started and hands them back, and the tasks that are
+ *     running run to their end. Its comment says so, and no method here takes
+ *     Java's mayInterruptIfRunning flag, because a flag that silently did
+ *     nothing would mislead exactly the reader it was for.
  *
  *   - There is no TimeUnit in this standard library. Every duration here is
  *     milliseconds, the unit Thread.sleep takes.
@@ -92,7 +92,7 @@ interface Future<V> {
   boolean isCancelled()
   /* Cancel a task that has not started yet: the worker that takes it will find
      it cancelled and skip it. A task that has already started is not cancelled
-     and this answers false -- there is no interrupt in this language, so
+     and this answers false -- this Future does not interrupt the worker, so
      nothing could stop it, and Java's cancel(true) is the form that would
      promise one. Java's cancel(false), which is this. */
   boolean cancel()
@@ -111,9 +111,8 @@ interface ExecutorService extends Executor {
      and the ones running -- finish, and then the workers leave. */
   void shutdown()
   /* Stop now: no new task is taken and the queued ones are handed back. It
-     cannot stop a task that is already running, because nothing here can
-     interrupt a thread; that task runs to its end. The futures of the tasks
-     handed back never complete, as in Java. */
+     does not interrupt a task that is already running, so that task runs to its
+     end. The futures of the tasks handed back never complete, as in Java. */
   List<Runnable> shutdownNow()
   /* Wait up to this many milliseconds for every worker to leave, answering
      true when the pool has finished. A duration of zero or less does not wait;
@@ -427,13 +426,12 @@ class ThreadPool implements ExecutorService {
   public List<Runnable> shutdownNow() {
     List<Runnable> dropped = new ArrayList<Runnable>()
     synchronized (this) {
-      /* What this cannot do is stop a task that has started: there is no
-         interrupt in this language, so the worker that is inside run() is
-         inside it until run() returns. What it does do is refuse new work,
-         hand back every task that never started, and let the workers leave as
-         soon as the task they are on is done. Java's shutdownNow also
-         interrupts the running tasks; here that half is simply absent, and
-         nothing pretends otherwise. */
+      /* What this does not do is interrupt a task that has started: the
+         worker that is inside run() is inside it until run() returns. What it
+         does do is refuse new work, hand back every task that never started,
+         and let the workers leave as soon as the task they are on is done.
+         Java's shutdownNow also interrupts the running tasks; this pool does
+         not use interrupt, and nothing pretends otherwise. */
       this.shutdown = true
       this.stopped = true
       while (!this.queue.isEmpty()) {

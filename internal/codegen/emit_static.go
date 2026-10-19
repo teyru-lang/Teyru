@@ -84,7 +84,16 @@ func (e *Emitter) emitClInit(cl *ast.Class) {
 				if f == nil || !f.Mods.Has(ast.ModStatic) || vd.Init == nil {
 					continue
 				}
+				// A static initializer is the field's declaration in the
+				// source, so a breakpoint on the field stops here.
+				d, dbgOn := e.sourceDirective(vd.Pos)
+				if dbgOn {
+					writeDirective(e.code, d)
+				}
 				e.line("%s = %s;\n", staticName(cl, f), e.coerce(e.expr(vd.Init), vd.Init.GetType(), f.Type))
+				if dbgOn {
+					e.writeReset(e.code)
+				}
 			}
 		}
 		for _, mem := range cl.Decl.Members {

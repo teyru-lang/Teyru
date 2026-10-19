@@ -34,7 +34,7 @@ teyru run hello.teyru
 | 目标 | 构建 | 执行 |
 |---|---|---|
 | linux/amd64 | ✅ | ✅ 原生，整套测试都在这里跑（`go test ./...`、`TEYRU=<编译器> sh tests/run.sh`） |
-| windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉编译；**会碰到 TLS 的程序除外**，那些是具名拒绝（mingw-w64 没有 OpenSSL） | ✅ 在 Wine 下跑，2026-10-17 测 `tests/programs` 的 **302 个**：**290 个输出（stdout、stderr、退出码）逐字节相同**、**11 个会碰到 TLS 而被具名拒绝**、**1 个（`t99_file_shell_meta`）因 NTFS 不能有那种文件名而跳过**——**0 个不符**。整套以 `-O0` 构建（约 3 分钟建完 302 个）；`-O1` 在最大的几个上 mingw 的 `cc1` 要跑超过两小时，那是工具链的构建时间，不是行为差异 |
+| windows/amd64 | ✅ 以 `x86_64-w64-mingw32-gcc` 交叉编译；**会碰到 TLS 的程序除外**（mingw-w64 没有 OpenSSL），那些是具名拒绝 | ✅ 在 Wine 下运行，2026-10-20 测 `tests/programs` 的 **318 支**：**302 支输出（stdout、stderr、退出码）逐字节相同**、**11 支碰到 TLS 而无法链接（具名拒绝）**、**4 支虚拟线程因为 Windows 没有 ucontext 而跳过**、**1 支（`t99_file_shell_meta`）因 NTFS 不能有那种文件名而跳过**——**0 支不符**。整套以 `-O1` 构建、以 `TEYRU_RUNNER=wine` 运行 |
 | linux/arm64 | ✅ 需要一个指向 arm64 sysroot 的编译器（`CC=aarch64-linux-gnu-gcc` ＋ `QEMU_LD_PREFIX`，做法写在 `AGENTS.md` §10） | ✅ 在 qemu 下跑：整套 **250 项全过、0 项不符**（222 个程序＋3 个包＋23 个诊断＋2 个原生），测量于 2026-09-17 |
 | darwin/amd64、darwin/arm64 | ✅ 以 `--cc <zig cc -target <arch>-macos>`（`resolveTarget` 现在看的是这次真的会用的那个编译器） | ❌ 这里没有 macOS：**没有任何一行程序在它上面执行过**，只到「编译并链接」 |
 
@@ -63,8 +63,9 @@ OpenSSL 的目标（windows、macOS）对它是**指名拒绝**——在写出�
 盯着这一格；反射真的在运行时调用到 TLS 方法时，拿到的是运行时 weak stub 的指名失败，不是
 跳到 NULL。
 
-目前**没有 CI**——没有任何 GitHub Actions：这份表上的每一列都是在这一台 linux/amd64 机器上
-跑出来的，所以「编得出来」与「跑得起来」在这里是两个问题。
+CI 在每次推送到 `main` 与每个 PR 上运行 `go build`、`go vet` 与整套 `go test`（`.github/workflows/ci.yml`），
+`CC=gcc` 那条腿每天运行一次（`nightly.yml`）。这份表上的每一列仍然是在这一台 linux/amd64 机器上
+跑出来的：CI 守的是「不会悄悄退步」，不是「每个平台都测过」。
 
 ## 标准库
 
@@ -87,71 +88,88 @@ OpenSSL 的目标（windows、macOS）对它是**指名拒绝**——在写出�
   `@ExceptionHandler`、`HandlerInterceptor`、静态文件、CORS、`ResponseEntity`、
   `MockServer`、会话与超时、校验注解。
 * **并发**：真正的操作系统线程（`Thread`、`Runnable`、真正的 `synchronized`、
-  `Object.wait`／`notify`），以及 `java.util.concurrent` 的形状——`Executors`、
+  `Object.wait`／`notify`、`interrupt`、daemon、`ThreadLocal`），**虚拟线程**
+  （`Thread.startVirtualThread`／`Thread.ofVirtual()`，ucontext 上的 M:N；Windows
+  以具名异常拒绝），以及 `java.util.concurrent` 的形状——`Executors`、
   `ExecutorService`、`Future`、`Callable`、`CountDownLatch`、`AtomicInteger`／
   `AtomicLong`、`ConcurrentHashMap`。
 * **其他**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`CRC32`、`Adler32`、
   deflate／inflate 与 gzip、`BigInteger`／`BigDecimal`、反射（`java.lang.reflect` 的形状，
   含注解的元数据）、`java.util.logging` 形状的日志。
 
+## 工具链
+
+四个工具在同一个 `teyru` 里，不是插件：
+
+| 工具 | 做什么 |
+|---|---|
+| `teyru fmt [-w]` | 固定风格格式化；幂等，注释逐字保留，格式化前后输出相同 |
+| `teyru lsp` | stdin/stdout 上的语言服务器：`TY-*` 诊断与同文件定义跳转 |
+| `teyru test` | `@Test`／`@BeforeEach`／`Assert`，退出码 0／1／2；包自己的 `main` 不会被调用 |
+| `teyru build -g` | 生成的 C 带 `#line`，DWARF 指回 `.teyru`；不加 `-g` 时输出逐字节不变 |
+
+CI 在每次推送与每个 PR 上运行 `go build`、`go vet` 与整套 `go test`，`CC=gcc` 那条腿每天
+运行一次。细节见 <https://docs.teyru.dev/zh-CN/docs/tooling>。
+
 ## 测量
 
-完整表格在 <https://docs.teyru.dev>，方法是 `RUNS=5 sh scripts/bench.sh`（五次取最佳、**整个
+完整表格在 <https://docs.teyru.dev>，方法是 `RUNS=5 sh scripts/bench.sh`（五次取最佳、**整支
 程序的 wall clock、含进程启动**、`-O2`），两边拿到**同一个规模参数**，在同一台机器上与 HotSpot
-（OpenJDK 21、默认参数）对照。脚本自己会打印出它测在哪棵树、哪台机器上、以及进入与离开两组表时的
-1／5／15 分钟负载平均——这台机器是共用的，而一张没有负载的耗时表，没人分得出它是不是在忙的时候
-测的。以下是 2026-09-17 在 `nobara-pc`（Ryzen 7 5700X、16 线程、clang 22.1.8）上的一次执行，
-编译器取自 `130565a`：进入两组表时 1 分钟负载 2.73、离开时 2.79，执行期间的 13 次采样全部低于 1。
-两边打印出不同答案的行，比值那一栏是 `!(out)` 而不是数字——那种行的比值不是在比两个实现。
+（OpenJDK 21、默认参数）对照。脚本自己会打印它量在哪棵树上、哪台机器上、以及进入与离开两组表时的
+1／5／15 分钟负载平均。以下是 **2026-10-20** 在 `nobara-pc`（Ryzen 7 5700X、16 线程、clang 22.1.8）
+上的一次执行，编译器取自 `6cb64d6`，进入两组表时 1 分钟负载 3.33、离开时 2.97。
 
-**脚本打印两组表，因为一个数字答不了两个问题。** 短规模是各程序自己的默认规模（一行 6～410 ms），
-那个数字里 JVM 的启动占掉大半：它说明的是启动与小程序、**不是吞吐**。README 从前写的
-「`bench_fib`／`bench_oop`／`bench_string` 快 3.5～5 倍」就是这一组（**短规模**，今天测到
-3.51／4.27／3.81 倍），把短规模读成吞吐就是那个错。长规模把同一个程序放大到**每行至少数百
-毫秒**（五行超过 1 秒，两行字符串的在 0.3～0.8 秒之间），JVM 预热完，答案才是程序的：
+**短规模**（各程序自己的默认规模；这个数字里 JVM 的启动占了大半，说明的是启动与小程序、**不是
+吞吐**）：
 
-| 长规模（每行至少数百毫秒） | Teyru | Java | 谁快 |
+| 程序 | Teyru | Java | Teyru／Java |
 |---|---|---|---|
-| `bench_fib`（fib(44)） | 1.877 s | 1.800 s | 打平（Java 快 4%） |
-| `bench_loop`（100 万轮） | 1.134 s | 1.007 s | Java 1.13 倍 |
-| `bench_oop`（50 万轮） | 1.002 s | 0.357 s | **Java 2.8 倍** |
-| `bench_string`（1600 万次串接） | 0.750 s | 0.285 s | **Java 2.6 倍** |
-| `bench_string_cjk`（400 万次，见下） | 0.30 s | 0.15 s | **Java 2.0 倍** |
-| `bench_alloc`（8 亿次分配） | 1.398 s | 0.204 s | **Java 6.8 倍** |
-| `bench_invoke`（2 亿次反射调用） | 4.066 s | 1.859 s | **Java 2.2 倍** |
+| `bench_alloc` | 0.1920 s | 0.0327 s | 0.17 倍时间 |
+| `bench_escape` | 0.4571 s | 0.1070 s | 0.23 倍 |
+| `bench_fib` | 0.0080 s | 0.0288 s | **3.60 倍快** |
+| `bench_invoke` | 1.7531 s | 0.2592 s | 0.15 倍 |
+| `bench_loop` | 0.0431 s | 0.0474 s | 1.10 倍快 |
+| `bench_oop` | 0.0146 s | 0.0288 s | 1.97 倍快 |
+| `bench_string` | 0.0120 s | 0.0569 s | **4.74 倍快** |
+| `bench_string_cjk` | 0.0146 s | 0.0806 s | **5.52 倍快** |
 
-**长跑上没有一行是 Teyru 赢的，`bench_fib` 是唯一打平的一行。** 短规模赢的那三行，在长跑上分别
-变成打平、慢 2.8 倍、慢 2.6 倍：同样两个实现，只把工作量放大，差距就反过来了。
+**长规模**（每列至少数百毫秒；JVM 预热完，答案才是程序的）：
 
-**`bench_alloc` 那一行与收集器无关。** `TEYRU_GCTRACE=1` 在 8 亿次分配下测到**零次收集**：编译器
-的逃逸分析把 `Cell` 留在栈上、再把它的字段提升成寄存器（`AGENTS.md` §10），所以这一行测到的
-是循环本身，不是分配器——它慢 6.8 倍也就不是「GC 慢」能解释的。
+| 长规模 | Teyru | Java | 谁快 | 峰值 RSS（Teyru） |
+|---|---|---|---|---|
+| `bench_alloc`（8 亿次分配） | 7.6013 s | 0.2054 s | **Java 37 倍**（见下） | 4,240 kB |
+| `bench_escape` | 0.9186 s | 0.1539 s | **Java 6.0 倍** | 8,604 kB |
+| `bench_fib`（fib(44)） | 1.8511 s | 1.8044 s | 打平（Java 快 2.6%） | 4,292 kB |
+| `bench_invoke`（2 亿次反射调用） | 17.6147 s | 1.8807 s | **Java 9.4 倍** | 8,664 kB |
+| `bench_loop`（100 万轮） | 2.0201 s | 1.0075 s | **Java 2.0 倍** | 4,292 kB |
+| `bench_oop`（50 万轮） | 3.0662 s | 0.3657 s | **Java 8.4 倍** | 4,364 kB |
+| `bench_string`（1600 万次拼接） | 0.5242 s | 0.3826 s | **Java 1.4 倍** | 8,600 kB |
+| `bench_string_cjk`（400 万次） | 0.1783 s | 0.1610 s | Java 1.1 倍 | 8,856 kB |
 
-**`bench_invoke` 慢 2.2 倍，而贵的是分配不是反射。** 短规模的版本（2000 万次）是慢 1.63 倍
-（0.4094 s 对 0.2517 s）。拆开来看，Teyru 自己的**直接调用**循环就已经比 Java 慢 2.6 倍
-（2000 万次 26 ms 对 10 ms），反射再加机制成本；每次反射调用 19 ns（程序自己打印的 2 亿次
-3.798 s，表格那 4.066 s 是它加上直接调用那一圈）。`AGENTS.md` §10 的消去法拆解测到贵的是
-`Object` API 逼出来的两次分配（调用端的实参装箱、运行时 invoker thunk 里的结果装箱），而 Java
-也付那两次分配——差别在分配器与对象大小（Teyru 的 `new Object()` 是 32 字节、Java 是 16）。
-**那次拆解是在旧的总体成本上测的（每次 27 ns、20M 次 540～601 ms），本次是 19 ns，拆解本身没有
-重测。**
+**长跑上没有一列是 Teyru 赢的，`bench_fib` 是唯一打平的一列。** 短规模看起来相反，是因为整支
+程序的时间有很大一部分是 JVM 启动（同一台机器约 20 ms 对 0.75 ms），那是启动的差别，不是吞吐的
+差别。
 
-**`bench_string_cjk` 这一行现在是比较了，而它以前不是。** 以前这边的 `String` 还是 UTF-8
-字节、`charAt` 读到的是字节不是字符，所以两边拿到同一个规模参数却做**不同的工作**——
-400 万次时 Teyru 打印 `walked=0`、Java 打印 `walked=1000`——脚本因此对它打印 `!(out)` 而不是比值
-（一张在比两个实现的表，不能有一行在比两件不同的事）。字符串语义（W5）落地之后两边打印的是
-**同一行**（`concat=88890 walked=1000 sliced=4`，在 10,000 与 4,000,000 两个规模上逐字节
-相同），所以它是一行比值：**Teyru 0.30 s、Java 0.15 s，Java 快 2.0 倍**（本机 linux/amd64、
-load 0.77、五次取最佳、2026-10-16）。这一行是这一组里最贵的几行之一，因为每一个索引都要做
-一次 UTF-16 到 WTF-8 的换算——那正是它存在的理由。
+**这一版的长跑数字比 2026-09-17 那一组差很多，原因是一个刻意换来的正确性。** 那一组（`130565a`）
+是 `bench_alloc` 1.398 s、`bench_oop` 1.002 s、`bench_invoke` 4.066 s、`bench_loop` 1.134 s；
+今天分别是 7.60／3.07／17.61／2.02。差别来自精确的 GC 根：每一个会分配的函式都要向收集器登记
+自己的框（frame map），而**有框的函式不能被内联**——它的框地址是那张地图的一部分，内联之后
+描述的就是别人的框。`bench_alloc` 的内循环每一轮都调用一次 `new Cell(i)` 与 `Cell.value()`，
+那两个小方法从前被 clang 内联掉，现在是真正的调用。`TEYRU_NO_FRAME_MAPS=1`（测量开关，不是
+可以出厂的设定）在同一棵树上量到 1.39 s，就是没有地图的版本。已修掉的部分：原生类型指针与
+「指向栈对象的指针」不再登记，`bench_loop` 因此从 2.91 s 回到 2.02 s。剩下的差额是下一个
+要处理的性能项，`AGENTS.md` §10 有测量方式。
 
-**不是程序的三行**：启动 100 次 0.0763 s 对 2.1093 s（**27.6 倍**）；hello 可执行文件 **66,808
-字节**（`-O2`，同一个程序 `-O1` 是 85,440、`-O3` 是 70,248；这个数字几乎每次落地都会动，
-所以它属于上面那棵树——**2026-10-16 在今天的树上测到的是 97,888 字节**，`-O0` 233,680、
-`-O1` 209,472、`-O3` 106,032，差在框架地图的设计代价，以及一段已修的 `CharSequence` 退步，
-见 <https://docs.teyru.dev> 的大小那一节）；峰值内存 4,348 kB 对 51,420 kB（**少 11.8 倍**）。内存那一行取五次
-里**最大**的一次，不是最小的一次：最小的一次反映的是那一轮没有把堆碰进内存，不是程序需要的
-比较少（同一个 hello 二十次里有一次测到 2,116 kB，其余在 4,150～4,450）。
+**`bench_string` 反而变快了**：0.750 s → 0.524 s。拼接链现在一次算好总长度、分配一个缓冲区
+（`ty_str_concatN`），不再每个 `+` 分配一个中间字符串；`bench_string_cjk` 从 0.30 s 到 0.178 s，
+是同一个改动。
+
+**`bench_alloc` 那一列与收集器无关。** `TEYRU_GCTRACE=1` 在 8 亿次分配下量到**零次收集**：
+逃逸分析把 `Cell` 留在栈上，所以这一列量到的是调用与循环，不是分配器，也不是 GC。
+
+**不是程序的三列**：启动 100 次 0.0744 s 对 2.0684 s（**27.8 倍**）；hello 可执行文件 **105,416
+字节**（`-O2`）；峰值内存 4,400 kB 对 51,436 kB（**11.7 倍少**）。内存那一列取五次里**最大**的
+一次，不是最小的一次：最小的一次反映的是那一轮没有把堆碰进内存，不是程序需要的比较少。
 
 ## 安装与构建
 
