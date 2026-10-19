@@ -33,6 +33,17 @@ package teyru
 //     Thread object;
 //   - Thread.sleep(long), Thread.yield(), Thread.currentThread().
 //
+//   - Virtual threads, as Java 21 has them: Thread.ofVirtual() and
+//     Thread.startVirtualThread(Runnable) start a thread that is multiplexed
+//     onto a small pool of carrier threads instead of owning an operating
+//     system thread, and Thread.isVirtual() tells the two apart. A virtual
+//     thread parks -- gives its carrier up -- in Thread.sleep, Thread.join,
+//     Object.wait, and a blocking socket or file read, write, accept or
+//     connect. The runtime side is in tyrt_thread.c. On a platform without
+//     continuations (Windows) ofVirtual().start() throws
+//     UnsupportedOperationException rather than quietly running the work on a
+//     platform thread.
+//
 // Not implemented, and deliberately not declared: the thread priorities,
 // ThreadGroup, the uncaught exception handler (the runtime prints the same line
 // Java's default handler prints, and the thread ends), Thread.State, and the
@@ -60,6 +71,11 @@ class Thread implements Runnable {
      rather than stored in the runtime earlier: the registry entry does not
      exist until start(), and setDaemon may not be called after it. */
   private static native long start0(Thread t, long id, String name, boolean daemon)
+
+  /* Start a virtual thread that runs t.run(). The runtime makes a continuation
+     with its own stack and hands it to a carrier; no operating system thread is
+     created. The id is the one the Thread object was given when it was built. */
+  private static native void startVirtual0(Thread t, long id, String name)
 
   /* The id a Thread object gets when it is built: the runtime's counter, so that
      getId() answers the same number before and after start(). */
@@ -109,6 +125,9 @@ class Thread implements Runnable {
      entry afterwards. The field is what isDaemon answers for a thread that has
      not started, and what start0 hands the runtime. */
   private boolean daemon
+  /* Whether this thread is a virtual one. Set by the builder before start();
+     it is what start() dispatches on and what isVirtual() answers. */
+  private boolean virtual
   /* This thread's ThreadLocal values, keyed by the ThreadLocal instance. Only
      the thread it belongs to touches it, so it needs no monitor, and it is an
      ordinary reference field so that the collector traces it like any other.
@@ -161,7 +180,18 @@ class Thread implements Runnable {
       throw new IllegalStateException("thread already started")
     }
     this.started = true
-    Thread.start0(this, this.tid, this.name, this.daemon)
+    if (this.virtual) {
+      Thread.startVirtual0(this, this.tid, this.name)
+    } else {
+      Thread.start0(this, this.tid, this.name, this.daemon)
+    }
+  }
+
+  /* Whether this is a virtual thread. The main thread and every thread built
+     with `new Thread(...)` answer false; one built through ofVirtual() answers
+     true. */
+  public boolean isVirtual() {
+    return this.virtual
   }
 
   /* Wait for this thread to finish. A thread that was never started has nothing
@@ -215,6 +245,13 @@ class Thread implements Runnable {
      Java only allows it before start(); after that the thread's life is the
      runtime's business, and so is the count. */
   public final void setDaemon(boolean on) {
+    /* java.lang.Thread refuses this for a virtual thread, and so does this:
+       a virtual thread is a user thread the process waits for, and making it
+       a daemon would be a promise the runtime's exit accounting does not
+       keep. */
+    if (this.virtual) {
+      throw new UnsupportedOperationException("not supported for virtual threads")
+    }
     if (this.started) {
       throw new IllegalThreadStateException("thread already started")
     }
@@ -272,6 +309,51 @@ class Thread implements Runnable {
   public static Thread currentThread() {
     Thread t = (Thread) Thread.current0()
     return (t != null) ? t : Thread.mainThread()
+  }
+
+  // ------------------------------------------------------- virtual threads
+
+  /* Start a virtual thread that runs task. Shorthand for
+     ofVirtual().start(task), as in java.lang.Thread. */
+  public static Thread startVirtualThread(Runnable task) {
+    if (task == null) {
+      throw new NullPointerException("task")
+    }
+    return Thread.ofVirtual().start(task)
+  }
+
+  /* A builder for a virtual thread: name(String) sets its name and
+     start(Runnable) starts it, which is the part of Java's
+     Thread.Builder.OfVirtual a program uses. */
+  public static Builder ofVirtual() {
+    return new Builder()
+  }
+
+  static class Builder {
+    private String vname
+
+    public Builder name(String name) {
+      if (name == null) {
+        throw new NullPointerException("name")
+      }
+      this.vname = name
+      return this
+    }
+
+    public Thread start(Runnable task) {
+      if (task == null) {
+        throw new NullPointerException("task")
+      }
+      Thread t = new Thread(task, this.vname)
+      t.virtual = true
+      /* A virtual thread is counted as a user thread: the process ends when
+         the last one does, which is what this runtime's exit accounting
+         already means by "non-daemon". It is not settable (setDaemon refuses),
+         and startVirtual0 does not take the flag. */
+      t.daemon = false
+      t.start()
+      return t
+    }
   }
 }
 

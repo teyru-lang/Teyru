@@ -195,9 +195,9 @@ static int32_t ty_connect_one(const struct addrinfo *r, int32_t timeout_ms) {
       /* The wait for the connection to come up is a wait: bracketed as a stop
          point, so a collection does not wait for a connect that is still in
          flight -- and with no timeout that is a wait with no end. */
-      ty_thread_stopped_begin();
-      int pr = typlat_socket_wait(fd, 1, timeout_ms < 0 ? -1 : timeout_ms);
-      ty_thread_stopped_end();
+      /* ty_wait_fd is the same poll for a platform thread and a park for a
+         virtual one; the stop point is inside it. */
+      int pr = ty_wait_fd(fd, 2, timeout_ms < 0 ? -1 : timeout_ms);
       if (pr < 0) {
         if (pr == -EINTR) continue; /* a signal is not a deadline */
         (void)typlat_socket_close(fd);
@@ -279,18 +279,26 @@ int32_t ty_net_accept(int32_t fd, int32_t timeout_ms) {
          other call in this runtime that waits (tyrt_thread.c): a collection
          asked for while this thread sits here must not wait for its deadline,
          which without a timeout is never. */
-      ty_thread_stopped_begin();
-      int pr = typlat_socket_wait(fd, 0, timeout_ms);
-      ty_thread_stopped_end();
+      int pr = ty_wait_fd(fd, 1, timeout_ms);
       if (pr < 0) {
         if (pr == -EINTR) continue;
         return pr;
       }
       if (pr == 0) return TY_NET_TIMEOUT;
     }
-    /* And the accept itself: with no timeout it blocks until a connection
-       arrives, and with one it can still block if the readiness the poll saw
-       was taken by another thread. */
+    /* A virtual thread must not block its carrier inside accept: it waits for
+       a connection to be ready and only then takes it. A platform thread keeps
+       the direct accept, which with no timeout blocks until a connection
+       arrives and with one can still block if the readiness the poll saw was
+       taken by another thread. */
+    if (ty_self->is_virtual) {
+      int pr = ty_wait_fd(fd, 1, timeout_ms);
+      if (pr == 0) return TY_NET_TIMEOUT;
+      if (pr < 0) {
+        if (pr == -EINTR) continue;
+        return pr;
+      }
+    }
     ty_thread_stopped_begin();
     int32_t c = typlat_socket_accept(fd);
     ty_thread_stopped_end();
@@ -334,6 +342,23 @@ int32_t ty_net_read(int32_t fd, tyarr *buf, int32_t off, int32_t len) {
        heap. */
     char *p = buf->data + off;
     TY_ROOT_PUSH(buf);
+    if (ty_self->is_virtual) {
+      /* A virtual thread waits for the data outside the kernel call, so its
+         carrier can run somebody else meanwhile. The receive timeout the
+         socket was given is the deadline: recv would have applied it, and a
+         poll that ignored it would turn a timed read into an endless one. */
+      int32_t tmo = typlat_socket_recv_timeout_ms(fd);
+      int32_t w = ty_wait_fd(fd, 1, tmo == 0 ? -1 : tmo);
+      if (w == 0) {
+        TY_ROOT_POP();
+        return -EAGAIN;
+      }
+      if (w < 0) {
+        TY_ROOT_POP();
+        if (w == -EINTR) continue;
+        return w;
+      }
+    }
     ty_thread_stopped_begin();
     int64_t n = typlat_socket_recv(fd, p, len);
     ty_thread_stopped_end();
@@ -357,6 +382,18 @@ int32_t ty_net_write_all(int32_t fd, tyarr *buf, int32_t off, int32_t len) {
        stop point like the read above, with the same root and for the same
        reason: the kernel is reading the bytes out of this array. */
     TY_ROOT_PUSH(buf);
+    if (ty_self->is_virtual) {
+      /* Wait for room in the send buffer. A blocking send after POLLOUT
+         transfers at least one byte rather than blocking, which is the whole
+         of what the kernel promises and all this needs: a short send is
+         handled by the loop. */
+      int32_t w = ty_wait_fd(fd, 2, -1);
+      if (w < 0) {
+        TY_ROOT_POP();
+        if (w == -EINTR) continue;
+        return w;
+      }
+    }
     ty_thread_stopped_begin();
     int64_t n = typlat_socket_send(fd, p + done, len - done);
     ty_thread_stopped_end();
@@ -387,6 +424,14 @@ int32_t ty_net_write_str(int32_t fd, tystr *s) {
     /* The same stop point as ty_net_write_all, with the string as the root
        instead of the array. */
     TY_ROOT_PUSH(s);
+    if (ty_self->is_virtual) {
+      int32_t w = ty_wait_fd(fd, 2, -1);
+      if (w < 0) {
+        TY_ROOT_POP();
+        if (w == -EINTR) continue;
+        return w;
+      }
+    }
     ty_thread_stopped_begin();
     int64_t n = typlat_socket_send(fd, p + done, (int32_t)len - done);
     ty_thread_stopped_end();
@@ -715,6 +760,21 @@ tyarr *ty_file_read_bytes(tystr *path, tyarr *err) {
        interest in it; the error array is not, and it is used after the loop
        ends, so it goes on the shadow stack for the whole of it. */
     TY_ROOT_PUSH(err);
+    if (ty_self->is_virtual) {
+      /* A pipe or a FIFO blocks until somebody writes; poll is what lets the
+         carrier go. A regular file is always ready, so this costs one poll and
+         changes nothing. */
+      int32_t w = ty_wait_fd(fd, 1, -1);
+      if (w < 0) {
+        TY_ROOT_POP();
+        if (w == -EINTR) continue;
+        int e = -w;
+        free(buf);
+        (void)close(fd);
+        ty_set_err(err, e);
+        return NULL;
+      }
+    }
     ty_thread_stopped_begin();
     ssize_t n = read(fd, buf + len, cap - len);
     ty_thread_stopped_end();
@@ -751,6 +811,14 @@ static int32_t ty_write_fd(int fd, const char *data, int64_t len, void *owner) {
        pipe nobody is draining, a file on a filesystem that has stopped
        answering. It is a stop point for the same reason. */
     TY_ROOT_PUSH(owner);
+    if (ty_self->is_virtual) {
+      int32_t w = ty_wait_fd(fd, 2, -1);
+      if (w < 0) {
+        TY_ROOT_POP();
+        if (w == -EINTR) continue;
+        return w;
+      }
+    }
     ty_thread_stopped_begin();
     ssize_t n = write(fd, data + done, (size_t)(len - done));
     ty_thread_stopped_end();

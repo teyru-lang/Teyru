@@ -360,6 +360,15 @@ int typlat_socket_timeout_ms(int32_t fd, int ms) {
   return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0 ? neg_errno() : 0;
 }
 
+int32_t typlat_socket_recv_timeout_ms(int32_t fd) {
+  struct timeval tv;
+  socklen_t n = sizeof tv;
+  if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &n) < 0) return 0;
+  int64_t ms = (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+  if (ms <= 0) return 0;
+  return ms > INT32_MAX ? INT32_MAX : (int32_t)ms;
+}
+
 int typlat_socket_wait(int32_t fd, int for_write, int timeout_ms) {
   struct pollfd p;
   p.fd = fd;

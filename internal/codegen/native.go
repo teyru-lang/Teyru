@@ -149,6 +149,13 @@ var nativeTable = map[string]nativeFn{
 	"Thread.start0(Thread,J,String,Z)": {
 		fn: "ty_thread_start0", selClass: "teyru.Runnable", selMethod: "run",
 	},
+	/* The virtual-thread half of the same start. The runtime creates a
+	   continuation and hands it to a carrier instead of creating an operating
+	   system thread; the selector is the same one start0 needs, for the same
+	   reason. */
+	"Thread.startVirtual0(Thread,J,String)": {
+		fn: "ty_thread_start_virtual0", selClass: "teyru.Runnable", selMethod: "run",
+	},
 	"Thread.join0(J)":            {fn: "ty_thread_join"},
 	"Thread.alive0(J)":           {fn: "ty_thread_alive"},
 	"Thread.nextId0()":           {fn: "ty_thread_next_id"},
