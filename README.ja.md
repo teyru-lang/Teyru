@@ -65,8 +65,10 @@ windows/amd64 は Wine 下（上述の 302 本）。
 `link_test.go` の `TestTLSReachability` がこの欄を見張っている。リフレクションが実行時に実際に TLS の
 メソッドを呼んだとき、得られるのは実行時の weak stub による名前付きの失敗であって、NULL へのジャンプではない。
 
-現在**CI はない**——GitHub Actions は一切ない：この表の各行はすべてこの 1 台の linux/amd64 マシンで出した
-ものなので、ここでは「ビルドできる」と「実行できる」は別の問題である。
+CI は `main` への push と PR のたびに `go build`、`go vet`、`go test` 一式を実行し
+（`.github/workflows/ci.yml`）、`CC=gcc` の脚は毎日 1 回です（`nightly.yml`）。この表の各行は
+今もこの 1 台の linux/amd64 マシンで出したもので、CI が守るのは「静かに退步しないこと」であって、
+「すべてのプラットフォームを測ったこと」ではありません。
 
 ## 標準ライブラリ
 

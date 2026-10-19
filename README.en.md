@@ -69,8 +69,10 @@ reflects and never touches TLS does **not** link OpenSSL — `tests/programs/t24
 and `TestTLSReachability` in `link_test.go` guard this cell; when reflection really does call a TLS
 method at runtime, what it gets is a named failure from the runtime weak stub, not a jump to NULL.
 
-There is currently **no CI** — no GitHub Actions at all: every row in this table was produced on this
-one linux/amd64 machine, so "it compiles" and "it runs" are two questions here.
+CI runs `go build`, `go vet` and the whole `go test` suite on every push to `main` and every pull
+request (`.github/workflows/ci.yml`), with the `CC=gcc` leg once a day (`nightly.yml`). Every row in
+this table is still produced on this one linux/amd64 machine: CI guards against silent regressions,
+it does not measure every platform.
 
 ## Standard library
 

@@ -63,8 +63,9 @@ OpenSSL 的目標（windows、macOS）對它是**指名拒絕**——在寫出�
 盯著這一格；反射真的在執行期叫到 TLS 方法時，拿到的是執行期 weak stub 的指名失敗，不是
 跳到 NULL。
 
-目前**沒有 CI**——沒有任何 GitHub Actions：這份表上的每一列都是在這一台 linux/amd64 機器上
-跑出來的，所以「編得出來」與「跑得起來」在這裡是兩個問題。
+CI 在每次 push 到 `main` 與每個 PR 上跑 `go build`、`go vet` 與整套 `go test`（`.github/workflows/ci.yml`），
+`CC=gcc` 那條腿每天跑一次（`nightly.yml`）。這份表上的每一列仍然是在這一台 linux/amd64 機器上
+跑出來的：CI 守的是「不會悄悄退步」，不是「每個平台都量過」。
 
 ## 標準程式庫
 
