@@ -1444,6 +1444,20 @@ func (e *Emitter) unaryInner(v *ast.Unary) string {
 		if v.Op == "--" {
 			op = "- 1"
 		}
+		// A plain local needs no pointer: `x++` on a C variable of the target's
+		// own type is the operation Java performs, and taking the address to
+		// write `(*_p) += 1` keeps a loop counter out of a register. The
+		// temporary is for targets that must be evaluated once (an index, a
+		// field through a receiver); an identifier naming a local is not one.
+		if id, ok := v.X.(*ast.Ident); ok {
+			if _, isVar := id.Ref.(*ast.Var); isVar {
+				lv := e.lvalue(v.X)
+				if v.Postfix {
+					return "(" + lv + v.Op + ")"
+				}
+				return "((" + v.Op + lv + "))"
+			}
+		}
 		decl, ref := e.lvalueTemp(v.X)
 		if v.Postfix {
 			// the value of a postfix update is the one the target held before it
@@ -2236,6 +2250,36 @@ func (e *Emitter) assign(v *ast.Assign) string {
 			return "(" + pre + e.assignInner(v, lv, lv) + ")"
 		}
 		return e.assignInner(v, lv, lv)
+	}
+	// A compound assignment to a plain local of primitive type needs no
+	// pointer. Binding the target in a temporary takes the variable's address,
+	// and an address-taken loop counter cannot stay in a register: bench_loop's
+	// inner loop went from 1.13 s to 2.01 s when every `total += xs[i] % 7`
+	// started going through `int64_t *_t = &total`. The temporary exists for
+	// two reasons that do not apply here -- a target with a side effect of its
+	// own (an index, a field reached through a receiver) has to be evaluated
+	// once, and an operand that writes the target has to be evaluated after the
+	// read -- so the direct form is emitted only when the target is an
+	// identifier naming a local, the operand has no side effects, and the
+	// operation is one C's own `op=` performs identically. Division, remainder
+	// and the shifts are left out: they go through helpers that check for zero
+	// and mask the count, and `>>>` has no C operator at all.
+	if id, ok := v.X.(*ast.Ident); ok && pre == "" {
+		if _, isVar := id.Ref.(*ast.Var); isVar && !e.isStringType(v.X.GetType()) {
+			if _, boxed := e.boxKindOf(v.X.GetType()); !boxed && !e.hasEffects(v.Y) &&
+				e.ctype(v.OpType) == e.ctype(v.X.GetType()) {
+				// The operation and the store must be the same type. Where they
+				// are not, Java computes in the promoted type and narrows back
+				// (JLS 15.26.2), and for a floating-point operation narrowed to
+				// an integral target that conversion saturates, which is what
+				// assignInner's narrowTarget does and what C's own `op=` does
+				// not: t193_narrowing_saturation and t244 caught this.
+				switch v.Op {
+				case "+=", "-=", "*=", "&=", "|=", "^=":
+					return "(" + e.lvalue(v.X) + " " + v.Op + " " + e.coerce(e.expr(v.Y), v.Y.GetType(), v.X.GetType()) + ")"
+				}
+			}
+		}
 	}
 	// a compound assignment reads the target as well as writing it, so the
 	// target is bound once and both uses go through the temporary.

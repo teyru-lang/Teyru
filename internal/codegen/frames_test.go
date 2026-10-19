@@ -377,6 +377,16 @@ func frameCheckDecls(t *testing.T, f frameFunc, body string, named map[string]bo
 			// as a pointer type; frameCheckCopies reads what it copies instead.
 			continue
 		}
+		if isPrimitiveCType(typ) {
+			/* A pointer to a C primitive is not a reference: it points at a
+			   local, at a loop counter, or into the middle of an array whose
+			   owner is named somewhere else. Registering one takes the
+			   variable's address, which keeps a loop counter out of a
+			   register, and hands the collector a word that can only fail its
+			   validity test. The emitter's pass skips them (frames.go), so
+			   this check must skip them too. */
+			continue
+		}
 		counts.decls++
 		if qual != "" {
 			counts.qualified++
