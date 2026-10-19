@@ -1,0 +1,146 @@
+package teyru.test
+
+// A test framework, in the standard library because `teyru test` compiles the
+// package under test with a generated entry point that calls these names.
+//
+// The annotations are the four JUnit calls a test class is written with. They
+// are read by `teyru test` from the source, not by the program at run time: a
+// program that ships does not carry a runner, and a test binary does not need
+// reflection to find its own tests.
+//
+// The names are `teyru.test.*` rather than `org.junit.jupiter.api.*` because
+// there is no JUnit here -- a test that imported it would be a test the
+// compiler cannot compile. The short names are what a test file writes, which
+// is what makes a test read the way a JUnit test reads.
+
+@interface Test {
+}
+
+@interface BeforeEach {
+}
+
+@interface AfterEach {
+}
+
+@interface BeforeAll {
+}
+
+@interface AfterAll {
+}
+
+// Assert is the assertion set. A failure is an AssertionError whose message
+// names both values, because the report a reader gets from a failing test is
+// the message and the exception, and "assertion failed" names neither.
+class Assert {
+  public static void fail(String message) {
+    throw new AssertionError(message)
+  }
+
+  public static void assertTrue(boolean condition) {
+    if (!condition) {
+      fail("expected true, but was false")
+    }
+  }
+
+  public static void assertFalse(boolean condition) {
+    if (condition) {
+      fail("expected false, but was true")
+    }
+  }
+
+  public static void assertNull(Object actual) {
+    if (actual != null) {
+      fail("expected null, but was " + actual)
+    }
+  }
+
+  public static void assertNotNull(Object actual) {
+    if (actual == null) {
+      fail("expected not null, but was null")
+    }
+  }
+
+  public static void assertEquals(Object expected, Object actual) {
+    if (expected == null) {
+      if (actual != null) {
+        fail("expected null, but was " + actual)
+      }
+      return
+    }
+    if (!expected.equals(actual)) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(int expected, int actual) {
+    if (expected != actual) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(long expected, long actual) {
+    if (expected != actual) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(char expected, char actual) {
+    if (expected != actual) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(boolean expected, boolean actual) {
+    if (expected != actual) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  /* Doubles compare the way Double.equals does -- NaN equals NaN and the two
+     zeros differ -- so a test of a computed double is not flaky on the value
+     the arithmetic actually produced. */
+  public static void assertEquals(double expected, double actual) {
+    if (Double.compare(expected, actual) != 0) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  /* assertThrows returns the throwable it caught, which is how a test reads
+     the message or a field of the exception it expected. A different
+     exception is a failure, and the message says which one arrived. */
+  public static Throwable assertThrows(Class expected, Runnable action) {
+    if (expected == null) {
+      fail("expected exception class is null")
+    }
+    try {
+      action.run()
+    } catch (Throwable t) {
+      if (expected.isInstance(t)) {
+        return t
+      }
+      fail("expected " + expected.getName() + ", but was " + t.toString())
+    }
+    fail("expected " + expected.getName() + ", but nothing was thrown")
+    return null
+  }
+}
+
+// TestReport is the runner's formatting, not an assertion: the generated entry
+// point calls it so the two lines a failure prints agree on how a throwable is
+// spelled.
+class TestReport {
+  /* The message for the FAIL line. A throwable with no message still has to
+     name something, so the class name stands in. */
+  public static String message(Throwable t) {
+    String m = t.getMessage()
+    if (m == null) {
+      return t.getClass().getName()
+    }
+    return m
+  }
+
+  /* The exception line under it: Java's toString, class name and message. */
+  public static String describe(Throwable t) {
+    return t.toString()
+  }
+}

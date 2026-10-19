@@ -63,6 +63,15 @@ type Options struct {
 	// NativeHeader, when set, receives a C header declaring every native
 	// method the program expects to be implemented.
 	NativeHeader string
+	// TestEntry, when set, is an extra compilation unit compiled as part of
+	// the package named by TestEntryBase. `teyru test` generates the entry
+	// point that runs a package's tests this way, so the generated file never
+	// has to be written into the user's tree.
+	TestEntry string
+	// TestEntryBase names a source file of the package TestEntry belongs to.
+	// The entry takes that file's package identity, which inside a module is
+	// the package's import path rather than the name written in the file.
+	TestEntryBase string
 }
 
 // Result reports the outcome of a compilation.
@@ -151,7 +160,16 @@ func Compile(paths []string, opts Options) (*Result, error) {
 	}
 
 	astFiles := parsePrelude(diags)
-	program := make([]*ast.File, 0, len(files))
+	program := make([]*ast.File, 0, len(files)+1)
+	var testEntry *ast.File
+	if opts.TestEntry != "" {
+		// The entry is the first compilation unit after the prelude, which is
+		// what makes it the program's main when the package under test has a
+		// main of its own: the checker keeps the first of two static mains,
+		// so a test run never calls the user's.
+		testEntry = parseSource("<test>/__TeyruTestMain.teyru", opts.TestEntry, diags)
+		program = append(program, testEntry)
+	}
 	for _, f := range files {
 		program = append(program, parseFile(f, diags))
 	}
@@ -163,6 +181,20 @@ func Compile(paths []string, opts Options) (*Result, error) {
 		astFiles = append(astFiles, resolveImports(graph, program, diags)...)
 	} else {
 		astFiles = append(astFiles, program...)
+	}
+	if testEntry != nil && opts.TestEntryBase != "" {
+		// resolveImports has given every file of the package its identity by
+		// now, which inside a module is the import path. The generated entry
+		// is not a file of the module, so it adopts the identity of a real one
+		// instead of guessing it from the package clause.
+		base := absPath(opts.TestEntryBase)
+		for _, f := range program[1:] {
+			if absPath(f.Src.Path) == base {
+				testEntry.Package = f.Package
+				testEntry.DeclaredPackage = f.DeclaredPackage
+				break
+			}
+		}
 	}
 	if diags.HasErrors() {
 		return &Result{Diags: diags}, fmt.Errorf("parse errors")
