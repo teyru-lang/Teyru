@@ -144,6 +144,12 @@ source → lexer → parser → ast → sema → codegen
   而函式庫對它拿到的那個檔案在**兩種佈局下都讀對**（vanguard 與 rearguard 對愛爾蘭給出相同的
   offset 與縮寫、相反的 `isdst`），所以沒有任何固定的期望能同時滿足兩者；差一點就去改讀取程式
   那一邊，而該改的是測試。
+- **跨平台的整套要給 `TEYRU_RUNNER`**：`TEYRU_TARGET=windows/amd64` 配
+  `TEYRU_RUNNER=wine`，arm64 配 `qemu-aarch64`。**不要用 binfmt 代替**：核心的 `P` 旗標
+  會把執行檔路徑同時當成 argv[0] 與第一個參數，`t08_args` 因此回報多一個參數——那是
+  執行方式錯了，不是程式錯了。MinGW 的組譯器另外有 32,767 個 COFF section 的上限，
+  冷快取的標準庫單元會超過它（`t93_json` 是 35,655），所以 mingw 的旗標裡有
+  `-Wa,-mbig-obj`（`targetCflags`）。
 - **Teyru 自己的測試**：語言層級的單元測試用 `teyru test`（`@Test`／`@BeforeEach`／
   `Assert`，見〈工具鏈〉），放在 `tests/test-framework/`。它驗的是**標準庫與語言語意**；
   編譯器本身的 Go 測試仍用 `go test`，兩者不互相取代。
