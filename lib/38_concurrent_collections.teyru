@@ -21,11 +21,11 @@ package teyru
  * ordinary shape of a synchronizer, and the runtime carries it.
  *
  * Absent, and deliberately not declared: TimeUnit (every duration here is
- * milliseconds, as in Thread.sleep), interruptible waits (there is no
- * interrupt in this language), CyclicBarrier, Semaphore, Phaser, Exchanger,
- * and the atomic field updaters. CountDownLatch.await here cannot be
- * interrupted, so it has no InterruptedException to throw and no throws clause
- * to name one in -- this language has none. */
+ * milliseconds, as in Thread.sleep), CyclicBarrier, Semaphore, Phaser,
+ * Exchanger, and the atomic field updaters. CountDownLatch.await waits with
+ * Object.wait, so an interrupt ends it with InterruptedException -- this
+ * compiler does not check checked exceptions, so the method declares no throws
+ * clause for it, as in the rest of this library. */
 
 /* Java's CountDownLatch: a gate that opens when the count reaches zero.
  *

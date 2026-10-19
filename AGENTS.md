@@ -331,8 +331,19 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   `currentThread`／`getId`／`getName`／`isAlive`）、真的 `synchronized`（含
   `synchronized` 方法修飾子，方法會持有監視器整段）與 `Object.wait`／`notify`／
   `notifyAll`。執行期在 `internal/runtime/src/tyrt_thread.c`，端到端測試是
-  `tests/programs/t159_threads.teyru`。**沒有的**：`interrupt`、daemon、優先權、
-  `ThreadGroup`、`ThreadLocal`、堆疊大小與逾時的 `join(long)`，以及未處理例外的
+  `tests/programs/t159_threads.teyru`。
+  中斷與 daemon 已實作：`interrupt`／`isInterrupted`／`Thread.interrupted`（狀態
+  在每個執行緒的執行期條目裡；`sleep`、`join`、`Object.wait`／`wait(long)` 用各自的
+  條件變數等待並在醒來時檢查，所以不需要 signal；被中斷時清除旗標並丟
+  `InterruptedException`；阻塞的檔案與 socket I/O 不可中斷，與 classic `java.io`
+  相同）、`setDaemon`／`isDaemon`（`start` 之後丟
+  `IllegalThreadStateException`；建構時繼承建立者的 daemon 狀態；行程在最後一個
+  非 daemon 執行緒結束時結束，`ty_thread_join_all` 等的是
+  `n_live - n_daemon`）。`ThreadLocal` 是純 Teyru：值放在 `Thread` 物件自己的
+  `HashMap` 欄位，GC 看到的是普通引用，執行期不參與。端到端測試是
+  `tests/programs/t288_interrupt.teyru`、`t289_interrupt_status.teyru`、
+  `t290_daemon_exit.teyru`、`t291_thread_local.teyru`。**沒有的**：優先權、
+  `ThreadGroup`、堆疊大小與逾時的 `join(long)`、中斷阻塞 I/O，以及未處理例外的
   handler（執行期印出 Java 預設處理常式那一行，然後結束那個執行緒、行程繼續）。
   GC 是**合作式**停止世界：安全點在每個迴圈回邊（產生器會放）、配置慢路徑、等
   heap 鎖，以及執行期自己每個會等的呼叫——socket 的讀、寫、accept 與 connect 等待，TLS

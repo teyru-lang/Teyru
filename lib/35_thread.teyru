@@ -8,27 +8,42 @@ package teyru
 // the part a program writes against: a Thread object with a Runnable to run,
 // and the handful of methods java.lang.Thread has for asking about it.
 //
-// What is implemented, and what it costs to be honest about the rest:
+// What is implemented:
 //
 //   - Thread(Runnable), Thread(Runnable, String), Thread() and Thread(String);
 //   - start(), which creates the thread and runs run() on it. Calling run()
 //     directly runs it on the calling thread, as it does in Java; calling
 //     start() twice throws IllegalStateException (Java throws
-//     IllegalThreadStateException, which this standard library does not have);
+//     IllegalThreadStateException, and so does this after start());
 //   - join(), join(long) is not here -- join() waits for as long as the thread
 //     takes, and there is no form that gives up after a while;
 //   - isAlive(), getId(), getName(), setName(String);
+//   - interrupt(), isInterrupted(), Thread.interrupted(). A thread asleep in
+//     Thread.sleep, Thread.join or Object.wait wakes with
+//     InterruptedException, and the interrupt status is cleared when it is
+//     thrown. Blocking file and socket I/O is not interruptible, which is
+//     classic java.io's behaviour too;
+//   - setDaemon(boolean) and isDaemon(). A thread inherits its creator's daemon
+//     status at construction, as in Java, and the process ends when the last
+//     non-daemon thread does -- a daemon that is still looping is simply left
+//     behind;
+//   - ThreadLocal, in this file, with a per-Thread map. It is deliberately
+//     Teyru and not runtime state: the map is an ordinary reference the
+//     collector already understands, and a thread's values go away with its
+//     Thread object;
 //   - Thread.sleep(long), Thread.yield(), Thread.currentThread().
 //
-// Not implemented, and deliberately not declared: interrupt(),
-// setDaemon/isDaemon, the thread priorities, ThreadGroup, the uncaught
-// exception handler (the runtime prints the same line Java's default handler
-// prints, and the thread ends), Thread.State, ThreadLocal, and the constructors
-// that take a ThreadGroup or a stack size.
+// Not implemented, and deliberately not declared: the thread priorities,
+// ThreadGroup, the uncaught exception handler (the runtime prints the same line
+// Java's default handler prints, and the thread ends), Thread.State, and the
+// constructors that take a ThreadGroup or a stack size.
 //
 // The one place this differs from Java in behaviour rather than in surface:
 // getId() is assigned when the Thread object is built and never changes, and the
 // main thread is 1. Both are Java's rule; the numbers simply are not the JVM's.
+// Interrupt status lives on the Thread object, as in Java, so a thread that was
+// interrupted before start() runs with the status set, and one that finished
+// keeps whatever status it ended with.
 
 class Thread implements Runnable {
   // ------------------------------------------------------------------ natives
@@ -41,8 +56,10 @@ class Thread implements Runnable {
   /* Start a thread that runs t.run(), and answer with the id it was given. The
      runtime is handed the object rather than a function because the call it has
      to make is the program's own run(), dispatched the way the compiler
-     dispatches every other interface call. */
-  private static native long start0(Thread t, long id, String name)
+     dispatches every other interface call. The daemon flag is passed here
+     rather than stored in the runtime earlier: the registry entry does not
+     exist until start(), and setDaemon may not be called after it. */
+  private static native long start0(Thread t, long id, String name, boolean daemon)
 
   /* The id a Thread object gets when it is built: the runtime's counter, so that
      getId() answers the same number before and after start(). */
@@ -59,8 +76,26 @@ class Thread implements Runnable {
      ever made an object for. */
   private static native void bind0(Thread t)
 
-  private static native void join0(long id)
+  /* Wait for the thread, answering true when the wait was interrupted instead
+     of the thread finishing. The status is already cleared when it answers
+     true; join() is what turns it into InterruptedException. */
+  private static native boolean join0(long id)
   private static native boolean alive0(long id)
+
+  /* Sleep, answering true when the sleep was interrupted (and clearing the
+     status). The native call has to be the thing that waits, because it is the
+     only layer that can be woken by interrupt0. */
+  private static native boolean sleep0(long millis)
+
+  /* Interrupt status, by thread id: set, read, and read-and-clear. The three
+     are separate because isInterrupted() must not clear and Thread.interrupted()
+     must. */
+  private static native void interrupt0(long id)
+  private static native boolean isInterrupted0(long id)
+  private static native boolean clearInterrupted0()
+
+  /* The calling thread's daemon status, which a new Thread inherits. */
+  private static native boolean currentDaemon0()
 
   // ------------------------------------------------------------------- fields
 
@@ -70,6 +105,16 @@ class Thread implements Runnable {
      every thread a number at construction, and a program may read it then. */
   private long tid
   private boolean started
+  /* Daemon status, set before start() and read by the runtime from the registry
+     entry afterwards. The field is what isDaemon answers for a thread that has
+     not started, and what start0 hands the runtime. */
+  private boolean daemon
+  /* This thread's ThreadLocal values, keyed by the ThreadLocal instance. Only
+     the thread it belongs to touches it, so it needs no monitor, and it is an
+     ordinary reference field so that the collector traces it like any other.
+     Package private so that ThreadLocal.remove can test it without making an
+     empty map just to throw it away. */
+  HashMap<Object, Object> locals
   /* The Thread object standing for the main thread, made on first use. It is a
      static reference, so it is a root the collector keeps: a thread's own object
      must not be collected while the program can still ask about it. */
@@ -93,6 +138,9 @@ class Thread implements Runnable {
     this.tid = Thread.nextId0()
     this.target = target
     this.name = (name == null) ? ("Thread-" + this.tid) : name
+    /* java.lang.Thread inherits the daemon status of the thread that makes it,
+       which is what keeps a worker created by a daemon a daemon. */
+    this.daemon = Thread.currentDaemon0()
   }
 
   // -------------------------------------------------------------- the thread
@@ -113,14 +161,18 @@ class Thread implements Runnable {
       throw new IllegalStateException("thread already started")
     }
     this.started = true
-    Thread.start0(this, this.tid, this.name)
+    Thread.start0(this, this.tid, this.name, this.daemon)
   }
 
   /* Wait for this thread to finish. A thread that was never started has nothing
      to wait for, and one that has already finished returns at once -- both are
-     what java.lang.Thread.join does. */
+     what java.lang.Thread.join does. An interrupt of the thread doing the
+     joining ends the wait with InterruptedException, and the status is cleared
+     as it is thrown. */
   public void join() {
-    Thread.join0(this.tid)
+    if (Thread.join0(this.tid)) {
+      throw new InterruptedException()
+    }
   }
 
   public boolean isAlive() {
@@ -139,6 +191,51 @@ class Thread implements Runnable {
     this.name = name
   }
 
+  /* Ask this thread to stop waiting. The status is set even when the thread is
+     running rather than blocked -- that is the cooperative half of Java's
+     interrupt -- and a thread asleep in sleep, join or Object.wait wakes with
+     InterruptedException. A thread that has finished, or was never started, is
+     not affected. */
+  public void interrupt() {
+    Thread.interrupt0(this.tid)
+  }
+
+  public boolean isInterrupted() {
+    return Thread.isInterrupted0(this.tid)
+  }
+
+  /* The calling thread's interrupt status, cleared: java.lang.Thread's static
+     interrupted(), which is what a program uses to poll the flag without an
+     exception. */
+  public static boolean interrupted() {
+    return Thread.clearInterrupted0()
+  }
+
+  /* Daemon status, which decides whether the process waits for this thread.
+     Java only allows it before start(); after that the thread's life is the
+     runtime's business, and so is the count. */
+  public final void setDaemon(boolean on) {
+    if (this.started) {
+      throw new IllegalThreadStateException("thread already started")
+    }
+    this.daemon = on
+  }
+
+  public final boolean isDaemon() {
+    return this.daemon
+  }
+
+  // -------------------------------------------------------- ThreadLocal storage
+
+  /* The map get()/set()/remove() below work on, made on first use. Package
+     private: it is this file's business, not the program's. */
+  HashMap<Object, Object> localMap() {
+    if (this.locals == null) {
+      this.locals = new HashMap<Object, Object>()
+    }
+    return this.locals
+  }
+
   // ----------------------------------------------------------------- statics
 
   /* Give the processor up. Java's Thread.yield is a hint with no guarantee, and
@@ -146,8 +243,13 @@ class Thread implements Runnable {
   public static native void yield()
 
   /* Sleep for at least this many milliseconds. A negative duration is an
-     IllegalArgumentException, as it is in Java; sleep(0) yields. */
-  public static native void sleep(long millis)
+     IllegalArgumentException, as it is in Java; sleep(0) yields. An interrupt
+     ends the sleep early with InterruptedException. */
+  public static void sleep(long millis) {
+    if (Thread.sleep0(millis)) {
+      throw new InterruptedException()
+    }
+  }
 
   /* The Thread object of the calling thread. Inside a started thread that is the
      object start() was called on; in the main thread it is an object this makes
@@ -170,5 +272,66 @@ class Thread implements Runnable {
   public static Thread currentThread() {
     Thread t = (Thread) Thread.current0()
     return (t != null) ? t : Thread.mainThread()
+  }
+}
+
+/* java.lang.ThreadLocal, one value per thread.
+ *
+ * The storage is the Thread object's own map (the `locals` field above), keyed
+ * by this object. Java's ThreadLocal is the same design -- a map on the thread,
+ * not a map on the ThreadLocal -- and the reason is the one that matters here:
+ * a thread's values must not be visible to another thread and must not outlive
+ * it. Keying by the ThreadLocal instance is identity, because ThreadLocal does
+ * not override equals/hashCode; two different ThreadLocals are two keys, and
+ * the same ThreadLocal seen from two threads finds two different maps.
+ *
+ * withInitial's supplier runs once per thread, on that thread's first get(), and
+ * a value that was set() explicitly (including null) is not replaced by it.
+ * remove() drops the entry, so the next get() calls the supplier again.
+ *
+ * One difference from the JDK worth knowing: Java's map has weak keys, so a
+ * ThreadLocal that goes out of scope can be collected while the thread lives.
+ * This one has strong keys -- there is no WeakReference in this library -- so a
+ * ThreadLocal whose entry is never removed stays reachable from every thread
+ * that read it, for as long as those threads live. A long-lived worker that
+ * creates ThreadLocals per task should remove() them, which is the advice
+ * Java's documentation gives too. */
+class ThreadLocal<T> {
+  private Supplier<? extends T> initial
+
+  public ThreadLocal() {
+  }
+
+  private ThreadLocal(Supplier<? extends T> initial) {
+    this.initial = initial
+  }
+
+  public static <S> ThreadLocal<S> withInitial(Supplier<? extends S> supplier) {
+    return new ThreadLocal<S>(supplier)
+  }
+
+  public T get() {
+    Thread t = Thread.currentThread()
+    HashMap<Object, Object> map = t.localMap()
+    if (map.containsKey(this)) {
+      return (T) map.get(this)
+    }
+    if (this.initial == null) {
+      return null
+    }
+    T value = this.initial.get()
+    map.put(this, value)
+    return value
+  }
+
+  public void set(T value) {
+    Thread.currentThread().localMap().put(this, value)
+  }
+
+  public void remove() {
+    Thread t = Thread.currentThread()
+    if (t.locals != null) {
+      t.locals.remove(this)
+    }
   }
 }

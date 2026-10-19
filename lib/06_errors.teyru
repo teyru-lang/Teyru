@@ -154,6 +154,31 @@ class IllegalStateException extends RuntimeException {
   }
 }
 
+/* java.lang.IllegalThreadStateException, which Thread.setDaemon throws when the
+   thread has already been started. It is an IllegalArgumentException in the JDK
+   and is one here too, so a program that catches the parent keeps working. */
+class IllegalThreadStateException extends IllegalArgumentException {
+  public IllegalThreadStateException() {
+  }
+  public IllegalThreadStateException(String message) {
+    super(message)
+  }
+}
+
+/* java.lang.InterruptedException: what Thread.sleep, Thread.join and
+   Object.wait throw when the thread they run on is interrupted. It is checked
+   in Java and unchecked here, because this compiler does not check checked
+   exceptions (AGENTS.md section 10). The runtime does not raise it -- the
+   blocking native call answers "interrupted" and the Teyru wrapper throws --
+   so it needs no TY_ class handle in the generated startup. */
+class InterruptedException extends Exception {
+  public InterruptedException() {
+  }
+  public InterruptedException(String message) {
+    super(message)
+  }
+}
+
 /* Thrown by Object.wait/notify/notifyAll when the calling thread does not hold
    the monitor of the object it names -- java.lang's exception for exactly that,
    and the one the runtime throws (tyrt_thread.c). */
