@@ -135,10 +135,19 @@ func skips(t *testing.T, dir, name string) (bool, string) {
 	}
 	osname, arch := target()
 	here := osname + "/" + arch
+	// `ci` names the environment rather than a platform: a case that fails on
+	// GitHub's runner and nowhere else says so here, and the run prints the
+	// reason instead of hiding it. The token matches when GITHUB_ACTIONS is set,
+	// which is the one thing the runner always exports.
+	inCI := os.Getenv("GITHUB_ACTIONS") != ""
 	for _, token := range tokens {
 		neg := strings.HasPrefix(token, "!")
 		token = strings.TrimPrefix(token, "!")
-		if (token == osname || token == here) != neg {
+		match := token == osname || token == here
+		if token == "ci" {
+			match = inCI
+		}
+		if match != neg {
 			return true, strings.Join(reasons, "; ")
 		}
 	}
