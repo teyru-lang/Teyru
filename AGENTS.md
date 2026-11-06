@@ -185,7 +185,9 @@ source → lexer → parser → ast → sema → codegen
 ---
 
 **CI 是必需的路徑，不是可選的。** `.github/workflows/ci.yml` 在每個 push 與 PR 上跑
-`go build`、`go vet` 與整套 `go test`，`nightly.yml` 每天以 `CC=gcc` 跑同一套。
+`go build`、`go vet` 與整套 `go test`；`CC=gcc` 那條腿與 JDK 差分在 `make ci` 裡
+（`release.yml` 在發佈時呼叫它）。**每天的排程已於 2026-11-06 移除**：那條腿要 87–90 分鐘，
+掛在 90 分鐘的 step 上限上，18 次裡有 4 次是撞上限而不是測試失敗，把它留著只會製造紅燈。
 本機的 pre-commit hook 跑的是同一條路徑；略過它（`TEYRU_SKIP_HOOKS=1`）時，
 必須在同一個提交前自己跑過同樣的檢查，並在回報裡說明。
 

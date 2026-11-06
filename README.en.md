@@ -70,9 +70,10 @@ and `TestTLSReachability` in `link_test.go` guard this cell; when reflection rea
 method at runtime, what it gets is a named failure from the runtime weak stub, not a jump to NULL.
 
 CI runs `go build`, `go vet` and the whole `go test` suite on every push to `main` and every pull
-request (`.github/workflows/ci.yml`), with the `CC=gcc` leg once a day (`nightly.yml`). Every row in
-this table is still produced on this one linux/amd64 machine: CI guards against silent regressions,
-it does not measure every platform.
+request (`.github/workflows/ci.yml`). The `CC=gcc` leg and the JDK differential live in `make ci`,
+which now runs automatically only at release time (`release.yml`). Every row in this table is still
+produced on this one linux/amd64 machine: CI guards against silent regressions, it does not measure
+every platform.
 
 ## Standard library
 
