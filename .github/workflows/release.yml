@@ -57,7 +57,22 @@ jobs:
           java-version: "21"
 
       - name: the C compilers the suite builds with
-        run: sudo apt-get update && sudo apt-get install -y clang gcc
+        # 0.5.0's run died here, before a single test ran: `apt-get update`
+        # exited 100 on a mirror that answered some requests and not others
+        # (`Ign:` lines for every archive entry, then exit 100). The packages
+        # are on the image's own mirror list, so a retry is the whole fix --
+        # and `-o Acquire::Retries` only covers a single URI, not the update
+        # itself, which is why the loop is here and not in a flag.
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y clang gcc; then
+              exit 0
+            fi
+            echo "apt failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "apt failed three times; the mirror, not this step, is the problem"
+          exit 1
 
       - name: build the compiler
         run: make build
