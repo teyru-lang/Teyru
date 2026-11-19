@@ -1278,6 +1278,26 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
     **腿 +14%** 才是這一節該引用的數字，全程式的 **+51%／+86%** 只在**沒有 prelude 快取**的路徑
     （`teyru emit`、`-O2` 的全程式路徑）上成立。
 
+- **`make ci` 的 gcc 腿逾時，根因是一段 O(敘述 × 暫存) 的死儲存（2026-11-20 找到並修好）**：
+  `v0.4.2` 與 `v0.5.1` 的 release run 都死在同一支——`TestPrograms/t115_math` 在 gcc 腿上
+  跑 25～29 分後 `panic: test timed out after 45m0s`。**不是那幾天的改動造成的**，兩個月前
+  的 tag 就是這樣；也不是「巨型函式讓 gcc 退化」——我一度這樣寫，那是**被污染的**量測（三個
+  gcc 並行、各吃 2～3 GB，zram 已用 11.7 GB），清空後同一份 `program.c` 單獨跑是 78 秒到
+  213 秒，波動本身就說明那不是穩定的退化。
+  **真正的原因**：`emitBlockInner` 在**每一個敘述結束**時，把 `e.frameTemps`——**整個函式
+  的所有暫存變數**——逐一寫一次 `ty_frame_put(..., NULL)`。`t115_math` 的 `main` 有 464 個
+  敘述、1,299 個暫存變數，於是產生 **504,771 行死儲存**（實測：`main` 的 510,032 行裡
+  506,918 行是 kill），整份 split 單元 512,615 行。這是 O(n²)，而且完全多餘：
+  `stmt()` 的 `frameScope` 已經精確地把**本敘述**寫入的字還回去，`framePass` 的 `pending`
+  也已經在掃描時做同一件事。
+  **修法**是刪掉那段掃描（`internal/codegen/emit_stmt.go`），性質不變——`framePass` 的
+  `pending` 就是「正在掃的這個敘述的暫存」，敘述結束就是它們回去的地方，
+  `TestEveryWrittenFrameWordIsReleased` 仍然盯著「沒有寫入是沒被還回去的」。
+  **量到的結果（本機 linux/amd64、gcc 16.2.1）**：`t115_math` 產生的 C **512,615 → 7,783 行**、
+  gcc `-O1` 建置 **25 分 40 秒（CI）／超過 213 秒（本機）→ 25.7 秒**、輸出與 `.expected`
+  逐行相同。同一支在 clang 上從 47 秒降到數秒。`t245_dropped_reference`（GC 根）與
+  `t260_eval_order`（求值順序）在 gcc 下仍然通過。
+
 - **一個必須說清楚的實作陷阱（同一次工作裡踩到的三個，都修了）**：(1) LTO 會內聯
   `ty_frame_enter_`，於是它自己的框架就是呼叫者的，`lo == hi`、範圍空掉——**任何「靠自己是
   另一層框架」才成立的 helper 都必須 `noinline`**；(2) 「還沒執行到的註冊」留下的是**零**，

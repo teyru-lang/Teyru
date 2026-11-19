@@ -94,16 +94,17 @@ func (e *Emitter) emitBlockInner(b *ast.Block) {
 			}
 			e.line("%s = NULL;\n", e.localName(v))
 		}
-		/* The frame's own words for values that were in flight: a value cannot
-		   still be waiting for the call that consumes it once the statement is
-		   over, so the words they were held in go back. The word, not the
-		   variable -- what the expression answered with has been read out of it
-		   by now. */
-		if n := len(e.frameTemps); n > 0 {
-			for k := 0; k < n; k++ {
-				e.line("%s(&%s, %d, NULL);\n", framePut, frameVar, e.frameBase+k)
-			}
-		}
+		/* The frame's own words for values that were in flight are given back by
+		   framePass (frames.go), which knows which of them *this* statement
+		   wrote. Releasing every word of the frame here -- which is what this
+		   block used to do -- is O(statements x temps) of dead stores: a method
+		   with 464 statements and 1,299 temporaries emitted 504,771 of them, and
+		   gcc's -O1 spent minutes on the resulting function (TestPrograms/t115_math
+		   timed out the 45m `make ci` gcc leg). The property the block was there
+		   for is unchanged: framePass's `pending` is the set of temporaries of
+		   the statement being scanned, and its statement end is where they go
+		   back. TestEveryWrittenFrameWordIsReleased checks that no write is left
+		   unreleased. */
 		/* And where the statement ended, which is what tells the map's pass
 		   (frames.go) to give the temporaries *it* registered their words back
 		   in the same way. */
