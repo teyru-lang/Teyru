@@ -144,6 +144,15 @@ source → lexer → parser → ast → sema → codegen
   而函式庫對它拿到的那個檔案在**兩種佈局下都讀對**（vanguard 與 rearguard 對愛爾蘭給出相同的
   offset 與縮寫、相反的 `isdst`），所以沒有任何固定的期望能同時滿足兩者；差一點就去改讀取程式
   那一邊，而該改的是測試。
+  **同一個家族的第二個實例（2026-11-19）**：`t188_timezone` 問宿主要 `Europe/Kiev`，那是 tzdata
+  的 backward 相容連結；**Ubuntu 24.04 把它拆到另一個套件（`tzdata-legacy`）**，runner 沒裝，
+  於是一個存在於 JDK 自帶資料庫、在這台 Fedora 上也存在的 id，在 CI 上直接拋
+  `Unknown time-zone ID`。三次 run 都掛在同一支，而 `.java.ref` 永遠量得到它——JDK 帶自己的
+  編譯後資料庫，這正是「期望值從哪來」決定你改哪一邊：**改測試**，把別名行為釘在測試自己寫的
+  資料庫上（`t189`），`t188` 不再指名一個「存在與否取決於宿主套件清單」的 id。
+  這條的通用形式是：**任何依賴宿主資料的期望，都要能回答「這台機器沒這筆資料時它還成立嗎」**；
+  答不出來就不是在測程式，是在測套件清單。
+
 - **跨平台的整套要給 `TEYRU_RUNNER`**：`TEYRU_TARGET=windows/amd64` 配
   `TEYRU_RUNNER=wine`，arm64 配 `qemu-aarch64`。**不要用 binfmt 代替**：核心的 `P` 旗標
   會把執行檔路徑同時當成 argv[0] 與第一個參數，`t08_args` 因此回報多一個參數——那是
