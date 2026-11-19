@@ -1626,7 +1626,7 @@ func Run(exe string, args []string) (int, error) {
 // changes in the same commit as the tag's release notes. It said 0.2.0 while the
 // project had moved well past it, which is how a version string stops being
 // information.
-var version = "0.5.1"
+var version = "0.5.2"
 
 // Version reports the compiler version string.
 func Version() string {
