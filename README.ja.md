@@ -205,11 +205,16 @@ README 自体にも 4 つの言語がある：繁體中文（本ファイル、�
 [English](README.en.md)、[日本語](README.ja.md)。正本を変えたら残りの 3 つも同期させること。数字、パス、
 コードブロックはそのまま写し、翻訳するのは散文だけである。
 
-GitHub 上の言語統計も `.gitattributes` で補正してある：`*.teyru` は Teyru と宣言し、`*.java.ref`
-（これは仕様である——`.expected` は javac の出力から生成される）と `*.expected`（テストデータ）は集計対象外と
-した。それ以前は「Java」がこのリポジトリで最大の言語だったが、それはほとんど存在していなかった。はっきり
-言っておくと、`linguist-language` の行は**Teyru を出現させない**：Linguist は自分が知っている言語しか集計
-しないので、言語自体と `teyru-lang/editors` の文法が上流に取り込まれて初めて、統計に Teyru の項目が現れる。
+GitHub 上の**コードの着色と言語統計は別物**で、`.gitattributes` はその二つを分けて扱う。着色：
+`*.teyru` は `linguist-language=Java` で Java の文法に渡して描く（両者の構文は十分近く、読める）；
+統計：同じファイル群を `linguist-detectable=false` で除外するので、Teyru のソースが Java として
+数えられることはない。`*.java.ref`（これは仕様である——`.expected` は javac の出力から生成される）と
+`*.expected`（テストデータ）も集計対象外とした。それ以前は「Java」がこのリポジトリで最大の言語だったが、
+それはほとんど存在していなかった。はっきり言っておくと、統計に**Teyru の項目はまだ現れない**：
+Linguist は自分が知っている言語しか集計しないので、言語自体と `teyru-lang/editors` の文法が上流に
+取り込まれて初めて現れる（それはメンテナの判断であり、agent が代わりに送るものではない）。同じ理由で、
+GitHub の Markdown のコードブロックに `teyru` という言語タグを書いても**着色されない**——そちらの
+着色は Linguist の言語表を読み、`.gitattributes` は見ない。着色されるのはファイル自体だけである。
 
 ## この組織のほかのリポジトリ
 

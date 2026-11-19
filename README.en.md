@@ -211,13 +211,18 @@ locales). This README itself also comes in four languages: Traditional Chinese (
 changes, the other three must be brought in sync, copying numbers, paths and code blocks verbatim and
 translating only the prose.
 
-The language statistics on GitHub have been corrected by `.gitattributes` as well: `*.teyru` is
-declared as Teyru, and `*.java.ref` (that is the spec — `.expected` is generated from javac's output)
-and `*.expected` (test data) are marked as not counted. Before that, "Java" was once the largest
-language in this repository, and it barely exists. To be clear, the `linguist-language` line **will
-not make Teyru appear**: Linguist only counts languages it recognises, so Teyru will show up in the
-statistics only after the language itself and the grammar in `teyru-lang/editors` are accepted
-upstream.
+**Syntax colouring and language statistics are two different things on GitHub**, and
+`.gitattributes` handles them separately. Colouring: `*.teyru` is handed to the Java grammar with
+`linguist-language=Java` (the syntax is close enough to read); statistics: the same files are then
+excluded with `linguist-detectable=false`, so Teyru sources are not counted as Java. `*.java.ref`
+(that is the spec — `.expected` is generated from javac's output) and `*.expected` (test data) are
+marked as not counted too. Before that, "Java" was once the largest language in this repository, and
+it barely exists. To be clear, Teyru **still does not appear in the statistics**: Linguist only
+counts languages it recognises, so that waits on the language itself and the grammar in
+`teyru-lang/editors` being accepted upstream (the maintainer's decision, not something an agent
+sends). For the same reason, a `teyru` language tag on a fenced code block in GitHub Markdown
+**still gets no colouring** — that highlighting reads Linguist's language table, not
+`.gitattributes`; only files themselves get coloured.
 
 ## Other repositories in this organisation
 

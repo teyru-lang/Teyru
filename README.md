@@ -196,11 +196,15 @@ Web 框架、模組系統、原生互通、架構。原始檔在
 繁體中文（本檔，正本）、[简体中文](README.zh-CN.md)、[English](README.en.md) 與
 [日本語](README.ja.md)；改了正本就要把其餘三份同步，數字、路徑與程式碼區塊照抄，只翻散文。
 
-GitHub 上的語言統計也由 `.gitattributes` 校正過：`*.teyru` 宣告成 Teyru，`*.java.ref`
-（那是規格——`.expected` 是由 javac 的輸出產生的）與 `*.expected`（測試資料）標成不計入。
-在那之前，「Java」曾經是這個倉庫裡最大的語言，而它幾乎不存在。要說清楚的是
-`linguist-language` 這一行**不會讓 Teyru 出現**：Linguist 只統計它認得的語言，所以要等
-語言本身與 `teyru-lang/editors` 那份文法被上游收下，統計裡才會有 Teyru 這一項。
+GitHub 上的**程式碼著色與語言統計是兩件事**，`.gitattributes` 分開處理它們。著色：
+`*.teyru` 以 `linguist-language=Java` 交給 Java 文法畫（兩者的語法形狀夠近，畫面讀得懂）；
+統計：同一批檔案再用 `linguist-detectable=false` 排除，所以 Teyru 的原始碼不會被算成
+Java。`*.java.ref`（那是規格——`.expected` 是由 javac 的輸出產生的）與 `*.expected`
+（測試資料）也標成不計入。在那之前，「Java」曾經是這個倉庫裡最大的語言，而它幾乎不存在。
+要說清楚的是，統計裡**仍然沒有 Teyru 這一項**：Linguist 只統計它認得的語言，要等語言本身
+與 `teyru-lang/editors` 那份文法被上游收下（那要由維護者決定，不由 agent 代送）。同樣的
+原因，GitHub 的 Markdown 程式碼區塊裡寫 `teyru` 當作語言標記還是**不會著色**——那片著色
+走的是 Linguist 的語言表，不吃 `.gitattributes`；被著色的只有檔案本身。
 
 ## 這個組織的其他倉庫
 
