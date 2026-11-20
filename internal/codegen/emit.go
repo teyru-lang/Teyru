@@ -66,6 +66,14 @@ type Emitter struct {
 	sideLib  bool     // whether the class being emitted belongs to the prelude
 	lib      bool     // whether this emitter is the library's unit
 	metaInit []string // the assignments that attach them at startup
+	// analysisOnly is set on an emitter that exists to answer a question and
+	// writes nothing. The reflection scan is a question -- which classes do this
+	// program's call sites reach -- and the LLVM back end asks it with a
+	// zero-value Emitter (llvm.go, reflTables), whose own unit is nil; the scan's
+	// helpers register array classes, and a registration that wrote its
+	// declaration into own.types dereferenced that nil and panicked on
+	// t300_array_component. With this set they register and say nothing.
+	analysisOnly bool
 	// vts collects the vtable arrays of a split build (see emitClassMeta), and
 	// forName the class table Class.forName searches (see forNameTable). Both
 	// belong to the program's unit whatever class they name, so they are

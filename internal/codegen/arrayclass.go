@@ -166,6 +166,11 @@ func (e *Emitter) arrayClassFor(t ast.Type) string {
 	// "String[]" are then two class objects; nothing in the library reads a
 	// program's array class, and the program's ty_prog_array_of is the table a
 	// program's reflection uses.
+	if e.analysisOnly {
+		// Nothing is being written: see the field's comment in emit.go. The
+		// registration still happened, which is the answer the caller wanted.
+		return "cls_" + info.cname
+	}
 	if e.lib {
 		// The declaration goes into the unit's data section rather than its
 		// types: the types section becomes the shared header, and a static

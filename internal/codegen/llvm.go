@@ -488,7 +488,10 @@ func (e *llvmEmitter) run() {
 	// classes, and written for every class it would pin the whole library into
 	// a program that never reflects. The scan answers with the classes a
 	// program's call sites can reach, or every class when it cannot bound them.
-	e.reflTables, _ = (&Emitter{prog: e.p}).reflectionReach()
+	// analysisOnly: this emitter exists for the scan's answer and writes no
+	// output, so the array classes the scan registers must not try to declare
+	// themselves into a unit it does not have.
+	e.reflTables, _ = (&Emitter{prog: e.p, analysisOnly: true}).reflectionReach()
 	// The work queue grows while it is drained: a method body names classes,
 	// which bring their constructors, their static initializers and their
 	// vtable's methods.
