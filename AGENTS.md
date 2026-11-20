@@ -200,6 +200,21 @@ source → lexer → parser → ast → sema → codegen
 本機的 pre-commit hook 跑的是同一條路徑；略過它（`TEYRU_SKIP_HOOKS=1`）時，
 必須在同一個提交前自己跑過同樣的檢查，並在回報裡說明。
 
+**`release.yml` 的關卡是五個 job，不是一個（2026-11-20 改）。** 一個 job 跑完所有檢查的
+版本在 `v0.5.3` 上用掉 **2h19m**，被 SIGTERM 砍在 back-end matrix 的第 69 分鐘——那時
+它已經跑過 `make ci`（含 gcc 腿）、`java-compat` 與 JDK 差分（437 s）且都綠，只是**同一個
+job 的時鐘用完了**。現在的 job 是：`gate`（build／vet／`make ci`／`make cache`／
+`make notices`）、`java-compat`、`matrix`（**六個 cell 各一個 job**，`fail-fast: false`）、
+`matrix-report`（合併六份記錄並回答整張矩陣的 verdict）、`publish`（六個執行檔）。
+`matrix` **刻意不 `needs: gate`**——分開的理由就是同時跑；`publish` 需要前面全部通過，
+所以「任一關卡紅就沒有 binaries」這條性質沒變，那正是原本單一 job 存在的理由。
+
+`scripts/backend-matrix.sh` 因此多了 `MERGE='dir…'`：它不建置、不執行，只把各 shard 的
+`runs/*.tsv` 收進一份記錄再產生同一份報告。合併時**逐格檢查沒有洞**——某個 cell 沒跑完
+就拒絕產生報告，因為「對一個沒跑過的 cell 說沒有分歧」正是這支腳本存在要防的答案。
+shard 自己的 verdict 會因為 `ONLY=` 跑子集而列出「stale allowlist entry」，那是子集執行
+的既有行為，不是新問題；合併後的那一份才是決定發不發佈的那個。
+
 ## 7. 診斷碼規範
 
 - 格式 `TY-<階段>-<四位數字>`，階段為 `SYN`（詞法與語法）、`TYP`（語意）、

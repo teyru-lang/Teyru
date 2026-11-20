@@ -15,6 +15,16 @@ name: release
 # first run of this workflow failed in `make ci` and skipped the two steps that
 # attach the binaries, and re-running it by hand is cheaper than cutting a tag
 # only to retry the same commit.
+#
+# The jobs are split because one job ran 2h19m and was SIGTERMed part way through
+# the back-end matrix (v0.5.3): every check shared one job, so the last one had
+# no time left however fast it was. Now each check owns its own job and its own
+# clock -- `gate` (the suite, both C compilers, the JDK differential),
+# `java-compat`, `matrix` (six cells, one job each, fanned in parallel from a
+# matrix), `matrix-report` (merges the six records and answers for the matrix as
+# a whole), and `publish`, which runs only when every one of them passed. A
+# failure anywhere still means no binaries, which is the property the single job
+# had and the reason it existed.
 
 on:
   release:
@@ -30,19 +40,23 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: build, test and publish the released tag
+  # ---------------------------------------------------------------- the gate
+  #
+  # The suite under both C compilers and the JDK differential. 0.5.3 ran this in
+  # the same job as everything else and it took 4h; on its own it is about an
+  # hour, and a failure here is the one that matters most, so it gets its own
+  # job and reports first.
+  gate:
+    name: the suite, both C compilers, and the JDK differential
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     env:
-      # Both ways in name the tag: a published release in the event payload, and a
-      # manual start in the input. Every step below reads this and nothing else.
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
     steps:
       - name: check out the released tag
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
-          # tests/ is the teyru-lang/tests submodule and the suite is its data
           submodules: recursive
 
       - name: set up Go
@@ -87,22 +101,158 @@ jobs:
           TEYRU_JDK: ${{ env.JAVA_HOME }}
         run: make ci
 
-      - name: the unmodified-Java corpus (tests/java-compat)
-        run: make java-compat
-
-      - name: the JDK differential
-        env:
-          TEYRU_JDK: ${{ env.JAVA_HOME }}
-        run: make jdk-diff
-
-      - name: the back-end matrix (every program under both back ends, -O0 and -O2, clang and gcc)
-        run: make backend-matrix
-
       - name: the standard library cache is filled, reused and invalidated
         run: make cache
 
       - name: third-party notices and the tree agree
         run: make notices
+
+  # ------------------------------------------------------------ java-compat
+  #
+  # Unchanged Java sources that must compile as they stand. It needs no JDK:
+  # the expectations are already the JDK's output.
+  java-compat:
+    name: the unmodified-Java corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - name: check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: the C compiler it builds with
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: the corpus
+        run: make java-compat
+
+  # ---------------------------------------------------------------- the matrix
+  #
+  # Six cells, one job each, so six runners work at once instead of one runner
+  # doing 1,908 builds in sequence. Each shard writes its record and uploads it;
+  # `matrix-report` merges them. The cell list is the workflow's, not the
+  # script's default, so adding a cell here is the only place it is named.
+  matrix:
+    name: back-end matrix, ${{ matrix.cell }}
+    runs-on: ubuntu-24.04
+    # Deliberately not `needs: gate`: the whole reason these are separate jobs
+    # is that they run at the same time. A red gate still stops `publish`.
+    timeout-minutes: 120
+    strategy:
+      # A failing cell should not hide the other five: the report is what says
+      # whether the cells disagree, and it needs them all.
+      fail-fast: false
+      matrix:
+        cell: [O0-clang, O0-gcc, O0-llvm, O2-clang, O2-gcc, O2-llvm]
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - name: check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: the C compilers the cells build with
+        run: sudo apt-get update && sudo apt-get install -y clang gcc
+
+      - name: this cell
+        env:
+          CELL: ${{ matrix.cell }}
+        run: |
+          # JOBS=4 is the runner's core count: more would only thrash the
+          # container, and this job is one cell of six rather than all of them.
+          CELLS=$CELL JOBS=4 OUT="$RUNNER_TEMP/matrix" sh scripts/backend-matrix.sh
+
+      - name: upload the record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.cell }}
+          path: ${{ runner.temp }}/matrix
+          # `.backend-matrix` is the marker the merge looks for, and v4 skips
+          # hidden files unless told otherwise.
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------ matrix report
+  #
+  # The part the split would otherwise lose: the cells are compared with each
+  # other here, and one verdict is answered for the matrix as a whole. It also
+  # refuses to report on an incomplete record, so a shard that died cannot turn
+  # into "no divergence".
+  matrix-report:
+    name: the back-end matrix, merged
+    runs-on: ubuntu-24.04
+    needs: matrix
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - name: check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: fetch every cell's record
+        uses: actions/download-artifact@v4
+        with:
+          pattern: matrix-*
+          path: ${{ runner.temp }}/shards
+
+      - name: merge and report
+        run: |
+          set -e
+          # download-artifact puts each artifact under a directory named after
+          # it, so the shards are the children of the download path.
+          shards=$(find "$RUNNER_TEMP/shards" -maxdepth 2 -name '.backend-matrix' -printf '%h\n' | sort)
+          echo "shards: $shards"
+          [ -n "$shards" ] || { echo "no matrix record was downloaded"; exit 1; }
+          MERGE="$shards" OUT="$RUNNER_TEMP/merged" sh scripts/backend-matrix.sh
+
+  # ---------------------------------------------------------------- publish
+  #
+  # Only when every check passed. These are the six binaries the compiler's own
+  # portability covers (CGO_ENABLED=0), which is a different question from the
+  # targets it can emit for -- README.md has that table.
+  publish:
+    name: build and attach the binaries
+    runs-on: ubuntu-24.04
+    needs: [gate, java-compat, matrix-report]
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - name: check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
       - name: build the release binaries
         run: |

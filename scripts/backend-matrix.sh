@@ -16,6 +16,14 @@
 #   OUT=$HOME/tywork/matrix-2026-09-17 sh scripts/backend-matrix.sh
 #   BIN=/path/to/teyru sh scripts/backend-matrix.sh  # instead of this tree's
 #   STRICT=1 sh scripts/backend-matrix.sh         # see "what it answers" below
+#   MERGE='a b c' OUT=combined sh scripts/backend-matrix.sh  # report over shards
+#
+# MERGE is how the release workflow runs this: one job per cell (with
+# CELLS= naming just that one), each writing its own record, then one job that
+# merges them and produces the report. It builds and runs nothing; it copies
+# each shard's runs/*.tsv into OUT and answers the same verdict the single run
+# would have. A shard whose cell list is not the union the caller names still
+# gets reported on -- the report reads the cells out of the records.
 #
 # What it answers, and what it does not
 # -------------------------------------
@@ -61,6 +69,7 @@ DIR=${DIR:-tests/programs}
 CELLS=${CELLS:-O0-clang O0-gcc O0-llvm O2-clang O2-gcc O2-llvm}
 JOBS=${JOBS:-4}
 ONLY=${ONLY:-}
+MERGE=${MERGE:-}
 BUILD_TIMEOUT=${BUILD_TIMEOUT:-900}
 RUN_TIMEOUT=${RUN_TIMEOUT:-120}
 KEEP=${KEEP:-0}
@@ -189,6 +198,58 @@ fi
 : >"$W/.backend-matrix"
 mkdir -p "$W/runs" "$W/exe"
 
+# ---------------------------------------------------------------- merged record
+#
+# MERGE names other runs' record directories (the per-cell shards the release
+# workflow produces). Nothing is built or run here: their runs/*.tsv are copied
+# into this record, the cells and programs are read back out of them, and the
+# same report is written below. A shard that is missing, or that recorded
+# nothing, is an error -- a merged report over a partial matrix is exactly the
+# "green because the work never ran" answer this file exists to avoid.
+if [ -n "$MERGE" ]; then
+  for shard in $MERGE; do
+    [ -d "$shard/runs" ] || { echo "backend-matrix: shard $shard has no runs/" >&2; exit 2; }
+    n=0
+    for f in "$shard"/runs/*.tsv; do
+      [ -f "$f" ] || continue
+      n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+      echo "backend-matrix: shard $shard recorded nothing" >&2
+      exit 2
+    fi
+    cp "$shard"/runs/*.tsv "$W/runs/"
+  done
+  # The cells and programs come from the records, not from the caller's CELLS:
+  # a shard decides which cell it is, and the report must cover what ran.
+  CELLS=$(cut -f2 "$W"/runs/*.tsv | sort -u | tr '\n' ' ' | sed 's/ *$//')
+  programs=$(cut -f1 "$W"/runs/*.tsv | sort -u)
+  count=$(printf '%s\n' $programs | wc -l | tr -d ' ')
+  ncells=$(printf '%s\n' $CELLS | wc -l | tr -d ' ')
+  # Every program must have every cell. A shard that died, or a job that was
+  # skipped, leaves a hole, and a report over a hole would say "no divergence"
+  # about a cell that never ran -- the answer this script exists to make
+  # impossible.
+  holes=0
+  for prog in $programs; do
+    for cell in $CELLS; do
+      if [ ! -f "$W/runs/$prog.$cell.tsv" ]; then
+        echo "backend-matrix: the merged record has no $prog $cell" >&2
+        holes=$((holes + 1))
+      fi
+    done
+  done
+  [ "$holes" -eq 0 ] || { echo "backend-matrix: $holes hole(s) in the merged record; refusing to report" >&2; exit 2; }
+  BIN=${BIN:-"(merged from $MERGE)"}
+  BIN_TEMP=
+  load_start="not measured (merged)"
+  echo "backend-matrix: merging $count programs x $ncells cells from: $MERGE"
+  echo "                cells:  $CELLS"
+  echo "                record: $W"
+  echo
+  start=$(date +%s)
+fi
+
 # A missing account file means nothing is accounted for, which is the safe
 # reading; awk is handed an empty file so that it does not warn about this one.
 if [ ! -f "$ALLOW" ]; then
@@ -197,73 +258,75 @@ if [ ! -f "$ALLOW" ]; then
   : >"$ALLOW"
 fi
 
-BIN=${BIN:-}
-BIN_TEMP=
-if [ -z "$BIN" ]; then
-  # Built from the tree being run, into the record's directory, so that the
-  # cells are this checkout's cells and not those of a binary that happened to
-  # be lying around (the same paragraph as in bench.sh).
-  BIN=$W/teyru
-  BIN_TEMP=$BIN
-  go build -trimpath -o "$BIN" ./cmd/teyru || exit 2
+if [ -z "$MERGE" ]; then
+  BIN=${BIN:-}
+  BIN_TEMP=
+  if [ -z "$BIN" ]; then
+    # Built from the tree being run, into the record's directory, so that the
+    # cells are this checkout's cells and not those of a binary that happened to
+    # be lying around (the same paragraph as in bench.sh).
+    BIN=$W/teyru
+    BIN_TEMP=$BIN
+    go build -trimpath -o "$BIN" ./cmd/teyru || exit 2
+  fi
+  [ -x "$BIN" ] && [ ! -d "$BIN" ] || { echo "backend-matrix: $BIN is not an executable" >&2; exit 2; }
+
+  programs=""
+  for src in "$DIR"/*.teyru; do
+    [ -f "$src" ] || continue
+    name=$(basename "$src" .teyru)
+    if [ -n "$ONLY" ]; then
+      printf '%s\n' "$name" | grep -Eq -- "$ONLY" || continue
+    fi
+    programs="$programs $name"
+  done
+  [ -n "$programs" ] || { echo "backend-matrix: no programs under $DIR" >&2; exit 2; }
+  count=$(printf '%s\n' $programs | wc -l | tr -d ' ')
+
+  : >"$W/tasks.txt"
+  for prog in $programs; do
+    for cell in $CELLS; do
+      printf '%s %s\n' "$cell" "$prog" >>"$W/tasks.txt"
+    done
+  done
+  ncells=$(printf '%s\n' $CELLS | wc -l | tr -d ' ')
+
+  load() {
+    if [ -r /proc/loadavg ]; then
+      awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg
+    else
+      echo "unknown"
+    fi
+  }
+  load_start=$(load)
+
+  echo "backend-matrix: $count programs x $ncells cells = $((count * ncells)) builds"
+  echo "                cells:    $CELLS"
+  echo "                compiler: $BIN"
+  echo "                record:   $W"
+  echo "                jobs:     $JOBS, load at start: $load_start"
+  echo
+
+  start=$(date +%s)
+  export MATRIX_SELF=$SELF MATRIX_DIR=$DIR MATRIX_BIN=$BIN MATRIX_W=$W \
+    MATRIX_RUN_TIMEOUT=$RUN_TIMEOUT MATRIX_BUILD_TIMEOUT=$BUILD_TIMEOUT \
+    MATRIX_KEEP=$KEEP
+  # The cell and the program are the two arguments xargs splits each line of the
+  # task list into; everything else comes from the environment above.
+  xargs -P "$JOBS" -n 2 sh -c 'MATRIX_CELL=$1 MATRIX_PROG=$2 MATRIX_CHILD=1 sh "$MATRIX_SELF"' sh \
+    <"$W/tasks.txt"
+  xargsstat=$?
+  [ "$xargsstat" -eq 0 ] || echo "backend-matrix: xargs exited $xargsstat" >&2
+
+  # A cell that recorded nothing is a bug in this script, not a result.
+  missing=0
+  for prog in $programs; do
+    for cell in $CELLS; do
+      [ -f "$W/runs/$prog.$cell.tsv" ] || { echo "backend-matrix: no record for $prog $cell" >&2; missing=$((missing + 1)); }
+    done
+  done
+  [ "$missing" -eq 0 ] || exit 2
 fi
-[ -x "$BIN" ] && [ ! -d "$BIN" ] || { echo "backend-matrix: $BIN is not an executable" >&2; exit 2; }
-
-programs=""
-for src in "$DIR"/*.teyru; do
-  [ -f "$src" ] || continue
-  name=$(basename "$src" .teyru)
-  if [ -n "$ONLY" ]; then
-    printf '%s\n' "$name" | grep -Eq -- "$ONLY" || continue
-  fi
-  programs="$programs $name"
-done
-[ -n "$programs" ] || { echo "backend-matrix: no programs under $DIR" >&2; exit 2; }
-count=$(printf '%s\n' $programs | wc -l | tr -d ' ')
-
-: >"$W/tasks.txt"
-for prog in $programs; do
-  for cell in $CELLS; do
-    printf '%s %s\n' "$cell" "$prog" >>"$W/tasks.txt"
-  done
-done
-ncells=$(printf '%s\n' $CELLS | wc -l | tr -d ' ')
-
-load() {
-  if [ -r /proc/loadavg ]; then
-    awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg
-  else
-    echo "unknown"
-  fi
-}
-load_start=$(load)
-
-echo "backend-matrix: $count programs x $ncells cells = $((count * ncells)) builds"
-echo "                cells:    $CELLS"
-echo "                compiler: $BIN"
-echo "                record:   $W"
-echo "                jobs:     $JOBS, load at start: $load_start"
-echo
-
-start=$(date +%s)
-export MATRIX_SELF=$SELF MATRIX_DIR=$DIR MATRIX_BIN=$BIN MATRIX_W=$W \
-  MATRIX_RUN_TIMEOUT=$RUN_TIMEOUT MATRIX_BUILD_TIMEOUT=$BUILD_TIMEOUT \
-  MATRIX_KEEP=$KEEP
-# The cell and the program are the two arguments xargs splits each line of the
-# task list into; everything else comes from the environment above.
-xargs -P "$JOBS" -n 2 sh -c 'MATRIX_CELL=$1 MATRIX_PROG=$2 MATRIX_CHILD=1 sh "$MATRIX_SELF"' sh \
-  <"$W/tasks.txt"
-xargsstat=$?
-[ "$xargsstat" -eq 0 ] || echo "backend-matrix: xargs exited $xargsstat" >&2
-
-# A cell that recorded nothing is a bug in this script, not a result.
-missing=0
-for prog in $programs; do
-  for cell in $CELLS; do
-    [ -f "$W/runs/$prog.$cell.tsv" ] || { echo "backend-matrix: no record for $prog $cell" >&2; missing=$((missing + 1)); }
-  done
-done
-[ "$missing" -eq 0 ] || exit 2
 
 cat "$W"/runs/*.tsv >"$W/results.tsv"
 
