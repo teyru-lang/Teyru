@@ -194,6 +194,12 @@ var tyclassLayout = []rtField{
 	// the JDK name this class reports, or null when it is named as it is
 	// (lib side: internal/runtime/src/tyrt.h, struct tyclass)
 	{"jname", "ptr", 184},
+	// comp and gsig are NULL here -- this back end builds no per-component
+	// array classes and no type signatures -- but they must be DECLARED: the
+	// runtime reaches this record through C's sizeof(tyclass), 208, so a record
+	// 192 bytes wide put every following class record 16 bytes early.
+	{"comp", "ptr", 192},
+	{"gsig", "ptr", 200},
 }
 
 // tySB is StringBuilder's own struct: its state is the runtime's, not the

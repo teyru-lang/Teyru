@@ -69,11 +69,21 @@ func (e *llvmEmitter) callExpr(f *fb, c *ast.Call) lval {
 		return e.arrayMethod(f, c)
 	}
 	if e.needsReflection(f, m) {
-		// The member tables are written, but the invoker convention behind
-		// these calls is not lowered here: a descriptor's `fn` is a stub. The
-		// program is refused at compile time rather than built into one whose
-		// reflective call stops at that stub.
-		e.refuse(c.GetPos(), "a reflective call (%s.%s): the llvm back end does not lower the boxed-argument invoker these calls use", m.Owner.Full, m.Name)
+		// Two different reasons reach here, so the message names which: the
+		// invoker convention (a descriptor's `fn` is a stub here) or the type
+		// signatures (this back end emits no tysig table, so the generic
+		// readers would answer NULL). Either way the program is refused at
+		// compile time rather than built into one that answers wrongly.
+		switch {
+		case m.Owner.Name == "Field" && m.Name == "getGenericType",
+			m.Owner.Name == "Class" && m.Name == "getGenericSuperclass",
+			m.Owner.Name == "Method" && strings.HasPrefix(m.Name, "getGenericR"),
+			m.Owner.Name == "Method" && m.Name == "getGenericParameterTypes",
+			m.Owner.Name == "Constructor" && m.Name == "getGenericParameterTypes":
+			e.refuse(c.GetPos(), "a reflective call (%s.%s): the llvm back end emits no type-%s tables, so a generic signature cannot be answered", m.Owner.Full, m.Name, "signature")
+		default:
+			e.refuse(c.GetPos(), "a reflective call (%s.%s): the llvm back end does not lower the boxed-argument invoker these calls use", m.Owner.Full, m.Name)
+		}
 	}
 	recv := ""
 	if !m.IsStatic() {
@@ -208,6 +218,13 @@ func (e *llvmEmitter) devirtInterface(m *ast.Method) *ast.Method {
 // their own reasons: Array.newInstance needs a class the backend does not
 // build, and the frameworks reflect on classes only their callers name, which
 // this back end has not been taught to follow.
+//
+// The generic-signature readers are refused because this back end emits no
+// tysig table at all: Field.getGenericType answers NULL where the C back end
+// answers a ParameterizedType, which is a wrong answer rather than a limit
+// (t301_generic_reflection). The shape that would support them is the C back
+// end's (reflect.go writes .gsig/.gret/.gparams and the tysig records); until
+// it is here, naming the refusal is the contract.
 
 func (e *llvmEmitter) needsReflection(f *fb, m *ast.Method) bool {
 	if m == nil {
@@ -225,9 +242,13 @@ func (e *llvmEmitter) needsReflection(f *fb, m *ast.Method) bool {
 	}
 	switch m.Owner.Name {
 	case "Method":
-		return m.Name == "invoke"
+		return m.Name == "invoke" || strings.HasPrefix(m.Name, "getGenericR") || m.Name == "getGenericParameterTypes"
 	case "Constructor":
-		return m.Name == "newInstance"
+		return m.Name == "newInstance" || m.Name == "getGenericParameterTypes"
+	case "Field":
+		return m.Name == "getGenericType"
+	case "Class":
+		return m.Name == "getGenericSuperclass"
 	case "Array":
 		return true
 	case "Gson", "Application", "ApplicationContext", "BeanRegistry":

@@ -57,6 +57,12 @@ var tyfieldLayout = []rtField{
 	{"annos", "ptr", 48},
 	{"nannos", "i32", 56},
 	{"elem", "ptr", 64},
+	// gsig is the declared generic type (Field.getGenericType). This back end
+	// emits no type signatures, so every entry leaves it NULL -- but the field
+	// has to be DECLARED: the runtime strides this array by C's sizeof(tyfield),
+	// which is 80 with it and 72 without, so an omitted field made entry 1
+	// onward be read out of the middle of its neighbour (t147, t305).
+	{"gsig", "ptr", 72},
 }
 
 var tymethodLayout = []rtField{
@@ -74,6 +80,12 @@ var tymethodLayout = []rtField{
 	{"pannos", "ptr", 72},
 	{"pnannos", "ptr", 80},
 	{"pnames", "ptr", 88},
+	// Same reason as tyfield.gsig: the runtime strides by sizeof(tymethod) =
+	// 112. Both are NULL here -- no signature tables are emitted -- and
+	// declaring them is what keeps the stride right (t301's SIGSEGV was
+	// getGenericType reading a neighbouring record's name as a tysig*).
+	{"gret", "ptr", 96},
+	{"gparams", "ptr", 104},
 }
 
 // classMeta is what one class's tyclass record names: the tables emitted for
