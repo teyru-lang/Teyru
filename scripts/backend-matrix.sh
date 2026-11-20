@@ -336,9 +336,16 @@ cat "$W"/runs/*.tsv >"$W/results.tsv"
 # produced the same bytes and cmp confirms it below, so a listed divergence is
 # never a guess.
 elapsed=$(( $(date +%s) - start ))
+# A shard is a run of fewer cells than the matrix has. It records, but it does
+# not answer: "these cells disagree" and "this allow entry is stale" are both
+# statements about the whole matrix, and a shard cannot make them -- an entry
+# whose divergence is between O2-clang and O2-gcc looks stale to any run that
+# does not have both. Only the merged run over every cell answers.
+shard=0
+[ "$ncells" -lt 6 ] && shard=1
 awk -F'\t' -v W="$W" -v cells="$CELLS" -v known="$KNOWN" -v allow="$ALLOW" \
   -v strict="$STRICT" -v loadavg="$load_start" -v jobs="$JOBS" \
-  -v count="$count" -v elapsed="$elapsed" '
+  -v count="$count" -v elapsed="$elapsed" -v shard="$shard" '
 function rank(c,   a,o,b) {
   split(c, a, "-")
   o = (a[1] == "O0") ? 1 : 2
@@ -523,6 +530,12 @@ END {
 
   fatal = nun + ne
   if (strict) fatal += nclass["expect"] + 0
+  if (shard) {
+    print "verdict: shard (partial -- the merged run over every cell is what answers)"
+    print "  this run has " nc " cell(s); a divergence between cells and a stale"
+    print "  allowlist entry are statements about all of them, so neither is decided here."
+    exit 0
+  }
   printf "verdict: %s\n", (fatal == 0) ? "ok" : "failed"
   if (nun > 0) {
     print "  " nun " finding(s) not accounted for in " allow ":"
