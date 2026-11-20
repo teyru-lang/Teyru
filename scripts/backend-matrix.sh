@@ -18,6 +18,14 @@
 #   STRICT=1 sh scripts/backend-matrix.sh         # see "what it answers" below
 #   MERGE='a b c' OUT=combined sh scripts/backend-matrix.sh  # report over shards
 #
+# A case whose `.skip` names this platform -- or `ci`, when GITHUB_ACTIONS is
+# set -- is not built here, exactly as tests/run.sh and the go test driver skip
+# it. The matrix is the third driver of the same suite, and a case the other two
+# skip by name must not fail here by timing out: t314_vthreads_many and
+# t316_vthreads_gc are skipped in CI because 4-core runners trip the virtual
+# thread defects AGENTS.md section 10 records, and before this the merged matrix
+# reported them as divergences of the LLVM cells that ran them.
+#
 # MERGE is how the release workflow runs this: one job per cell (with
 # CELLS= naming just that one), each writing its own record, then one job that
 # merges them and produces the report. It builds and runs nothing; it copies
@@ -271,12 +279,49 @@ if [ -z "$MERGE" ]; then
   fi
   [ -x "$BIN" ] && [ ! -d "$BIN" ] || { echo "backend-matrix: $BIN is not an executable" >&2; exit 2; }
 
+  # skip_reason prints the reason a case is skipped here, or nothing. The tokens are
+  # tests/run.sh's: a goos, a goos/goarch pair, or `ci` when this is the runner,
+  # each negatable with `!`. Keeping the two readers identical matters more than
+  # the code being shared: they are different languages (sh and Go).
+  skip_reason() {
+    f="$DIR/$1.skip"
+    [ -f "$f" ] || return 0
+    awk -v here="$osname/$osarch" -v os="$osname" -v ci="${GITHUB_ACTIONS:+1}" '
+      { line = $0
+        if (i = index(line, "#")) { r = substr(line, i + 1); gsub(/^[ \t]+|[ \t]+$/, "", r); reason = reason (reason == "" ? "" : "; ") r; line = substr(line, 1, i - 1) }
+        n = split(line, tok, /[ \t]+/)
+        for (j = 1; j <= n; j++) {
+          t = tok[j]
+          if (t == "") continue
+          neg = (substr(t, 1, 1) == "!")
+          if (neg) t = substr(t, 2)
+          hit = (t == os || t == here)
+          if (t == "ci") hit = (ci == "1")
+          if (hit != neg) { print reason; exit }
+        }
+      }' "$f"
+  }
+  osname=$(uname -s | tr "[:upper:]" "[:lower:]")
+  case "$osname" in
+    darwin|linux|windows|freebsd|netbsd|openbsd) ;;
+    *) osname=linux ;;
+  esac
+  osarch=$(uname -m)
+  case "$osarch" in
+    x86_64|amd64) osarch=amd64 ;;
+    aarch64|arm64) osarch=arm64 ;;
+  esac
+
   programs=""
   for src in "$DIR"/*.teyru; do
     [ -f "$src" ] || continue
     name=$(basename "$src" .teyru)
     if [ -n "$ONLY" ]; then
       printf '%s\n' "$name" | grep -Eq -- "$ONLY" || continue
+    fi
+    if why=$(skip_reason "$name") && [ -n "$why" ]; then
+      echo "SKIP $name: $why"
+      continue
     fi
     programs="$programs $name"
   done
