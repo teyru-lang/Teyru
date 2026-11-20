@@ -212,8 +212,33 @@ job 的時鐘用完了**。現在的 job 是：`gate`（build／vet／`make ci`�
 `scripts/backend-matrix.sh` 因此多了 `MERGE='dir…'`：它不建置、不執行，只把各 shard 的
 `runs/*.tsv` 收進一份記錄再產生同一份報告。合併時**逐格檢查沒有洞**——某個 cell 沒跑完
 就拒絕產生報告，因為「對一個沒跑過的 cell 說沒有分歧」正是這支腳本存在要防的答案。
-shard 自己的 verdict 會因為 `ONLY=` 跑子集而列出「stale allowlist entry」，那是子集執行
-的既有行為，不是新問題；合併後的那一份才是決定發不發佈的那個。
+**shard 只記錄、不判定**：跑不到六格的執行不可能說出「這兩個 cell 互相分歧」或「這條
+allow 條目過期」，因為後者可能是 O2-clang 與 O2-gcc 之間的差異，而那個 shard 兩個都沒有。
+所以少於六格時它印 `verdict: shard (partial …)` 並 exit 0，判定只發生在合併後那一份。
+
+**矩陣第一次真的跑完，就抓到四個 LLVM 後端的缺陷（2026-11-20，已修）**。這件事值得記在
+這裡，因為它說明「關卡從沒跑完」本身就是一種缺陷：這四支在被看見之前，`AGENTS.md` 與
+`README` 都把它們當成「LLVM 後端已知比較差」。
+- **成員表的版面比執行期讀的結構窄**：`llvm_meta.go` 的 `tyfield` 宣告到 `elem` 為止
+  （72 B），`tyrt.h` 是 80 B（多一個 `gsig`）；`tymethod` 是 96 對 112（多 `gret`、
+  `gparams`）；`tyclass`（`llvm.go`）是 192 對 208（多 `comp`、`gsig`）。執行期用
+  **C 的 `sizeof`** 跨步（`tyrt_reflect.c` 的 `field_at`／`method_at`），所以第 1 筆之後
+  都讀到鄰居的中間：`t147`／`t305` 得到 `NoSuchFieldException`，而那個欄位明明存在；
+  `t301` 把鄰居的 `name` 當成 `tysig*` 解引用而 SIGSEGV；`t222_http_parser_fuzz` 那條
+  「LLVM 會 crash，exit 139」的舊帳目也是同一個 bug（條目已刪）。
+  **修法是把欄位宣告補回去、值留 NULL**（本後端沒有型別簽章表），不是加 allow 條目——
+  兩個後端寫的資料必須同形狀，`llvm_meta.go` 開頭就寫著這條。
+- **編譯器 panic**：LLVM 用 `&Emitter{prog: e.p}`（`own` 為 nil）去問反射可達性，掃描
+  註冊 array class 時就寫進 nil unit（`t300_array_component` 讓編譯器 SIGSEGV）。加了
+  `Emitter.analysisOnly`：那個模式下只登記、不宣告。現在 `t300` 得到它本來就該有的
+  `TY-INT-0100`（`Array.newInstance`）。
+- **泛型簽章讀取改成具名拒絕**：本後端沒有 `tysig` 表，`Field.getGenericType` 會回
+  `Class` 而 C 後端回 `ParameterizedType`——**錯答案比拒絕糟**，所以
+  `getGenericType`／`getGenericR*`／`getGenericSuperclass` 現在都以 `TY-INT-0100` 拒絕，
+  訊息說的是「沒有型別簽章表」而不是籠統的 invoker 理由。
+- **`t316_vthreads_gc` 的 `-O0` 逾時是同一個版面 bug** 經由錯位的描述子影響 GC；版面
+  修好後兩個 LLVM cell 都過，stop-the-world 路徑本身無罪。
+**合併後的完整矩陣：318 支 × 6 格，317 一致、1 支既有帳目**（`t245`，LLVM 的保守 roots）。
 
 ## 7. 診斷碼規範
 
