@@ -34,9 +34,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
+
+extern char **environ;
 
 #if defined(__APPLE__)
 #include <sys/socket.h>
@@ -378,6 +382,62 @@ int typlat_socket_wait(int32_t fd, int for_write, int timeout_ms) {
   return r < 0 ? neg_errno() : r;
 }
 
+int64_t typlat_socket_sendto(int32_t fd, const void *buf, int len,
+                             const struct sockaddr *addr, int alen) {
+  ssize_t n;
+  do {
+    n = sendto(fd, buf, (size_t)len, 0, addr, (socklen_t)alen);
+  } while (n < 0 && errno == EINTR);
+  return n < 0 ? (int64_t)neg_errno() : (int64_t)n;
+}
+
+int64_t typlat_socket_recvfrom(int32_t fd, void *buf, int len,
+                               struct sockaddr *addr, int *alen) {
+  socklen_t slen = (socklen_t)*alen;
+  ssize_t n;
+  do {
+    n = recvfrom(fd, buf, (size_t)len, 0, addr, &slen);
+  } while (n < 0 && errno == EINTR);
+  if (n < 0) return (int64_t)neg_errno();
+  *alen = (int)slen;
+  return (int64_t)n;
+}
+
+int typlat_poll(int32_t *fds, int32_t *events, int32_t *revents, int n, int timeout_ms) {
+  struct pollfd *p;
+  int r, i;
+  if (n < 0) return -EINVAL;
+  if (n == 0) {
+    /* poll with no descriptors is a sleep, which is a legitimate wait: a
+       selector with nothing registered still has a timeout. */
+    if (timeout_ms > 0) typlat_sleep_ns((int64_t)timeout_ms * 1000000);
+    return 0;
+  }
+  p = (struct pollfd *)malloc((size_t)n * sizeof *p);
+  if (!p) return -ENOMEM;
+  for (i = 0; i < n; i++) {
+    p[i].fd = fds[i];
+    p[i].events = (short)((events[i] & 1 ? POLLIN : 0) | (events[i] & 2 ? POLLOUT : 0));
+    p[i].revents = 0;
+  }
+  do {
+    r = poll(p, (nfds_t)n, timeout_ms);
+  } while (r < 0 && errno == EINTR);
+  if (r < 0) {
+    free(p);
+    return neg_errno();
+  }
+  for (i = 0; i < n; i++) {
+    int e = 0;
+    if (p[i].revents & (POLLIN | POLLHUP | POLLERR)) e |= 1;
+    if (p[i].revents & (POLLOUT | POLLERR)) e |= 2;
+    if (p[i].revents & (POLLERR | POLLNVAL)) e |= 4;
+    revents[i] = e;
+  }
+  free(p);
+  return r;
+}
+
 void typlat_error_text(int code, char *buf, size_t n) {
   const char *m = strerror(code);
   if (!m || !*m) m = "unknown error";
@@ -451,4 +511,164 @@ int typlat_random_bytes(void *buf, size_t n) {
     close(fd);
   }
   return 0;
+}
+
+/* ---------------------------------------------------------------- processes */
+
+/* A pipe whose two ends are close-on-exec, so that a descriptor of this pipe
+   cannot leak into a *different* child started by another thread at the same
+   moment. macOS has no pipe2, so the flags are set right after. */
+static int ty_pipe(int fds[2]) {
+  if (pipe(fds) < 0) return neg_errno();
+  (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+  (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+  return 0;
+}
+
+int typlat_proc_spawn(const char *const argv[], char *const envp[], const char *dir,
+                      int merge, typlat_proc *p) {
+  int in[2], out[2], err[2];
+  posix_spawn_file_actions_t fa;
+  posix_spawnattr_t at;
+  pid_t pid = -1;
+  int rc, e = 0;
+  if (!argv || !argv[0]) return -EINVAL;
+  p->pid = -1;
+  p->in = p->out = p->err = -1;
+  if ((e = ty_pipe(in)) < 0) return e;
+  if ((e = ty_pipe(out)) < 0) {
+    (void)close(in[0]);
+    (void)close(in[1]);
+    return e;
+  }
+  if (!merge) {
+    if ((e = ty_pipe(err)) < 0) {
+      (void)close(in[0]); (void)close(in[1]);
+      (void)close(out[0]); (void)close(out[1]);
+      return e;
+    }
+  }
+
+  /* The child's ends are moved onto 0/1/2 and then closed in the child. The
+     parent's ends are closed in the child too, because posix_spawn inherits
+     every descriptor that is not close-on-exec and a pipe end left open in the
+     child keeps the parent's read from ever seeing end of file. */
+  if ((e = posix_spawn_file_actions_init(&fa)) != 0) goto fail;
+  posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+  posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+  if (merge) {
+    posix_spawn_file_actions_adddup2(&fa, out[1], 2);
+  } else {
+    posix_spawn_file_actions_adddup2(&fa, err[1], 2);
+  }
+  posix_spawn_file_actions_addclose(&fa, in[0]);
+  posix_spawn_file_actions_addclose(&fa, out[1]);
+  if (!merge) posix_spawn_file_actions_addclose(&fa, err[1]);
+  posix_spawn_file_actions_addclose(&fa, in[1]);
+  posix_spawn_file_actions_addclose(&fa, out[0]);
+  if (!merge) posix_spawn_file_actions_addclose(&fa, err[0]);
+  if (dir && *dir) posix_spawn_file_actions_addchdir_np(&fa, dir);
+
+  if ((e = posix_spawnattr_init(&at)) != 0) {
+    posix_spawn_file_actions_destroy(&fa);
+    goto fail;
+  }
+  /* No inherited signal handling: the child starts with the default disposition
+     for every signal, as a program started from a shell does. Without this the
+     child would inherit the runtime's SIGSEGV handler and its SIGPIPE decision,
+     and a child that crashed would be handled by its parent's runtime. The mask
+     is emptied for the same reason: this process blocks nothing on purpose, but
+     a caller that did would otherwise hand the blocked set to its child. */
+  {
+    sigset_t all, none;
+    (void)sigfillset(&all);
+    (void)sigemptyset(&none);
+    posix_spawnattr_setsigdefault(&at, &all);
+    posix_spawnattr_setsigmask(&at, &none);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+  }
+  rc = posix_spawnp(&pid, argv[0], &fa, &at, (char *const *)argv,
+                    envp ? (char *const *)envp : environ);
+  posix_spawnattr_destroy(&at);
+  posix_spawn_file_actions_destroy(&fa);
+  e = rc; /* posix_spawn reports errno-style codes, not -1 */
+  if (e != 0) {
+    if (e > 0) e = -e;
+    goto fail;
+  }
+
+  (void)close(in[0]);
+  (void)close(out[1]);
+  if (!merge) (void)close(err[1]);
+  p->pid = (int64_t)pid;
+  p->in = in[1];
+  p->out = out[0];
+  p->err = merge ? -1 : err[0];
+  return 0;
+
+fail:
+  (void)close(in[0]);
+  (void)close(in[1]);
+  (void)close(out[0]);
+  (void)close(out[1]);
+  if (!merge) {
+    (void)close(err[0]);
+    (void)close(err[1]);
+  }
+  return e;
+}
+
+int typlat_proc_wait(int64_t pid, int32_t *status) {
+  int st = 0;
+  pid_t r;
+  do {
+    r = waitpid((pid_t)pid, &st, 0);
+  } while (r < 0 && errno == EINTR);
+  if (r < 0) return neg_errno();
+  if (WIFEXITED(st)) {
+    *status = WEXITSTATUS(st);
+  } else if (WIFSIGNALED(st)) {
+    *status = 128 + WTERMSIG(st);
+  } else {
+    *status = 0;
+  }
+  return 0;
+}
+
+int typlat_proc_poll(int64_t pid, int32_t *status) {
+  int st = 0;
+  pid_t r = waitpid((pid_t)pid, &st, WNOHANG);
+  if (r == 0) return 0;
+  if (r < 0) return neg_errno();
+  if (WIFEXITED(st)) {
+    *status = WEXITSTATUS(st);
+  } else if (WIFSIGNALED(st)) {
+    *status = 128 + WTERMSIG(st);
+  } else {
+    *status = 0;
+  }
+  return 1;
+}
+
+int typlat_proc_kill(int64_t pid) {
+  if (kill((pid_t)pid, SIGKILL) < 0) return neg_errno();
+  return 0;
+}
+
+int64_t typlat_fd_read(int32_t fd, void *buf, int len) {
+  ssize_t n;
+  if (fd < 0 || len < 0) return -EINVAL;
+  do {
+    n = read(fd, buf, (size_t)len);
+  } while (n < 0 && errno == EINTR);
+  return n < 0 ? (int64_t)neg_errno() : (int64_t)n;
+}
+
+int64_t typlat_fd_write(int32_t fd, const void *buf, int len) {
+  ssize_t n;
+  if (fd < 0 || len < 0) return -EINVAL;
+  do {
+    n = write(fd, buf, (size_t)len);
+  } while (n < 0 && errno == EINTR);
+  return n < 0 ? (int64_t)neg_errno() : (int64_t)n;
 }

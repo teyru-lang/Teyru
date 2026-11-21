@@ -179,6 +179,19 @@ func init() {
 		refuseStdlib[n] = timeUnits
 	}
 	refuseStdlib["Mac"] = "javax.crypto.Mac takes a Key here where this library's takes the bytes: there is no Key interface"
+	/* RSA's two key classes are the one part of this library's crypto layer
+	   that cannot be printed: Java's KeyFactory.generatePublic answers the
+	   PublicKey interface and the program casts to RSAPublicKey, while this
+	   library's answers the concrete class directly (there is no separate
+	   interface to cast from). A printed program would not compile, so the
+	   printer says which classes they are instead of producing Java that javac
+	   rejects -- and t323_cipher's expectation is still the JDK's own output,
+	   from the hand-written reference beside it, the way tests/java-compat
+	   works. */
+	rsaShape := "this library's RSA key classes are concrete where java.security's are interfaces reached through a cast"
+	for _, n := range []string{"RsaPublicKey", "RsaPrivateKey", "KeyFactory"} {
+		refuseStdlib[n] = rsaShape
+	}
 	for _, n := range []string{"Reflect", "Annotation", "Array"} {
 		if _, isJava := util.JavaClassOf(n); !isJava {
 			refuseStdlib[n] = reflect

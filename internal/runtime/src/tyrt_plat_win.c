@@ -404,6 +404,49 @@ int typlat_random_bytes(void *buf, size_t n) {
   return 0;
 }
 
+int64_t typlat_socket_sendto(int32_t fd, const void *buf, int len,
+                             const struct sockaddr *addr, int alen) {
+  int n = sendto(as_socket(fd), (const char *)buf, len, 0, addr, alen);
+  return n == SOCKET_ERROR ? (int64_t)neg_wsa() : (int64_t)n;
+}
+
+int64_t typlat_socket_recvfrom(int32_t fd, void *buf, int len,
+                               struct sockaddr *addr, int *alen) {
+  int n = recvfrom(as_socket(fd), (char *)buf, len, 0, addr, alen);
+  return n == SOCKET_ERROR ? (int64_t)neg_wsa() : (int64_t)n;
+}
+
+int typlat_poll(int32_t *fds, int32_t *events, int32_t *revents, int n, int timeout_ms) {
+  WSAPOLLFD *p;
+  int r, i;
+  if (n < 0) return -EINVAL;
+  if (n == 0) {
+    if (timeout_ms > 0) Sleep((DWORD)timeout_ms);
+    return 0;
+  }
+  p = (WSAPOLLFD *)malloc((size_t)n * sizeof *p);
+  if (!p) return -ENOMEM;
+  for (i = 0; i < n; i++) {
+    p[i].fd = as_socket(fds[i]);
+    p[i].events = (short)((events[i] & 1 ? POLLRDNORM : 0) | (events[i] & 2 ? POLLWRNORM : 0));
+    p[i].revents = 0;
+  }
+  r = WSAPoll(p, (ULONG)n, timeout_ms);
+  if (r == SOCKET_ERROR) {
+    free(p);
+    return neg_wsa();
+  }
+  for (i = 0; i < n; i++) {
+    int e = 0;
+    if (p[i].revents & (POLLRDNORM | POLLHUP | POLLERR)) e |= 1;
+    if (p[i].revents & (POLLWRNORM | POLLERR)) e |= 2;
+    if (p[i].revents & (POLLERR | POLLNVAL)) e |= 4;
+    revents[i] = e;
+  }
+  free(p);
+  return r;
+}
+
 int typlat_socket_reuse(int32_t fd, int on) {
   int v = on ? 1 : 0;
   return setsockopt(as_socket(fd), SOL_SOCKET, SO_REUSEADDR, (const char *)&v, sizeof v) ==
@@ -534,4 +577,214 @@ int typlat_mkdtemp(char *tpl) {
     if (errno != EEXIST) return 0;
   }
   return 0;
+}
+
+/* ---------------------------------------------------------------- processes */
+
+/* A pipe whose ends are not inherited by another child. CreatePipe defaults to
+   inheritable handles, and a handle left inheritable by one spawn is a handle
+   the next spawn leaks into. */
+static int ty_win_pipe(HANDLE *rd, HANDLE *wr) {
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof sa;
+  sa.lpSecurityDescriptor = NULL;
+  sa.bInheritHandle = TRUE;
+  if (!CreatePipe(rd, wr, &sa, 0)) return -EIO;
+  return 0;
+}
+
+/* The CRT descriptor for a handle, or -1. _open_osfhandle takes ownership, so
+   the handle is not closed here. */
+static int ty_win_fd(HANDLE h, int flags) {
+  intptr_t r = _open_osfhandle((intptr_t)h, flags | _O_BINARY);
+  return r < 0 ? -1 : (int)r;
+}
+
+int typlat_proc_spawn(const char *const argv[], char *const envp[], const char *dir,
+                      int merge, typlat_proc *p) {
+  HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, errR = NULL, errW = NULL;
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+  char *cmd;
+  char *envblock = NULL;
+  DWORD e = 0;
+  size_t len = 0;
+  int i;
+  p->pid = -1;
+  p->in = p->out = p->err = -1;
+  if (!argv || !argv[0]) return -EINVAL;
+  if (ty_win_pipe(&inR, &inW) < 0) return -EIO;
+  if (ty_win_pipe(&outR, &outW) < 0) goto fail;
+  if (!merge) {
+    if (ty_win_pipe(&errR, &errW) < 0) goto fail;
+  }
+  /* The parent's ends must not be inherited, or the child holds the read end of
+     its own stdout and the parent never sees end of file. */
+  SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+  if (!merge) SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
+
+  /* Windows takes one command line, and quoting is the caller's argument
+     vector spelled the way CommandLineToArgvW reads it back. A program that
+     wants a shell writes `cmd /c ...` itself; nothing here goes through a shell
+     unasked. */
+  for (i = 0; argv[i]; i++) len += strlen(argv[i]) * 2 + 3;
+  cmd = (char *)malloc(len + 1);
+  if (!cmd) goto fail;
+  {
+    char *w = cmd;
+    for (i = 0; argv[i]; i++) {
+      const char *a = argv[i];
+      int need = !*a || strpbrk(a, " \t\n\v\"") != NULL;
+      if (i) *w++ = ' ';
+      if (need) {
+        *w++ = '"';
+        for (; *a; a++) {
+          if (*a == '"') *w++ = '\\';
+          *w++ = *a;
+        }
+        *w++ = '"';
+      } else {
+        size_t n = strlen(a);
+        memcpy(w, a, n);
+        w += n;
+      }
+    }
+    *w = 0;
+  }
+
+  /* The environment block, when the caller supplied one: a sequence of
+     NUL-terminated NAME=VALUE strings followed by one more NUL. NULL means
+     "inherit", which is CreateProcess's own meaning. */
+  if (envp) {
+    size_t n = 0;
+    char *block, *w;
+    for (i = 0; envp[i]; i++) n += strlen(envp[i]) + 1;
+    block = (char *)malloc(n + 1);
+    if (!block) {
+      free(cmd);
+      goto fail;
+    }
+    w = block;
+    for (i = 0; envp[i]; i++) {
+      size_t k = strlen(envp[i]) + 1;
+      memcpy(w, envp[i], k);
+      w += k;
+    }
+    *w = 0;
+    envblock = block;
+  }
+
+  memset(&si, 0, sizeof si);
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = inR;
+  si.hStdOutput = outW;
+  si.hStdError = merge ? outW : errW;
+  memset(&pi, 0, sizeof pi);
+  if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, envblock, dir && *dir ? dir : NULL, &si, &pi)) {
+    /* A program that is not there is the failure a caller acts on -- it is the
+       one POSIX's posix_spawn reports as ENOENT and the one Wine reports too --
+       so the two ERROR_ codes that mean it are translated rather than folded
+       into EIO. Everything else stays EIO: this layer has no general errno
+       mapping and inventing one would be worse than the number. */
+    e = GetLastError();
+    free(envblock);
+    free(cmd);
+    goto fail_errno;
+  }
+  free(envblock);
+  free(cmd);
+  /* Everything but the parent's three ends is now the child's; this process
+     closes its copies so the handles are released when the child ends. */
+  CloseHandle(pi.hThread);
+  CloseHandle(inR);
+  CloseHandle(outW);
+  if (!merge) CloseHandle(errW);
+
+  p->pid = (int64_t)(uintptr_t)pi.hProcess;
+  p->in = ty_win_fd(inW, _O_WRONLY);
+  p->out = ty_win_fd(outR, _O_RDONLY);
+  p->err = merge ? -1 : ty_win_fd(errR, _O_RDONLY);
+  if (p->in < 0 || p->out < 0 || (!merge && p->err < 0)) {
+    if (p->in >= 0) { (void)_close(p->in); p->in = -1; }
+    if (p->out >= 0) { (void)_close(p->out); p->out = -1; }
+    if (p->err >= 0) { (void)_close(p->err); p->err = -1; }
+    TerminateProcess((HANDLE)(uintptr_t)p->pid, 1);
+    CloseHandle((HANDLE)(uintptr_t)p->pid);
+    p->pid = -1;
+    return -EIO;
+  }
+  return 0;
+
+fail_errno:
+  if (inR) CloseHandle(inR);
+  if (inW) CloseHandle(inW);
+  if (outR) CloseHandle(outR);
+  if (outW) CloseHandle(outW);
+  if (errR) CloseHandle(errR);
+  if (errW) CloseHandle(errW);
+  if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return -ENOENT;
+  return -EIO;
+
+fail:
+  if (inR) CloseHandle(inR);
+  if (inW) CloseHandle(inW);
+  if (outR) CloseHandle(outR);
+  if (outW) CloseHandle(outW);
+  if (errR) CloseHandle(errR);
+  if (errW) CloseHandle(errW);
+  return -EIO;
+}
+
+int typlat_proc_wait(int64_t pid, int32_t *status) {
+  HANDLE h = (HANDLE)(uintptr_t)pid;
+  DWORD code = 0;
+  if (!h) return -EINVAL;
+  if (WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) {
+    return -EIO;
+  }
+  if (!GetExitCodeProcess(h, &code)) {
+    CloseHandle(h);
+    return -EIO;
+  }
+  CloseHandle(h);
+  *status = (int32_t)code;
+  return 0;
+}
+
+int typlat_proc_poll(int64_t pid, int32_t *status) {
+  HANDLE h = (HANDLE)(uintptr_t)pid;
+  DWORD code = 0;
+  if (!h) return -EINVAL;
+  if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0) return 0;
+  if (!GetExitCodeProcess(h, &code)) return -EIO;
+  *status = (int32_t)code;
+  return 1;
+}
+
+int typlat_proc_kill(int64_t pid) {
+  HANDLE h = (HANDLE)(uintptr_t)pid;
+  if (!h) return -EINVAL;
+  /* TerminateProcess takes an exit code rather than a signal; 1 is the value a
+     shell would report for a killed program's non-zero end, and the runtime's
+     Teyru side reports 128 + 9 for a SIGKILL the same way POSIX does. */
+  if (!TerminateProcess(h, 1)) return -EIO;
+  return 0;
+}
+
+int64_t typlat_fd_read(int32_t fd, void *buf, int len) {
+  int n;
+  if (fd < 0 || len < 0) return -EINVAL;
+  n = _read(fd, buf, (unsigned)len);
+  if (n < 0) return -EIO;
+  return (int64_t)n;
+}
+
+int64_t typlat_fd_write(int32_t fd, const void *buf, int len) {
+  int n;
+  if (fd < 0 || len < 0) return -EINVAL;
+  n = _write(fd, buf, (unsigned)len);
+  if (n < 0) return -EIO;
+  return (int64_t)n;
 }

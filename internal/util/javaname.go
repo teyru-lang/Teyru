@@ -133,10 +133,24 @@ func init() {
 	}
 	for _, n := range []string{
 		"MessageDigest", "DigestException", "GeneralSecurityException",
-		"NoSuchAlgorithmException", "SecureRandom",
+		"NoSuchAlgorithmException", "SecureRandom", "Signature",
+		"KeyFactory", "InvalidKeyException", "InvalidAlgorithmParameterException",
 	} {
 		javaClasses[n] = "java.security." + n
 	}
+	for _, n := range []string{
+		"Cipher", "Mac", "SecretKeySpec", "IvParameterSpec", "GCMParameterSpec",
+		"KeyGenerator", "BadPaddingException", "IllegalBlockSizeException",
+		"AEADBadTagException", "GeneralSecurityException",
+	} {
+		javaClasses[n] = "javax.crypto." + n
+	}
+	javaClasses["SecretKeySpec"] = "javax.crypto.spec.SecretKeySpec"
+	javaClasses["IvParameterSpec"] = "javax.crypto.spec.IvParameterSpec"
+	javaClasses["GCMParameterSpec"] = "javax.crypto.spec.GCMParameterSpec"
+	javaClasses["X509EncodedKeySpec"] = "java.security.spec.X509EncodedKeySpec"
+	javaClasses["PKCS8EncodedKeySpec"] = "java.security.spec.PKCS8EncodedKeySpec"
+
 	for _, n := range []string{"Files", "Path", "Paths", "NoSuchFileException"} {
 		javaClasses[n] = "java.nio.file." + n
 	}

@@ -1,0 +1,957 @@
+package teyru
+
+// java.nio, as far as this runtime can carry it honestly: heap ByteBuffers, a
+// non-blocking SocketChannel and ServerSocketChannel, a DatagramChannel, and a
+// Selector built on one poll(2)/WSAPoll call.
+//
+// The C half is internal/runtime/src/tyrt_nio.c, and the convention is the
+// socket layer's: a negative answer is -errno, a non-negative one is a count or
+// a descriptor. Everything here turns that into the Java answer -- a channel
+// that has nothing to read answers 0 from read(ByteBuffer), a channel with a
+// full send buffer answers 0 from write(ByteBuffer), and a selector that timed
+// out answers 0 from select -- because that is what these methods mean in Java
+// and returning an exception instead would make every non-blocking loop wrong.
+//
+// What is not here, and each is a decision rather than a gap that was forgotten:
+//
+//   - Direct buffers and memory mapping. A ByteBuffer here is a heap buffer over
+//     a byte[]; there is no mmap, and allocateDirect is not declared. A program
+//     that ports from Java and calls it is a compile error naming the method,
+//     not a buffer that silently behaves differently.
+//   - CharBuffer/ShortBuffer/IntBuffer and the view family. ByteBuffer carries
+//     the put/get methods those views exist for, and a second class that only
+//     forwards to the first would be API surface without an answer.
+//   - Asynchronous channels, CompletionHandler, FileChannel and the file locks.
+//     Those need an event loop or a kernel interface this runtime does not have,
+//     and a blocked file read is what the existing streams are for.
+//   - SelectionKey.attach and the attachment object are here; channel
+//     registration with more than one selector at a time is not, because a
+//     channel is one descriptor and this implementation keeps the registration
+//     on the channel.
+//
+// The threading contract is the one the rest of the runtime has: select() and a
+// blocking read are waits, and a wait is a stop point for the collector.
+
+/* The C surface. Every method is a static in one final class for the reason
+   lib/15_net.teyru gives: the compiler substitutes the direct call only for a
+   static/private/final method, and the prototype it repeats at the call site is
+   what keeps the generated C warning-free. */
+final class Nio {
+  public static int openTcp0() {
+    throw new IllegalStateException("Nio.openTcp0 is implemented in C")
+  }
+  public static int openUdp0() {
+    throw new IllegalStateException("Nio.openUdp0 is implemented in C")
+  }
+  public static int bindUdp0(int fd, String host, int port) {
+    throw new IllegalStateException("Nio.bindUdp0 is implemented in C")
+  }
+  public static int listen0(int port, int backlog) {
+    throw new IllegalStateException("Nio.listen0 is implemented in C")
+  }
+  public static int connect0(int fd, String host, int port) {
+    throw new IllegalStateException("Nio.connect0 is implemented in C")
+  }
+  public static int connected0(int fd) {
+    throw new IllegalStateException("Nio.connected0 is implemented in C")
+  }
+  public static int accept0(int fd) {
+    throw new IllegalStateException("Nio.accept0 is implemented in C")
+  }
+  public static int read0(int fd, byte[] b, int off, int len) {
+    throw new IllegalStateException("Nio.read0 is implemented in C")
+  }
+  public static int writeSome0(int fd, byte[] b, int off, int len) {
+    throw new IllegalStateException("Nio.writeSome0 is implemented in C")
+  }
+  public static int sendTo0(int fd, byte[] b, int off, int len, String host, int port) {
+    throw new IllegalStateException("Nio.sendTo0 is implemented in C")
+  }
+  public static int recvFrom0(int fd, byte[] b, int off, int len, int[] out) {
+    throw new IllegalStateException("Nio.recvFrom0 is implemented in C")
+  }
+  public static String sender0() {
+    throw new IllegalStateException("Nio.sender0 is implemented in C")
+  }
+  public static int poll0(int[] fds, int[] events, int[] revents, int timeoutMs) {
+    throw new IllegalStateException("Nio.poll0 is implemented in C")
+  }
+  public static int nonBlocking0(int fd, boolean on) {
+    throw new IllegalStateException("Nio.nonBlocking0 is implemented in C")
+  }
+  public static int setBlocking0(int fd, boolean blocking) {
+    throw new IllegalStateException("Nio.setBlocking0 is implemented in C")
+  }
+  public static int localPort0(int fd) {
+    throw new IllegalStateException("Nio.localPort0 is implemented in C")
+  }
+  public static int shutdownWrite0(int fd) {
+    throw new IllegalStateException("Nio.shutdownWrite0 is implemented in C")
+  }
+  public static int close0(int fd) {
+    throw new IllegalStateException("Nio.close0 is implemented in C")
+  }
+  public static String strerror0(int code) {
+    throw new IllegalStateException("Nio.strerror0 is implemented in C")
+  }
+
+  /* Java's answer for a non-blocking read with nothing there: zero bytes, not an
+     exception. -EAGAIN and -EWOULDBLOCK are the two spellings the kernels use,
+     and the Windows layer maps its WSAEWOULDBLOCK onto EAGAIN, so one number
+     covers both. */
+  private static final int EAGAIN = 11
+  private static final int EINPROGRESS = 115
+
+  public static boolean wouldBlock(int code) {
+    return code == -EAGAIN
+  }
+
+  /* A connect that is running rather than one that failed. */
+  public static boolean inProgress(int code) {
+    return code == -EINPROGRESS
+  }
+
+  public static int ok(int code, String what) {
+    if (code < 0) {
+      throw new ProcessException(what + ": " + strerror0(code))
+    }
+    return code
+  }
+}
+
+/* ByteBuffer, over a heap byte[]. Java's position/limit/capacity model, the
+   six primitive get/put pairs, and the flip/clear/rewind set that a non-blocking
+   loop is written with. The order is big-endian, as Java's is, and there is no
+   order() setter: every caller of this library that reads a length or a header
+   field is reading a network byte order, and a settable order that one caller
+   forgot to set is a program that reads a length wrong on a big-endian machine
+   only -- the failure this implementation refuses to make possible. */
+class ByteBuffer {
+  private byte[] buf
+  private int position
+  private int limit
+  private int capacity
+
+  private ByteBuffer(byte[] buf, int position, int limit) {
+    this.buf = buf
+    this.position = position
+    this.limit = limit
+    this.capacity = buf.length
+  }
+
+  public static ByteBuffer allocate(int capacity) {
+    if (capacity < 0) {
+      throw new IllegalArgumentException("negative capacity: " + capacity)
+    }
+    return new ByteBuffer(new byte[capacity], 0, capacity)
+  }
+
+  public static ByteBuffer wrap(byte[] array) {
+    return new ByteBuffer(array, 0, array.length)
+  }
+
+  public static ByteBuffer wrap(byte[] array, int offset, int length) {
+    if (offset < 0 || length < 0 || offset + length > array.length) {
+      throw new IndexOutOfBoundsException("offset=" + offset + " length=" + length + " array=" + array.length)
+    }
+    byte[] slice = new byte[length]
+    for (int i = 0 : i < length : i++) {
+      slice[i] = array[offset + i]
+    }
+    return new ByteBuffer(slice, 0, length)
+  }
+
+  public int capacity() {
+    return capacity
+  }
+
+  public int position() {
+    return position
+  }
+
+  public ByteBuffer position(int p) {
+    if (p < 0 || p > limit) {
+      throw new IllegalArgumentException("position=" + p + " limit=" + limit)
+    }
+    this.position = p
+    return this
+  }
+
+  public int limit() {
+    return limit
+  }
+
+  public ByteBuffer limit(int l) {
+    if (l < 0 || l > capacity) {
+      throw new IllegalArgumentException("limit=" + l + " capacity=" + capacity)
+    }
+    this.limit = l
+    if (position > l) {
+      position = l
+    }
+    return this
+  }
+
+  public int remaining() {
+    return limit - position
+  }
+
+  public boolean hasRemaining() {
+    return limit > position
+  }
+
+  /* The array behind this buffer, or null for a buffer that has none. Every
+     buffer here has one -- there are no direct buffers -- so this is the array
+     itself rather than a copy, which is what a caller writing into it expects. */
+  public byte[] array() {
+    return buf
+  }
+
+  public int arrayOffset() {
+    return 0
+  }
+
+  private void need(int n) {
+    if (limit - position < n) {
+      throw new BufferUnderflowException("need " + n + " bytes, " + remaining() + " remaining")
+    }
+  }
+
+  private byte[] take(int n) {
+    need(n)
+    byte[] out = new byte[n]
+    for (int i = 0 : i < n : i++) {
+      out[i] = buf[position + i]
+    }
+    position += n
+    return out
+  }
+
+  private byte[] putBytes(byte[] src, int off, int len) {
+    need(len)
+    for (int i = 0 : i < len : i++) {
+      buf[position + i] = src[off + i]
+    }
+    position += len
+    return null
+  }
+
+  public ByteBuffer put(byte b) {
+    need(1)
+    buf[position] = b
+    position++
+    return this
+  }
+
+  public byte get() {
+    return take(1)[0]
+  }
+
+  public ByteBuffer put(byte[] src) {
+    put(src, 0, src.length)
+    return this
+  }
+
+  public ByteBuffer put(byte[] src, int off, int len) {
+    need(len)
+    for (int i = 0 : i < len : i++) {
+      buf[position + i] = src[off + i]
+    }
+    position += len
+    return this
+  }
+
+  public ByteBuffer get(byte[] dst) {
+    return get(dst, 0, dst.length)
+  }
+
+  public ByteBuffer get(byte[] dst, int off, int len) {
+    need(len)
+    for (int i = 0 : i < len : i++) {
+      dst[off + i] = buf[position + i]
+    }
+    position += len
+    return this
+  }
+
+  /* The read a channel does into this buffer: fill from src up to the limit and
+     advance by what was actually read. Kept here rather than in the channel so a
+     caller can point several buffers at one stream without the channel knowing
+     about it. */
+  public int fillFrom(byte[] src, int off, int len) {
+    int n = Math.min(len, remaining())
+    for (int i = 0 : i < n : i++) {
+      buf[position + i] = src[off + i]
+    }
+    position += n
+    return n
+  }
+
+  public ByteBuffer putInt(int v) {
+    put((byte) (v >>> 24))
+    put((byte) (v >>> 16))
+    put((byte) (v >>> 8))
+    put((byte) v)
+    return this
+  }
+
+  public int getInt() {
+    byte[] b = take(4)
+    return ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255)
+  }
+
+  public ByteBuffer putLong(long v) {
+    put((byte) (v >>> 56))
+    put((byte) (v >>> 48))
+    put((byte) (v >>> 40))
+    put((byte) (v >>> 32))
+    put((byte) (v >>> 24))
+    put((byte) (v >>> 16))
+    put((byte) (v >>> 8))
+    put((byte) v)
+    return this
+  }
+
+  public long getLong() {
+    byte[] b = take(8)
+    long v = 0L
+    for (int i = 0 : i < 8 : i++) {
+      v = (v << 8) | (long) (b[i] & 255)
+    }
+    return v
+  }
+
+  public ByteBuffer putShort(short v) {
+    put((byte) (v >>> 8))
+    put((byte) v)
+    return this
+  }
+
+  public short getShort() {
+    byte[] b = take(2)
+    return (short) (((b[0] & 255) << 8) | (b[1] & 255))
+  }
+
+  public ByteBuffer putChar(char v) {
+    put((byte) (v >>> 8))
+    put((byte) v)
+    return this
+  }
+
+  public char getChar() {
+    byte[] b = take(2)
+    return (char) (((b[0] & 255) << 8) | (b[1] & 255))
+  }
+
+  public ByteBuffer putDouble(double v) {
+    return putLong(Double.doubleToLongBits(v))
+  }
+
+  public double getDouble() {
+    return Double.longBitsToDouble(getLong())
+  }
+
+  public ByteBuffer putFloat(float v) {
+    int bits = Float.floatToIntBits(v)
+    put((byte) (bits >>> 24))
+    put((byte) (bits >>> 16))
+    put((byte) (bits >>> 8))
+    put((byte) bits)
+    return this
+  }
+
+  public float getFloat() {
+    byte[] b = take(4)
+    int bits = ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255)
+    return Float.intBitsToFloat(bits)
+  }
+
+  /* The three that make a buffer loopable, exactly as Java defines them. */
+  public ByteBuffer flip() {
+    limit = position
+    position = 0
+    return this
+  }
+
+  public ByteBuffer clear() {
+    position = 0
+    limit = capacity
+    return this
+  }
+
+  public ByteBuffer rewind() {
+    position = 0
+    return this
+  }
+
+  public String toString() {
+    return "ByteBuffer[pos=" + position + " lim=" + limit + " cap=" + capacity + "]"
+  }
+}
+
+/* The buffer was read past its limit: java.nio's own exception, a
+   RuntimeException, and a programming error rather than an I/O failure. */
+class BufferUnderflowException extends RuntimeException {
+  public BufferUnderflowException() {}
+  public BufferUnderflowException(String message) {
+    super(message)
+  }
+}
+
+class BufferOverflowException extends RuntimeException {
+  public BufferOverflowException() {}
+  public BufferOverflowException(String message) {
+    super(message)
+  }
+}
+
+/* A SocketAddress, as the two fields java.net.InetSocketAddress carries: a host
+   string and a port. There is no InetAddress object behind it -- a name is
+   resolved when a channel connects or sends, by the C layer, so an address here
+   is exactly the pair of values the caller wrote. */
+class InetSocketAddress {
+  private final String host
+  private final int port
+
+  public InetSocketAddress(String host, int port) {
+    if (port < 0 || port > 65535) {
+      throw new IllegalArgumentException("port out of range: " + port)
+    }
+    this.host = host
+    this.port = port
+  }
+
+  public String getHostString() {
+    return host
+  }
+
+  public int getPort() {
+    return port
+  }
+
+  public String toString() {
+    return host + ":" + port
+  }
+}
+
+/* The operations a SelectionKey can be interested in, with Java's numbers, so a
+   caller that writes a mask in hex from Java's documentation gets the same map. */
+class SelectionKey {
+  public static final int OP_READ = 1
+  public static final int OP_WRITE = 4
+  public static final int OP_CONNECT = 8
+  public static final int OP_ACCEPT = 16
+
+  private final Object channel
+  private int interestOps
+  private int readyOps
+  private Object attachment
+
+  public SelectionKey(Object channel, int interestOps) {
+    this.channel = channel
+    this.interestOps = interestOps
+  }
+
+  public Object channel() {
+    return channel
+  }
+
+  public int interestOps() {
+    return interestOps
+  }
+
+  public SelectionKey interestOps(int ops) {
+    this.interestOps = ops
+    return this
+  }
+
+  public int readyOps() {
+    return readyOps
+  }
+
+  public void setReadyOps(int ops) {
+    this.readyOps = ops
+  }
+
+  public boolean isReadable() {
+    return (readyOps & OP_READ) != 0
+  }
+
+  public boolean isWritable() {
+    return (readyOps & OP_WRITE) != 0
+  }
+
+  public boolean isAcceptable() {
+    return (readyOps & OP_ACCEPT) != 0
+  }
+
+  public boolean isConnectable() {
+    return (readyOps & OP_CONNECT) != 0
+  }
+
+  public Object attach(Object o) {
+    this.attachment = o
+    return o
+  }
+
+  public Object attachment() {
+    return attachment
+  }
+}
+
+/* The selector: one poll over every registered channel, in registration order.
+   Java's select returns the number of keys whose ready set became non-empty,
+   and selectedKeys is the set it filled; this is the same contract with a List
+   in place of a Set, because iteration order here is registration order and a
+   program that seeds or tests a selector cares about that more than about Set's
+   hash order.
+
+   A key stays selected until its readyOps is cleared (done here at the start of
+   every select, as Java's does) or it is cancelled. */
+class Selector {
+  private ArrayList<SelectionKey> keys = new ArrayList<SelectionKey>()
+  private ArrayList<SelectionKey> selected = new ArrayList<SelectionKey>()
+  private boolean open = true
+
+  private Selector() {}
+
+  public static Selector open() {
+    return new Selector()
+  }
+
+  /* Register a channel's descriptor with interest ops. A channel registered
+     twice is the same key with the new ops, which is Java's rule. */
+  public SelectionKey register(SelectableChannel ch, int ops) {
+    if (!open) {
+      throw new IllegalStateException("selector is closed")
+    }
+    if (ch == null) {
+      throw new NullPointerException("channel")
+    }
+    for (int i = 0 : i < keys.size() : i++) {
+      if (keys.get(i).channel() == ch) {
+        keys.get(i).interestOps(ops)
+        return keys.get(i)
+      }
+    }
+    SelectionKey k = new SelectionKey(ch, ops)
+    ch.bind(k)
+    keys.add(k)
+    return k
+  }
+
+  public List<SelectionKey> keys() {
+    return keys
+  }
+
+  /* The set the last select filled. The list is the selector's own: a caller
+     that iterates and removes is removing from it, which is Java's behaviour. */
+  public List<SelectionKey> selectedKeys() {
+    return selected;
+  }
+
+  public int selectNow() {
+    return select(0L)
+  }
+
+  public int select() {
+    return select(-1L)
+  }
+
+  /* Wait up to timeoutMillis (negative waits forever), fill the ready sets and
+     answer how many keys have something. A channel whose interest is an accept
+     or a connect becomes readable/writable at the socket layer, so the poll mask
+     maps OP_ACCEPT to readable and OP_CONNECT to writable -- which is what the
+     kernel reports for those states, and what a Java selector is built on. */
+  public int select(long timeoutMillis) {
+    if (!open) {
+      throw new IllegalStateException("selector is closed")
+    }
+    selected.clear()
+    int n = keys.size()
+    int[] fds = new int[n]
+    int[] ev = new int[n]
+    int[] rev = new int[n]
+    int live = 0
+    for (int i = 0 : i < n : i++) {
+      SelectionKey k = keys.get(i)
+      k.setReadyOps(0)
+      SelectableChannel ch = (SelectableChannel) k.channel()
+      int ops = k.interestOps()
+      int mask = 0
+      if ((ops & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0) {
+        mask |= 1
+      }
+      if ((ops & (SelectionKey.OP_WRITE | SelectionKey.OP_CONNECT)) != 0) {
+        mask |= 2
+      }
+      if (mask != 0 &&!ch.isClosed()) {
+        fds[live] = ch.descriptor()
+        ev[live] = mask
+        rev[live] = 0
+        live++
+      }
+    }
+    int timeout = timeoutMillis < 0 ? -1 : (int) timeoutMillis
+    int r = Nio.ok(Nio.poll0(fds, ev, rev, timeout), "select")
+    if (r == 0) {
+      return 0;
+    }
+    int ready = 0
+    int at = 0
+    for (int i = 0 : i < n : i++) {
+      SelectionKey k = keys.get(i)
+      SelectableChannel ch = (SelectableChannel) k.channel()
+      int ops = k.interestOps()
+      int mask = 0
+      if ((ops & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0) {
+        mask |= 1
+      }
+      if ((ops & (SelectionKey.OP_WRITE | SelectionKey.OP_CONNECT)) != 0) {
+        mask |= 2
+      }
+      if (mask == 0 || ch.isClosed()) {
+        continue
+      }
+      int rv = rev[at]
+      at++
+      int readyOps = 0
+      if ((rv & 1) != 0) {
+        if ((ops & SelectionKey.OP_ACCEPT) != 0) {
+          readyOps |= SelectionKey.OP_ACCEPT
+        }
+        if ((ops & SelectionKey.OP_READ) != 0) {
+          readyOps |= SelectionKey.OP_READ
+        }
+      }
+      if ((rv & 2) != 0) {
+        if ((ops & SelectionKey.OP_CONNECT) != 0) {
+          readyOps |= SelectionKey.OP_CONNECT
+        }
+        if ((ops & SelectionKey.OP_WRITE) != 0) {
+          readyOps |= SelectionKey.OP_WRITE
+        }
+      }
+      if (readyOps != 0) {
+        k.setReadyOps(readyOps)
+        selected.add(k)
+        ready++
+      }
+    }
+    return ready
+  }
+
+  public void close() {
+    open = false
+  }
+
+  public boolean isOpen() {
+    return open
+  }
+}
+
+/* The part of a channel a Selector needs: a descriptor and a place to keep the
+   key. Channels are registered once; bind records which key is theirs. */
+abstract class SelectableChannel {
+  protected int fd = -1
+  protected SelectionKey key = null
+  protected boolean blocking = false
+
+  public abstract int descriptor()
+
+  public boolean isClosed() {
+    return fd < 0
+  }
+
+  public boolean isOpen() {
+    return fd >= 0
+  }
+
+  public void bind(SelectionKey k) {
+    this.key = k
+  }
+
+  public SelectionKey keyFor(Selector s) {
+    if (key == null) {
+      return null
+    }
+    return key
+  }
+
+  public SelectionKey register(Selector s, int ops) {
+    return s.register(this, ops)
+  }
+
+  public SelectableChannel configureBlocking(boolean block) {
+    if (fd < 0) {
+      throw new IllegalStateException("channel is closed")
+    }
+    Nio.ok(Nio.setBlocking0(fd, block), "configure blocking")
+    this.blocking = block
+    return this
+  }
+
+  public void close() {
+    if (fd >= 0) {
+      int f = fd
+      fd = -1
+      Nio.close0(f)
+    }
+  }
+}
+
+/* A non-blocking TCP client channel. read/write take a ByteBuffer and answer
+   what Java's answer: bytes transferred, or 0 when nothing can be done now. */
+class SocketChannel extends SelectableChannel {
+  private boolean connected = false
+
+  private SocketChannel(int fd) {
+    this.fd = fd
+    this.blocking = false
+  }
+
+  public static SocketChannel open() {
+    int fd = Nio.ok(Nio.openTcp0(), "open a socket channel")
+    return new SocketChannel(fd)
+  }
+
+  public int descriptor() {
+    return fd
+  }
+
+  /* Java's connect: true when the connection is up now, false when it is in
+     flight and finishConnect has to be called (or the channel waited on for
+     OP_CONNECT). */
+  public boolean connect(InetSocketAddress addr) {
+    if (fd < 0) {
+      throw new IllegalStateException("channel is closed")
+    }
+    int r = Nio.connect0(fd, addr.getHostString(), addr.getPort())
+    if (r == 0 || r == -115) {
+      /* -EINPROGRESS */
+      connected = r == 0
+      return connected
+    }
+    if (r < 0) {
+      throw new ProcessException("connect: " + Nio.strerror0(r))
+    }
+    connected = true
+    return true
+  }
+
+  public boolean finishConnect() {
+    int r = Nio.connected0(fd)
+    if (r == 0) {
+      connected = true
+      return true
+    }
+    if (Nio.inProgress(r)) {
+      return false
+    }
+    throw new ProcessException("finishConnect: " + Nio.strerror0(r))
+  }
+
+  public boolean isConnected() {
+    return connected
+  }
+
+  /* Read into the buffer's remaining space. 0 when the kernel has nothing now,
+     -1 at the end of the stream, and the count otherwise; the buffer's position
+     advances by what was read. */
+  public int read(ByteBuffer dst) {
+    if (fd < 0) {
+      throw new IllegalStateException("channel is closed")
+    }
+    byte[] tmp = new byte[dst.remaining()]
+    if (tmp.length == 0) {
+      return 0
+    }
+    int r = Nio.read0(fd, tmp, 0, tmp.length)
+    if (r < 0) {
+      if (Nio.wouldBlock(r)) {
+        return 0
+      }
+      throw new ProcessException("read: " + Nio.strerror0(r))
+    }
+    if (r == 0) {
+      return -1
+    }
+    dst.put(tmp, 0, r)
+    return r
+  }
+
+  public int write(ByteBuffer src) {
+    if (fd < 0) {
+      throw new IllegalStateException("channel is closed")
+    }
+    int n = src.remaining()
+    if (n == 0) {
+      return 0
+    }
+    byte[] tmp = new byte[n]
+    int at = src.position()
+    for (int i = 0 : i < n : i++) {
+      tmp[i] = src.array()[at + i]
+    }
+    int r = Nio.writeSome0(fd, tmp, 0, n)
+    if (r < 0) {
+      if (Nio.wouldBlock(r)) {
+        return 0
+      }
+      throw new ProcessException("write: " + Nio.strerror0(r))
+    }
+    src.position(at + r)
+    return r;
+  }
+
+  public void shutdownOutput() {
+    if (fd < 0) {
+      return
+    }
+    Nio.ok(Nio.shutdownWrite0(fd), "shut down the output side")
+  }
+
+  public void close() {
+    connected = false
+    super.close()
+  }
+}
+
+/* A listening channel. accept() answers null when no connection is pending,
+   which is Java's non-blocking contract. */
+class ServerSocketChannel extends SelectableChannel {
+  private ServerSocketChannel(int fd) {
+    this.fd = fd
+    this.blocking = false
+  }
+
+  public static ServerSocketChannel open() {
+    /* A listening channel is bound in one call: this runtime has no unbound
+       state for a server, and a bind step that could fail later would be a
+       second place a port is chosen. */
+    int fd = Nio.ok(Nio.openTcp0(), "open a server socket channel")
+    return new ServerSocketChannel(fd)
+  }
+
+  /* Bind and listen. Java separates bind from the constructor; here the channel
+     is made and bound in one call, because a server that is not bound is a state
+     nothing in this library has a use for. */
+  public ServerSocketChannel bind(int port) {
+    if (fd >= 0) {
+      Nio.close0(fd)
+      fd = -1
+    }
+    int nfd = Nio.ok(Nio.listen0(port, 128), "bind server channel")
+    this.fd = nfd
+    return this
+  }
+
+  public int descriptor() {
+    return fd
+  }
+
+  public SocketChannel accept() {
+    if (fd < 0) {
+      throw new IllegalStateException("channel is closed")
+    }
+    int c = Nio.accept0(fd)
+    if (c < 0) {
+      if (Nio.wouldBlock(c)) {
+        return null
+      }
+      throw new ProcessException("accept: " + Nio.strerror0(c))
+    }
+    return new SocketChannel(c)
+  }
+
+  public int getLocalPort() {
+    return Nio.localPort0(fd)
+  }
+}
+
+/* A datagram channel: one socket, an address per call. send/receive take a
+   ByteBuffer and a destination or answer a sender, which is Java's shape. */
+class DatagramChannel extends SelectableChannel {
+  private DatagramChannel(int fd) {
+    this.fd = fd
+    this.blocking = false
+  }
+
+  public static DatagramChannel open() {
+    int fd = Nio.ok(Nio.openUdp0(), "open a datagram channel")
+    return new DatagramChannel(fd)
+  }
+
+  public DatagramChannel bind(int port) {
+    Nio.ok(Nio.bindUdp0(fd, "0.0.0.0", port), "bind datagram channel")
+    return this
+  }
+
+  public DatagramChannel bind(String host, int port) {
+    Nio.ok(Nio.bindUdp0(fd, host, port), "bind datagram channel")
+    return this
+  }
+
+  public int descriptor() {
+    return fd
+  }
+
+  public int getLocalPort() {
+    return Nio.localPort0(fd)
+  }
+
+  /* Send the buffer's remaining bytes as one datagram; the buffer advances by
+     the number sent, and a datagram is sent whole or fails. */
+  public int send(ByteBuffer src, InetSocketAddress target) {
+    int n = src.remaining()
+    byte[] tmp = new byte[n]
+    int at = src.position()
+    for (int i = 0 : i < n : i++) {
+      tmp[i] = src.array()[at + i]
+    }
+    int r = Nio.sendTo0(fd, tmp, 0, n, target.getHostString(), target.getPort())
+    if (r < 0) {
+      if (Nio.wouldBlock(r)) {
+        return 0
+      }
+      throw new ProcessException("send: " + Nio.strerror0(r))
+    }
+    src.position(at + r)
+    return r
+  }
+
+  /* Receive one datagram into the buffer's remaining space. Answers the count
+     and leaves the sender where sender() reads it, 0 when nothing is there, and
+     -1 is not an answer for a datagram (there is no end of stream): a zero-size
+     read would be a zero-length datagram, which this returns as 0 with the
+     sender set. */
+  public int receive(ByteBuffer dst) {
+    return receive(dst, null)
+  }
+
+  /* Java's receive(SocketAddress) does not exist; this one answers the sender
+     into the array's first slot when it is given, which is how a caller that
+     wants the address without a second call gets it. */
+  public int receive(ByteBuffer dst, InetSocketAddress[] senderOut) {
+    int n = dst.remaining()
+    byte[] tmp = new byte[n == 0 ? 1 : n]
+    int[] out = new int[1]
+    int r = Nio.recvFrom0(fd, tmp, 0, tmp.length, out)
+    if (r < 0) {
+      if (Nio.wouldBlock(r)) {
+        return 0
+      }
+      throw new ProcessException("receive: " + Nio.strerror0(r))
+    }
+    int take = Math.min(r, n)
+    dst.put(tmp, 0, take)
+    if (senderOut != null && senderOut.length > 0) {
+      senderOut[0] = new InetSocketAddress(Nio.sender0(), out[0])
+    }
+    return take
+  }
+
+  public InetSocketAddress sender() {
+    return new InetSocketAddress(Nio.sender0(), 0)
+  }
+}

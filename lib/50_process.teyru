@@ -1,0 +1,478 @@
+package teyru
+
+// starting another program: java.lang.Process and ProcessBuilder.
+//
+// java.lang.ProcessBuilder is the builder; Process is the handle on what it
+// started. The shape is Java's, because a program that starts a child is
+// usually a port of one that already did: redirect the three streams,
+// directory, environment, wait for it, ask its exit status, kill it.
+//
+// The C half is internal/runtime/src/tyrt_proc.c, and it is honest about what it
+// is not: there is no shell anywhere in this file. `new ProcessBuilder("sh",
+// "-c", "ls | wc")` is how a program asks for one, which is also the only form
+// that lets a caller say exactly how its arguments quote.
+//
+// Differences from Java that a caller can observe, named rather than hidden:
+//
+//   - ProcessBuilder.redirectErrorStream is a constructor-level flag here (the
+//     `mergeError` argument) rather than a setter. A setter that has to be
+//     called before start() and does nothing afterwards is a state a reader has
+//     to reason about; the constructor cannot be called at the wrong time.
+//   - Process.waitFor(long, TimeUnit) has no TimeUnit to take, so waitFor() is
+//     unbounded and the timed form waits in milliseconds -- the same rule the
+//     rest of the concurrency layer follows.
+//   - Process.getInputStream/getOutputStream/getErrorStream return the stream
+//     wrappers below rather than Java's abstract streams. They are the same
+//     three methods from a caller's side.
+//   - ProcessBuilder.environment is not a Map that the child then reads: it is
+//     the array handed to start(), because a Map's iteration order is not the
+//     order a child's environ has and copying it into a block would be work for
+//     nothing. environment()/environment([]) are the two methods.
+//   - Process.pid answers the operating system's id: a pid on POSIX, a process
+//     id on Windows.
+//   - exitValue throws IllegalThreadStateException while the child is running,
+//     as Java does, and answers the status a shell would (128 + signal for a
+//     signalled end).
+
+// The failure a program that could not be started raises. java.io.IOException
+// is the parent in Java, and this library's hierarchy makes it one too, so a
+// caller that catches IOException still catches this.
+class ProcessException extends IOException {
+  public ProcessException() {}
+  public ProcessException(String message) {
+    super(message)
+  }
+}
+
+/* The C surface, in the shape lib/15_net.teyru uses and for the same reason:
+   every native is a static in one final class, so the compiler can substitute
+   the direct call and repeat the helper's prototype at the call site. */
+final class Proc {
+  // A long[] of four: pid, the parent's write end of the child's stdin, the
+  // read end of its stdout and the read end of its stderr (-1 when merged).
+  public static int spawn0(String[] argv, String[] env, String dir, boolean merge, long[] out) {
+    throw new IllegalStateException("Proc.spawn0 is implemented in C")
+  }
+  public static int wait0(long pid, int[] status) {
+    throw new IllegalStateException("Proc.wait0 is implemented in C")
+  }
+  public static int poll0(long pid, int[] status) {
+    throw new IllegalStateException("Proc.poll0 is implemented in C")
+  }
+  public static int kill0(long pid) {
+    throw new IllegalStateException("Proc.kill0 is implemented in C")
+  }
+  public static int read0(int fd, byte[] b, int off, int len) {
+    throw new IllegalStateException("Proc.read0 is implemented in C")
+  }
+  public static int write0(int fd, byte[] b, int off, int len) {
+    throw new IllegalStateException("Proc.write0 is implemented in C")
+  }
+  public static int writeStr0(int fd, String s) {
+    throw new IllegalStateException("Proc.writeStr0 is implemented in C")
+  }
+  public static int close0(int fd) {
+    throw new IllegalStateException("Proc.close0 is implemented in C")
+  }
+  public static String strerror0(int code) {
+    throw new IllegalStateException("Proc.strerror0 is implemented in C")
+  }
+
+  /* The same pair lib/15_net.teyru documents: a negative code becomes the
+     exception, anything else passes through. The message carries what was being
+     attempted and the operating system's own text for the code. */
+  public static int ok(int code, String what) {
+    if (code < 0) {
+      throw new ProcessException(what + ": " + strerror0(code))
+    }
+    return code
+  }
+
+  /* The argv/environment vectors are handed to C as the String[] they are:
+     the runtime reads a tystr's bytes directly, and converting them here would
+     be a second copy of every argument for no reason. */
+  public static String[] strings(String[] ss) {
+    return ss
+  }
+}
+
+/* A stream over one of the child's ends.
+ *
+ * read() reads one byte from the pipe and answers 0..255, or -1 at the end --
+ * which a parent sees as soon as the child closes that end or exits. close()
+ * closes the parent's end, which is what makes a child waiting on stdin see the
+ * end of it. There is no buffer here: a caller that wants lines wraps this in a
+ * BufferedReader, which is where the line grammar lives. */
+class ProcInputStream extends InputStream implements Reader {
+  private int fd
+  private boolean closed = false
+
+  public ProcInputStream(int fd) {
+    this.fd = fd
+  }
+
+  public int read() {
+    byte[] one = new byte[1]
+    int n = read(one, 0, 1)
+    if (n < 0) {
+      return -1
+    }
+    return one[0] & 255
+  }
+
+  /* The count read, which may be short and is not an error, or -1 at the end of
+     the stream. Java's InputStream returns exactly this. */
+  public int read(byte[] b, int off, int len) {
+    if (b == null) {
+      throw new NullPointerException("buffer")
+    }
+    if (off < 0 || len < 0 || off + len > b.length) {
+      throw new IndexOutOfBoundsException("off=" + off + " len=" + len + " length=" + b.length)
+    }
+    if (closed) {
+      throw new IllegalStateException("stream is closed")
+    }
+    if (len == 0) {
+      return 0
+    }
+    /* A merged error stream is -1: there is nothing to read, and the end of the
+       stream is the honest answer. */
+    if (fd < 0) {
+      return -1
+    }
+    int n = Proc.read0(fd, b, off, len)
+    if (n < 0) {
+      throw new ProcessException("read from the child: " + Proc.strerror0(n))
+    }
+    return n == 0 ? -1 : n
+  }
+
+  public void close() {
+    if (closed) {
+      return
+    }
+    closed = true
+    Proc.close0(fd)
+  }
+}
+
+/* The parent's write end of the child's stdin. A write loops until the last
+   byte is out, because a short write here would truncate what the child reads;
+   the exception on a broken pipe is the child having exited, which is the same
+   event as an ordinary write to a closed stream. */
+class ProcOutputStream extends Object implements OutputStream, Writer {
+  private int fd
+  private boolean closed = false
+
+  public ProcOutputStream(int fd) {
+    this.fd = fd
+  }
+
+  public void write(int b) {
+    byte[] one = new byte[1]
+    one[0] = (byte) b
+    write(one, 0, 1)
+  }
+
+  public void write(byte[] b) {
+    write(b, 0, b.length)
+  }
+
+  public void write(byte[] b, int off, int len) {
+    if (b == null) {
+      throw new NullPointerException("buffer")
+    }
+    if (off < 0 || len < 0 || off + len > b.length) {
+      throw new IndexOutOfBoundsException("off=" + off + " len=" + len + " length=" + b.length)
+    }
+    if (closed) {
+      throw new IllegalStateException("stream is closed")
+    }
+    if (len == 0) {
+      return
+    }
+    Proc.ok(Proc.write0(fd, b, off, len), "write to the child")
+  }
+
+  public void write(String s) {
+    if (s == null) {
+      throw new NullPointerException("string")
+    }
+    if (closed) {
+      throw new IllegalStateException("stream is closed")
+    }
+    Proc.ok(Proc.writeStr0(fd, s), "write to the child")
+  }
+
+  /* Nothing is buffered here -- each write already went to the pipe -- so this
+     exists because the interface has it, and does nothing. Saying that is
+     better than not declaring it: a caller flushing before waiting for the child
+     should not have to learn that from a missing method. */
+  public void flush() {}
+
+  public void close() {
+    if (closed) {
+      return
+    }
+    closed = true
+    Proc.close0(fd)
+  }
+}
+
+/* The builder. Java's has the command, the directory, the environment, and the
+   error-stream flag; this one has the same four, with the flag in the
+   constructor (see this file's header). */
+class ProcessBuilder {
+  private String[] command
+  private String[] env = null
+  private String dir = null
+  private boolean mergeError
+
+  public ProcessBuilder(String...command) {
+    if (command == null || command.length == 0) {
+      throw new IllegalArgumentException("command is empty")
+    }
+    this.command = command
+  }
+
+  public ProcessBuilder(String command) {
+    this(new String[] { command })
+  }
+
+  /* The command line, which is what a program changes between two starts. */
+  public ProcessBuilder command(String...command) {
+    if (command == null || command.length == 0) {
+      throw new IllegalArgumentException("command is empty")
+    }
+    this.command = command
+    return this
+  }
+
+  public String[] command() {
+    return this.command
+  }
+
+  /* The child's working directory, or null to inherit this one's. */
+  public ProcessBuilder directory(String dir) {
+    this.dir = dir
+    return this
+  }
+
+  public ProcessBuilder directory(File dir) {
+    this.dir = dir == null ? null : dir.getPath()
+    return this
+  }
+
+  public String directory() {
+    return this.dir
+  }
+
+  /* The child's whole environment, as the array a child's environ is: NAME=VALUE
+     per element. null inherits this process's, and an empty array is an empty
+     environment rather than an inherited one -- which is the distinction a
+     caller that wants a clean child actually needs. */
+  public ProcessBuilder environment(String[] env) {
+    this.env = env == null ? null : copyOf(env)
+    return this
+  }
+
+  public String[] environment() {
+    return this.env == null ? null : copyOf(this.env)
+  }
+
+  private static String[] copyOf(String[] src) {
+    String[] out = new String[src.length]
+    for (int i = 0 : i < src.length : i++) {
+      out[i] = src[i]
+    }
+    return out
+  }
+
+  public ProcessBuilder redirectErrorStream(boolean merge) {
+    this.mergeError = merge
+    return this
+  }
+
+  public boolean redirectErrorStream() {
+    return this.mergeError
+  }
+
+  /* Start it. The three streams exist as soon as this returns, whether or not
+     the program has written anything yet, which is what lets a caller write a
+     request before it reads a response. */
+  public Process start() {
+    long[] fds = new long[4]
+    int r = Proc.spawn0(command, env, dir, mergeError, fds)
+    if (r < 0) {
+      throw new ProcessException("start " + command[0] + ": " + Proc.strerror0(r))
+    }
+    return new Process(fds[0], (int) fds[1], (int) fds[2], (int) fds[3], mergeError)
+  }
+}
+
+/* The handle on a started program. One reader per endpoint and one writer to
+   stdin, created on the first call so that a caller that only reads stdout does
+   not carry the other two. */
+class Process {
+  private long pid
+  private int inFd
+  private int outFd
+  private int errFd
+  private boolean merged
+  private ProcInputStream stdinStream = null
+  private ProcOutputStream stdoutStream = null
+  private ProcInputStream stderrStream = null
+  private int[] status = new int[1]
+  private boolean haveStatus = false
+  private int exitStatus = 0
+
+  public Process(long pid, int inFd, int outFd, int errFd, boolean merged) {
+    this.pid = pid
+    this.inFd = inFd
+    this.outFd = outFd
+    this.errFd = errFd
+    this.merged = merged
+  }
+
+  /* The operating system's id: a pid on POSIX, a process id on Windows. */
+  public long pid() {
+    return this.pid
+  }
+
+  // The parent's write end of the child's stdin.
+  public ProcOutputStream getOutputStream() {
+    if (stdoutStream == null) {
+      stdoutStream = new ProcOutputStream(inFd)
+    }
+    return stdoutStream
+  }
+
+  // The parent's read end of the child's stdout.
+  public ProcInputStream getInputStream() {
+    if (stdinStream == null) {
+      stdinStream = new ProcInputStream(outFd)
+    }
+    return stdinStream
+  }
+
+  // The parent's read end of the child's stderr; -1 when the two were merged,
+  // which answers a stream whose read immediately reports the end of the stream.
+  public ProcInputStream getErrorStream() {
+    if (stderrStream == null) {
+      stderrStream = new ProcInputStream(errFd < 0 ? closedFd() : errFd)
+    }
+    return stderrStream
+  }
+
+  /* A descriptor that is already at the end of the stream, for a merged stderr:
+     reading -1 answers the end of the stream without a special case in the read
+     path. 0 is stdin, and it is never opened for writing here. */
+  private static int closedFd() {
+    return -1
+  }
+
+  /* Wait for the child to end and answer its status, which is the one a shell
+     reports: the exit code, or 128 + the signal that ended it. Repeat calls
+     answer the same status without waiting. */
+  public int waitFor() {
+    if (!haveStatus) {
+      int[] st = new int[1]
+      Proc.ok(Proc.wait0(pid, st), "wait for the child")
+      exitStatus = st[0]
+      haveStatus = true
+    }
+    return exitStatus
+  }
+
+  /* Wait up to millis for the child. False when the deadline passed with it
+     still running, which is Java's answer; the child is not killed, because
+     Java's does not either. The waiting is a loop of short polls rather than a
+     timed wait: the platform layer has no waitpid with a timeout, and a poll a
+     few times a millisecond is the same answer for any child that is not
+     already finished. */
+  public boolean waitFor(long millis) {
+    if (haveStatus) {
+      return true
+    }
+    if (millis <= 0) {
+      int[] st = new int[1]
+      int e = Proc.poll0(pid, st)
+      if (e < 0) {
+        throw new ProcessException("poll the child: " + Proc.strerror0(e))
+      }
+      if (e == 0) {
+        return false
+      }
+      exitStatus = st[0]
+      haveStatus = true
+      return true
+    }
+    long deadline = System.nanoTime() + millis * 1000000L
+    while (true) {
+      int[] st = new int[1]
+      int e = Proc.poll0(pid, st)
+      if (e < 0) {
+        throw new ProcessException("poll the child: " + Proc.strerror0(e))
+      }
+      if (e > 0) {
+        exitStatus = st[0]
+        haveStatus = true
+        return true
+      }
+      if (System.nanoTime() >= deadline) {
+        return false
+      }
+      Thread.sleep(1L)
+    }
+  }
+
+  /* Java's exitValue: the status when it is there, and
+     IllegalThreadStateException when the child is still running -- thrown
+     rather than blocking, because a caller that wanted to wait would have
+     called waitFor. */
+  public int exitValue() {
+    if (!haveStatus) {
+      int[] st = new int[1]
+      int e = Proc.poll0(pid, st)
+      if (e < 0) {
+        throw new ProcessException("poll the child: " + Proc.strerror0(e))
+      }
+      if (e == 0) {
+        throw new IllegalThreadStateException("process has not exited")
+      }
+      exitStatus = st[0]
+      haveStatus = true
+    }
+    return exitStatus
+  }
+
+  /* Whether the child is still running, answered without waiting. */
+  public boolean isAlive() {
+    if (haveStatus) {
+      return false
+    }
+    int[] st = new int[1]
+    int e = Proc.poll0(pid, st)
+    if (e < 0) {
+      throw new ProcessException("poll the child: " + Proc.strerror0(e))
+    }
+    if (e > 0) {
+      exitStatus = st[0]
+      haveStatus = true
+      return false
+    }
+    return true
+  }
+
+  /* Kill it, as Process.destroy does. The child is signalled rather than asked
+     to exit: this is the call a parent makes when the child is not going to
+     cooperate, and waiting for it to are still waitFor's job. */
+  public void destroy() {
+    Proc.kill0(pid)
+  }
+
+  public String toString() {
+    String state = haveStatus ? " exited with " + exitStatus : " running"
+    return "Process[pid=" + pid + state + "]"
+  }
+}

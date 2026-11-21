@@ -253,11 +253,31 @@ int32_t typlat_socket_recv_timeout_ms(int32_t fd);
    caller that bounds a wait with a timeout retries rather than reporting it. */
 int typlat_socket_wait(int32_t fd, int for_write, int timeout_ms);
 
+/* A datagram to or from a UDP socket. addr is a sockaddr_in the caller fills
+   the same way it does for bind: family, port, address. */
+int64_t typlat_socket_sendto(int32_t fd, const void *buf, int len,
+                             const struct sockaddr *addr, int alen);
+/* A datagram, with the sender's address filled in. *alen is the buffer's size
+   on the way in and the address's on the way out. A short read is a datagram,
+   not a truncation: UDP keeps message boundaries, and a buffer too small is
+   EMSGSIZE rather than a partial message. */
+int64_t typlat_socket_recvfrom(int32_t fd, void *buf, int len,
+                               struct sockaddr *addr, int *alen);
+
+/* Wait on several descriptors at once, which is what a Selector is.
+   events/revents are bit masks: 1 readable, 2 writable, 4 an error. The arrays
+   have n entries; the answer is how many are ready, 0 on timeout, or a negative
+   code. This is poll(2) on POSIX and WSAPoll on Windows, so a program that
+   waits on a thousand sockets makes one system call rather than a thousand. */
+int typlat_poll(int32_t *fds, int32_t *events, int32_t *revents, int n, int timeout_ms);
+
+#endif /* TYPLAT_WANT_SOCKETS */
+
 /* The text for a positive error code, with the number in it: strerror's message
    and "(errno N)" on POSIX, the system message and "(wsa N)" for a Winsock code
-   on Windows. Never empty. */
+   on Windows. Never empty. It is outside the socket gate because the process
+   layer needs it too and links without Winsock. */
 void typlat_error_text(int code, char *buf, size_t n);
-#endif /* TYPLAT_WANT_SOCKETS */
 
 /* ------------------------------------------------------------------ files */
 
@@ -299,5 +319,46 @@ void typlat_close_fd(int fd);
    SecureRandom built on a clock-seeded generator is the defect this exists to
    avoid. n may be zero, which answers 0 without touching buf. */
 int typlat_random_bytes(void *buf, size_t n);
+
+/* ------------------------------------------------------------------ processes */
+
+/* A started program and the parent's ends of its three pipes. pid is a POSIX
+   pid or a Windows process id; the descriptors are ordinary ones the caller
+   reads and writes and closes with typlat_close_fd. A pipe the caller did not
+   ask for is -1. */
+typedef struct typlat_proc {
+  int64_t pid;
+  int32_t in;  /* the child's stdin: the parent writes */
+  int32_t out; /* the child's stdout: the parent reads */
+  int32_t err; /* the child's stderr: the parent reads, -1 when merged */
+} typlat_proc;
+
+/* Start argv[0] with argv, which is NULL-terminated. envp is NULL to inherit
+   the environment. dir is the working directory or NULL. merge sends the
+   child's stderr to the same pipe as its stdout. Returns 0 or a negative
+   code; on success every field of *p is set. */
+int typlat_proc_spawn(const char *const argv[], char *const envp[], const char *dir,
+                      int merge, typlat_proc *p);
+
+/* Wait for the child, answering 0 and its exit status in *status (the same
+   value a shell reports: 128 + signal when a signal ended it), or a negative
+   code. This blocks; the caller brackets it as a stop point. */
+int typlat_proc_wait(int64_t pid, int32_t *status);
+
+/* Ask whether the child has ended, without waiting: 1 and *status set when it
+   has, 0 when it is still running, or a negative code. This is what
+   Process.exitValue needs: Java throws IllegalThreadStateException there rather
+   than blocking, so the answer has to be available without waiting. */
+int typlat_proc_poll(int64_t pid, int32_t *status);
+
+/* Terminate the child. Returns 0, or a negative code when it cannot. */
+int typlat_proc_kill(int64_t pid);
+
+/* A descriptor, which here may be a pipe or a socket: a read of 0 is the end
+   of the stream, a short read is an answer, and a negative value is -errno. */
+int64_t typlat_fd_read(int32_t fd, void *buf, int len);
+/* Bytes written, which is what makes the caller's loop correct, or a negative
+   code. */
+int64_t typlat_fd_write(int32_t fd, const void *buf, int len);
 
 #endif /* TYRT_PLAT_H */

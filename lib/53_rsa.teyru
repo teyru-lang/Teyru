@@ -1,0 +1,585 @@
+package teyru
+
+/* RSA, as far as verification and key transport need it: PKCS#1 v1.5
+   encryption/decryption through Cipher, PKCS#1 v1.5 signature verification
+   through Signature, and the two DER key encodings a key file is in.
+
+   Why verification is here and signing is not: a program that verifies holds a
+   public key, and the failure it can cause is "this signature is rejected". A
+   program that signs holds a private key, and the failure it can cause is a
+   forged signature, which is a property of the padding and of how the key was
+   handled. The operations that need care are the ones this file leaves out, and
+   a caller that wants to sign is told so by a missing method rather than by a
+   method that might be wrong.
+
+   The DER reader is deliberately small: it walks as many TLVs as a key
+   structure has, checks the tags it expects, and refuses anything else. It is
+   not a general ASN.1 library and does not pretend to be one.
+
+   How this is verified: tests/programs/t323_cipher.teyru (this file's RSA
+   section) uses a fixed 1024-bit key in X.509 and PKCS#8 DER, encrypts with the
+   public key and decrypts with the private one, and verifies a SHA-256
+   signature -- all against the JDK's own output for the same inputs. */
+class X509EncodedKeySpec {
+  private final byte[] der
+
+  public X509EncodedKeySpec(byte[] der) {
+    if (der == null) {
+      throw new NullPointerException("encoded key")
+    }
+    this.der = new byte[der.length]
+    System.arraycopy(der, 0, this.der, 0, der.length)
+  }
+
+  public byte[] getEncoded() {
+    byte[] b = new byte[der.length]
+    System.arraycopy(der, 0, b, 0, der.length)
+    return b
+  }
+
+  public String getFormat() {
+    return "X.509"
+  }
+}
+
+class PKCS8EncodedKeySpec {
+  private final byte[] der
+
+  public PKCS8EncodedKeySpec(byte[] der) {
+    if (der == null) {
+      throw new NullPointerException("encoded key")
+    }
+    this.der = new byte[der.length]
+    System.arraycopy(der, 0, this.der, 0, der.length)
+  }
+
+  public byte[] getEncoded() {
+    byte[] b = new byte[der.length]
+    System.arraycopy(der, 0, b, 0, der.length)
+    return b
+  }
+
+  public String getFormat() {
+    return "PKCS#8"
+  }
+}
+
+/* One DER value: a tag, the body's bytes, and the offset after it. The reader
+   below returns a cursor rather than a tree because a key structure is a fixed
+   path, not a document. */
+final class Der {
+  public static final int SEQUENCE = 0x30
+  public static final int INTEGER = 0x02
+  public static final int BIT_STRING = 0x03
+  public static final int OCTET_STRING = 0x04
+  public static final int NULL_TAG = 0x05
+  public static final int OID = 0x06
+
+  /* The next TLV at off: tag, body start, body length, and the next offset.
+     A length that runs past the buffer is refused rather than clamped. */
+  public static int[] next(byte[] der, int off) {
+    if (off + 2 > der.length) {
+      throw new IllegalArgumentException("truncated DER")
+    }
+    int tag = der[off] & 255
+    int at = off + 1
+    int len = der[at] & 255
+    at++
+    if ((len & 0x80) != 0) {
+      int n = len & 0x7f
+      if (n == 0 || n > 4 || at + n > der.length) {
+        throw new IllegalArgumentException("unsupported DER length")
+      }
+      len = 0
+      for (int i = 0 : i < n : i++) {
+        len = (len << 8) | (der[at + i] & 255)
+      }
+      at += n
+    }
+    if (at + len > der.length) {
+      throw new IllegalArgumentException("truncated DER body")
+    }
+    return new int[] { tag, at, len, at + len }
+  }
+
+  public static byte[] body(byte[] der, int[] tlv) {
+    byte[] b = new byte[tlv[2]]
+    System.arraycopy(der, tlv[1], b, 0, tlv[2])
+    return b
+  }
+}
+
+/* An RSA public key: modulus and exponent, both unsigned big integers.
+   getEncoded answers the X.509 SubjectPublicKeyInfo DER it was given or, for one
+   built from a spec, the encoding of those two numbers. */
+class RsaPublicKey {
+  private final BigInteger modulus
+  private final BigInteger exponent
+  private final byte[] encoded
+
+  public RsaPublicKey(BigInteger modulus, BigInteger exponent) {
+    this.modulus = modulus
+    this.exponent = exponent
+    this.encoded = null
+  }
+
+  public RsaPublicKey(BigInteger modulus, BigInteger exponent, byte[] encoded) {
+    this.modulus = modulus
+    this.exponent = exponent
+    this.encoded = encoded
+  }
+
+  public BigInteger getModulus() {
+    return modulus
+  }
+
+  public BigInteger getPublicExponent() {
+    return exponent
+  }
+
+  public byte[] getEncoded() {
+    return encoded;
+  }
+
+  public String getAlgorithm() {
+    return "RSA"
+  }
+}
+
+/* An RSA private key, kept as the CRT set PKCS#1 stores: modulus, private
+   exponent, and the two primes with their exponents and coefficient. Decryption
+   uses the private exponent directly (one modPow); the CRT fields are carried
+   because a key that names them is a key a caller may ask about, and dropping
+   them would make getEncoded unable to answer. */
+class RsaPrivateKey {
+  private final BigInteger modulus
+  private final BigInteger privateExponent
+  private final BigInteger primeP
+  private final BigInteger primeQ
+  private final BigInteger crtExponentP
+  private final BigInteger crtExponentQ
+  private final BigInteger crtCoefficient
+  private final byte[] encoded
+
+  public RsaPrivateKey(BigInteger n, BigInteger d, BigInteger p, BigInteger q,
+    BigInteger dp, BigInteger dq, BigInteger qinv, byte[] encoded) {
+    this.modulus = n
+    this.privateExponent = d
+    this.primeP = p
+    this.primeQ = q
+    this.crtExponentP = dp
+    this.crtExponentQ = dq
+    this.crtCoefficient = qinv
+    this.encoded = encoded
+  }
+
+  public BigInteger getModulus() {
+    return modulus
+  }
+
+  public BigInteger getPrivateExponent() {
+    return privateExponent
+  }
+
+  public byte[] getEncoded() {
+    return encoded;
+  }
+
+  public String getAlgorithm() {
+    return "RSA"
+  }
+}
+
+/* KeyFactory: DER in, key out. The two formats Java names are the two this
+   understands; the algorithm is resolved by name and "RSA" is the only one. */
+class KeyFactory {
+  private final String algorithm
+
+  private KeyFactory(String algorithm) {
+    this.algorithm = algorithm
+  }
+
+  public static KeyFactory getInstance(String algorithm) {
+    if (algorithm == null) {
+      throw new NullPointerException("null algorithm name")
+    }
+    if (!algorithm.equalsIgnoreCase("RSA")) {
+      throw new NoSuchAlgorithmException("Algorithm " + algorithm + " not available")
+    }
+    return new KeyFactory("RSA")
+  }
+
+  public String getAlgorithm() {
+    return algorithm
+  }
+
+  /* SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier, BIT STRING {
+     SEQUENCE { INTEGER n, INTEGER e } } }. The algorithm OID is not checked
+     beyond being present: a key whose OID says something other than rsaEncryption
+     is not an RSA key, and reading its integers anyway would produce a key that
+     silently decrypts wrong. */
+  public RsaPublicKey generatePublic(X509EncodedKeySpec spec) {
+    byte[] der = spec.getEncoded()
+    int[] top = Der.next(der, 0)
+    if (top[0] != Der.SEQUENCE) {
+      throw new InvalidKeyException("not a SubjectPublicKeyInfo")
+    }
+    int at = top[1]
+    int[] alg = Der.next(der, at)
+    if (alg[0] != Der.SEQUENCE) {
+      throw new InvalidKeyException("missing AlgorithmIdentifier")
+    }
+    at = alg[3]
+    int[] bits = Der.next(der, at)
+    if (bits[0] != Der.BIT_STRING || bits[2] < 2) {
+      throw new InvalidKeyException("missing public key BIT STRING")
+    }
+    /* The first byte of a BIT STRING is the number of unused bits, which is 0
+       for a key. */
+    int inner = bits[1] + 1
+    int[] seq = Der.next(der, inner)
+    if (seq[0] != Der.SEQUENCE) {
+      throw new InvalidKeyException("missing RSAPublicKey")
+    }
+    int p = seq[1]
+    int[] n = Der.next(der, p)
+    int[] e = Der.next(der, n[3])
+    if (n[0] != Der.INTEGER || e[0] != Der.INTEGER) {
+      throw new InvalidKeyException("RSAPublicKey is not two integers")
+    }
+    return new RsaPublicKey(unsigned(Der.body(der, n)), unsigned(Der.body(der, e)), der)
+  }
+
+  /* PrivateKeyInfo: SEQUENCE { INTEGER version, AlgorithmIdentifier, OCTET
+     STRING { RSAPrivateKey } }, and RSAPrivateKey is the nine integers of
+     PKCS#1. The two-prime form is the only one read: a multi-prime key is
+     refused by count rather than misread. */
+  public RsaPrivateKey generatePrivate(PKCS8EncodedKeySpec spec) {
+    byte[] der = spec.getEncoded()
+    int[] top = Der.next(der, 0)
+    if (top[0] != Der.SEQUENCE) {
+      throw new InvalidKeyException("not a PrivateKeyInfo")
+    }
+    int at = top[1]
+    int[] version = Der.next(der, at)
+    if (version[0] != Der.INTEGER) {
+      throw new InvalidKeyException("missing version")
+    }
+    int[] alg = Der.next(der, version[3])
+    if (alg[0] != Der.SEQUENCE) {
+      throw new InvalidKeyException("missing AlgorithmIdentifier")
+    }
+    int[] octets = Der.next(der, alg[3])
+    if (octets[0] != Der.OCTET_STRING) {
+      throw new InvalidKeyException("missing privateKey OCTET STRING")
+    }
+    int[] seq = Der.next(der, octets[1])
+    if (seq[0] != Der.SEQUENCE) {
+      throw new InvalidKeyException("missing RSAPrivateKey")
+    }
+    int p = seq[1]
+    int[] v = Der.next(der, p)
+    p = v[3]
+    int[] n = Der.next(der, p)
+    p = n[3]
+    /* The public exponent sits between the modulus and the private exponent in
+       PKCS#1's RSAPrivateKey; it is the one field decryption does not need and
+       the one a reader that skipped it would walk off into. */
+    int[] e = Der.next(der, p)
+    p = e[3]
+    int[] d = Der.next(der, p)
+    p = d[3]
+    int[] pp = Der.next(der, p)
+    p = pp[3]
+    int[] qq = Der.next(der, p)
+    p = qq[3]
+    int[] dp = Der.next(der, p)
+    p = dp[3]
+    int[] dq = Der.next(der, p)
+    p = dq[3]
+    int[] qinv = Der.next(der, p)
+    if (v[0] != Der.INTEGER || n[0] != Der.INTEGER || e[0] != Der.INTEGER || d[0] != Der.INTEGER ||
+      pp[0] != Der.INTEGER || qq[0] != Der.INTEGER || dp[0] != Der.INTEGER ||
+      dq[0] != Der.INTEGER || qinv[0] != Der.INTEGER) {
+      throw new InvalidKeyException("RSAPrivateKey is not the PKCS#1 integer sequence")
+    }
+    /* A multi-prime key has more integers after qInv; this reader stops at
+       eight and would silently ignore them, so the count is checked by asking
+       whether anything but padding follows. DER has no padding, so anything
+       left is a field this reader did not understand. */
+    /* PKCS#1 v2.1 adds an optional [0] otherPrimeInfos after qInv for
+       multi-prime keys; its absence is what this reader knows. A trailing
+       element that is not that tag is a document this reader does not
+       understand, and either way nothing is silently ignored. */
+    if (qinv[3] != seq[3]) {
+      int[] extra = Der.next(der, qinv[3])
+      if (extra[0] != 0xa0 || extra[3] != seq[3]) {
+        throw new InvalidKeyException("RSAPrivateKey has fields this reader does not know")
+      }
+      throw new InvalidKeyException("multi-prime RSA keys are not supported")
+    }
+    return new RsaPrivateKey(unsigned(Der.body(der, n)), unsigned(Der.body(der, d)),
+      unsigned(Der.body(der, pp)), unsigned(Der.body(der, qq)),
+      unsigned(Der.body(der, dp)), unsigned(Der.body(der, dq)),
+      unsigned(Der.body(der, qinv)), der)
+  }
+
+  /* A DER INTEGER is two's complement and its leading zero byte is the sign.
+     The numbers a key carries are unsigned, so the leading zero is stripped
+     rather than read as part of the value. */
+  private static BigInteger unsigned(byte[] body) {
+    int off = 0
+    while (off < body.length - 1 && body[off] == 0) {
+      off++
+    }
+    byte[] mag = new byte[body.length - off]
+    System.arraycopy(body, off, mag, 0, mag.length)
+    return new BigInteger(1, mag)
+  }
+}
+
+/* PKCS#1 v1.5 encryption, as Cipher's RSA transformation: pad to the modulus
+   with 00 02 || random nonzero || 00, raise to e or d, and unpad on the way
+   back. The message is limited to modulusBytes - 11, as the standard says; a
+   longer one is refused rather than truncated. */
+final class RsaPkcs1 {
+  private RsaPkcs1() {}
+
+  public static byte[] encrypt(RsaPublicKey key, byte[] msg) {
+    int k = modulusBytes(key.getModulus())
+    if (msg.length > k - 11) {
+      throw new IllegalBlockSizeException("message too long for a " + (k * 8) + "-bit RSA key")
+    }
+    byte[] em = new byte[k]
+    em[0] = 0
+    em[1] = 2
+    int ps = k - msg.length - 3
+    byte[] rnd = new byte[ps]
+    new SecureRandom().nextBytes(rnd)
+    for (int i = 0 : i < ps : i++) {
+      /* A zero in the padding would end it early, so a zero byte is replaced. */
+      if (rnd[i] == 0) {
+        rnd[i] = 1
+      }
+      em[2 + i] = rnd[i]
+    }
+    em[2 + ps] = 0
+    System.arraycopy(msg, 0, em, 3 + ps, msg.length)
+    byte[] c = new BigInteger(1, em).modPow(key.getPublicExponent(), key.getModulus()).toByteArray()
+    return leftPad(c, k)
+  }
+
+  public static byte[] decrypt(RsaPrivateKey key, byte[] msg) {
+    int k = modulusBytes(key.getModulus())
+    if (msg.length > k) {
+      /* Java's own refusal, and its own words: a ciphertext longer than the
+         modulus is a length error, while one shorter than it is left to the
+         padding check -- which is what the JDK does and what makes a truncated
+         ciphertext a padding failure rather than a length failure. */
+      throw new IllegalBlockSizeException("Data must not be longer than " + k + " bytes")
+    }
+    byte[] em = leftPad(new BigInteger(1, msg).modPow(key.getPrivateExponent(), key.getModulus()).toByteArray(), k)
+    if (em[0] != 0 || em[1] != 2) {
+      throw new BadPaddingException("Padding error in decryption")
+    }
+    int i = 2
+    while (i < em.length && em[i] != 0) {
+      i++
+    }
+    if (i >= em.length || i - 2 < 8) {
+      throw new BadPaddingException("Padding error in decryption")
+    }
+    byte[] out = new byte[em.length - i - 1]
+    System.arraycopy(em, i + 1, out, 0, out.length)
+    return out
+  }
+
+  /* PKCS#1 v1.5 signature verification: compare the recovered
+     00 01 FF..FF 00 || DigestInfo || hash with the padded value the signer
+     should have produced. The comparison is constant-time in the signature
+     bytes, which is what keeps a verification oracle from leaking how much of
+     a signature matched. */
+  public static boolean verify(RsaPublicKey key, String digestName, byte[] signature, byte[] hash) {
+    int k = modulusBytes(key.getModulus())
+    if (signature.length != k) {
+      return false
+    }
+    byte[] em
+    try {
+      em = leftPad(new BigInteger(1, signature).modPow(key.getPublicExponent(), key.getModulus()).toByteArray(), k)
+    } catch (RuntimeException e) {
+      return false
+    }
+    byte[] prefix = digestInfo(digestName)
+    if (prefix == null) {
+      throw new NoSuchAlgorithmException(digestName + " is not a digest this file knows")
+    }
+    int tLen = prefix.length + hash.length
+    if (k < tLen + 11) {
+      return false
+    }
+    int psLen = k - tLen - 3
+    if (em[0] != 0 || em[1] != 1) {
+      return false
+    }
+    for (int i = 2 : i < 2 + psLen : i++) {
+      if ((em[i] & 255) != 255) {
+        return false
+      }
+    }
+    if (em[2 + psLen] != 0) {
+      return false
+    }
+    int at = 3 + psLen
+    for (int i = 0 : i < prefix.length : i++) {
+      if (em[at + i] != prefix[i]) {
+        return false
+      }
+    }
+    at += prefix.length
+    int diff = 0
+    for (int i = 0 : i < hash.length : i++) {
+      diff = diff | (em[at + i] ^ hash[i])
+    }
+    return diff == 0
+  }
+
+  /* The DigestInfo DER prefix PKCS#1 v1.5 defines for each digest. */
+  private static byte[] digestInfo(String name) {
+    if (name.equalsIgnoreCase("SHA-256")) {
+      return new byte[] { 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, (byte) 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 }
+    }
+    if (name.equalsIgnoreCase("SHA-1")) {
+      return new byte[] { 0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a,
+        0x05, 0x00, 0x04, 0x14 }
+    }
+    if (name.equalsIgnoreCase("SHA-384")) {
+      return new byte[] { 0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, (byte) 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30 }
+    }
+    if (name.equalsIgnoreCase("SHA-512")) {
+      return new byte[] { 0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, (byte) 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 }
+    }
+    if (name.equalsIgnoreCase("SHA-224")) {
+      return new byte[] { 0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, (byte) 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0x04, 0x1c }
+    }
+    return null
+  }
+
+  private static int modulusBytes(BigInteger n) {
+    return (n.bitLength() + 7) / 8
+  }
+
+  private static byte[] leftPad(byte[] b, int n) {
+    if (b.length > n) {
+      /* toByteArray may prepend a sign byte; a value that is longer than the
+         modulus is out of range. */
+      byte[] out = new byte[n]
+      System.arraycopy(b, b.length - n, out, 0, n)
+      return out
+    }
+    byte[] out = new byte[n]
+    System.arraycopy(b, 0, out, n - b.length, b.length)
+    return out
+  }
+}
+
+/* Signature, the verification half. A caller writes initVerify(publicKey),
+   update(bytes) one or more times, then verify(signature). Java's signature of
+   the update stream is kept: the digest is over everything written to it. */
+class Signature {
+  private String algorithm
+  private MessageDigest digest
+  private byte[] written
+  private int writtenLen
+  private RsaPublicKey key
+
+  private Signature(String algorithm, String digestName) {
+    this.algorithm = algorithm
+    this.digest = MessageDigest.getInstance(digestName)
+  }
+
+  public static Signature getInstance(String algorithm) {
+    if (algorithm == null) {
+      throw new NullPointerException("null algorithm name")
+    }
+    String t = algorithm.toUpperCase().replace("-", "")
+    if (t.equals("SHA256WITHRSA")) {
+      return new Signature("SHA256withRSA", "SHA-256")
+    }
+    if (t.equals("SHA1WITHRSA")) {
+      return new Signature("SHA1withRSA", "SHA-1")
+    }
+    if (t.equals("SHA384WITHRSA")) {
+      return new Signature("SHA384withRSA", "SHA-384")
+    }
+    if (t.equals("SHA512WITHRSA")) {
+      return new Signature("SHA512withRSA", "SHA-512")
+    }
+    throw new NoSuchAlgorithmException("Algorithm " + algorithm + " not available")
+  }
+
+  public void initVerify(RsaPublicKey publicKey) {
+    if (publicKey == null) {
+      throw new InvalidKeyException("No public key given")
+    }
+    this.key = publicKey
+    this.digest.reset()
+    this.writtenLen = 0
+  }
+
+  /* The update stream is buffered until verify, which is what lets the C half
+     stay a one-shot hash. A signature over a stream larger than memory would be
+     a different API (and a different file); this one is honest about taking the
+     message it is given. */
+  public void update(byte[] data) {
+    if (key == null) {
+      throw new IllegalStateException("Signature has not been initialized")
+    }
+    if (data == null) {
+      throw new NullPointerException("data")
+    }
+    if (written == null) {
+      written = new byte[data.length]
+    } else if (writtenLen + data.length > written.length) {
+      byte[] bigger = new byte[Math.max(written.length * 2, writtenLen + data.length)]
+      System.arraycopy(written, 0, bigger, 0, writtenLen)
+      written = bigger
+    }
+    System.arraycopy(data, 0, written, writtenLen, data.length)
+    writtenLen += data.length
+  }
+
+  public void update(byte b) {
+    update(new byte[] { b })
+  }
+
+  public boolean verify(byte[] signature) {
+    if (key == null) {
+      throw new IllegalStateException("Signature has not been initialized")
+    }
+    if (signature == null) {
+      throw new NullPointerException("signature")
+    }
+    byte[] msg = written == null ? new byte[0] : new byte[writtenLen]
+    if (writtenLen > 0) {
+      System.arraycopy(written, 0, msg, 0, writtenLen)
+    }
+    byte[] hash = digest.digest(msg)
+    /* "SHA256withRSA" names the digest "SHA-256": the JDK's own spelling of
+       the algorithm is the hyphenless one, and the DigestInfo lookup is by the
+       digest's canonical name. */
+    String name = algorithm.substring(0, algorithm.indexOf("withRSA"))
+    if (!name.startsWith("SHA-")) {
+      name = "SHA-" + name.substring(3)
+    }
+    return RsaPkcs1.verify(key, name, signature, hash)
+  }
+
+  public String getAlgorithm() {
+    return algorithm
+  }
+}

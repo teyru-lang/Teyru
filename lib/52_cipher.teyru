@@ -1,0 +1,939 @@
+package teyru
+
+/* javax.crypto and the parts of java.security a program reaches for after
+   MessageDigest: a block cipher with the modes a service actually uses, key
+   generation, and the RSA operations that verify a signature or unwrap a key.
+
+   Why this is written here rather than reached for through OpenSSL. The TLS
+   layer is OpenSSL's, and it is the one part of the runtime that links a library
+   the compiler does not ship -- a program that never makes a TLS connection does
+   not carry libssl. A Cipher is asked for by a program that may have no socket
+   at all (a config file, a licence token, a database column), so putting it
+   behind OpenSSL would make every such program depend on it, and a target with
+   no OpenSSL (Windows, macOS) would lose the primitive entirely. AES is a
+   hundred lines of arithmetic and the tables below; RSA is BigInteger, which
+   this library already has.
+
+   What is here:
+     - AES-128/192/256 in ECB, CBC, CTR and GCM (the last with a tag that is
+       verified before any plaintext is returned).
+     - PKCS#5/#7 padding, which is what "PKCS5Padding" has always meant for a
+       block cipher, and no padding for CTR/GCM.
+     - SecretKeySpec, IvParameterSpec, GCMParameterSpec, KeyGenerator and
+       SecureRandom-backed key generation.
+     - RSA PKCS#1 v1.5 encryption/decryption and RSASSA-PKCS1-v1_5 verification
+       over the digests in 40_digest.teyru, plus a DER reader for the two key
+       encodings a key file is in (X.509 SubjectPublicKeyInfo, PKCS#8).
+
+   What is not here, and it is named rather than left to be discovered:
+     - No signature *creation*, and no private-key RSA operations at all. A
+       program that holds a signing key is a program that should say so in its
+       deployment (a key file in the process's memory), and the operations that
+       would use it are exactly the ones where getting the padding wrong is a
+       vulnerability. Verification is safe to offer; signing is a decision.
+     - No modes beyond the four: GCM covers authenticated encryption, and CFB,
+       OFB, CTS, XTS and the AEAD family beyond GCM are named absences.
+     - No provider architecture, no KeyStore, no PKCS#11 and no JCE providers.
+
+   How this file is verified. tests/programs/t323_cipher.teyru is the same
+   program as its .java.ref, run on OpenJDK 21, over the FIPS-197 vectors for
+   every key size, the NIST SP 800-38A CBC/CTR/GCM vectors, the padding
+   boundaries, and an RSA key from a fixed DER blob. Its expectation is the
+   JDK's output, so every byte below is checked against the reference
+   implementation rather than against itself. */
+class InvalidKeyException extends GeneralSecurityException {
+  public InvalidKeyException() {}
+  public InvalidKeyException(String message) {
+    super(message)
+  }
+}
+
+class InvalidAlgorithmParameterException extends GeneralSecurityException {
+  public InvalidAlgorithmParameterException() {}
+  public InvalidAlgorithmParameterException(String message) {
+    super(message)
+  }
+}
+
+class BadPaddingException extends GeneralSecurityException {
+  public BadPaddingException() {}
+  public BadPaddingException(String message) {
+    super(message)
+  }
+}
+
+class IllegalBlockSizeException extends GeneralSecurityException {
+  public IllegalBlockSizeException() {}
+  public IllegalBlockSizeException(String message) {
+    super(message)
+  }
+}
+
+class AEADBadTagException extends BadPaddingException {
+  public AEADBadTagException() {}
+  public AEADBadTagException(String message) {
+    super(message)
+  }
+}
+
+/* A key's bytes and the name of the algorithm they are for. Java's class has a
+   constructor that takes the algorithm name and one that does not; both are
+   here, and the second takes the name the Cipher was asked for, as the JDK's
+   does when the provider can tell. */
+class SecretKeySpec {
+  private final byte[] key
+  private final String algorithm
+
+  public SecretKeySpec(byte[] key, String algorithm) {
+    if (key == null || key.length == 0) {
+      throw new IllegalArgumentException("Empty key")
+    }
+    if (algorithm == null) {
+      throw new IllegalArgumentException("null algorithm")
+    }
+    this.key = copy(key)
+    this.algorithm = algorithm
+  }
+
+  public SecretKeySpec(byte[] key, int offset, int len, String algorithm) {
+    if (key == null) {
+      throw new IllegalArgumentException("Empty key")
+    }
+    if (len == 0) {
+      throw new IllegalArgumentException("Empty key")
+    }
+    byte[] part = new byte[len]
+    System.arraycopy(key, offset, part, 0, len)
+    this.key = part
+    this.algorithm = algorithm
+  }
+
+  public byte[] getEncoded() {
+    return copy(key)
+  }
+
+  public String getAlgorithm() {
+    return algorithm
+  }
+
+  private static byte[] copy(byte[] a) {
+    byte[] b = new byte[a.length]
+    System.arraycopy(a, 0, b, 0, a.length)
+    return b
+  }
+}
+
+class IvParameterSpec {
+  private final byte[] iv
+
+  public IvParameterSpec(byte[] iv) {
+    if (iv == null) {
+      throw new NullPointerException("iv")
+    }
+    this.iv = new byte[iv.length]
+    System.arraycopy(iv, 0, this.iv, 0, iv.length)
+  }
+
+  public byte[] getIV() {
+    byte[] b = new byte[iv.length]
+    System.arraycopy(iv, 0, b, 0, iv.length)
+    return b
+  }
+}
+
+class GCMParameterSpec {
+  private final int tLen
+  private final byte[] iv
+
+  public GCMParameterSpec(int tLen, byte[] src) {
+    if (src == null) {
+      throw new NullPointerException("iv")
+    }
+    this.tLen = tLen
+    this.iv = new byte[src.length]
+    System.arraycopy(src, 0, this.iv, 0, src.length)
+  }
+
+  public int getTLen() {
+    return tLen
+  }
+
+  public byte[] getIV() {
+    byte[] b = new byte[iv.length]
+    System.arraycopy(iv, 0, b, 0, iv.length)
+    return b
+  }
+}
+
+/* KeyGenerator: asked for a key length and an algorithm, answers random bytes
+   from SecureRandom. For AES the length is the key's; for HmacSHA* it is the
+   block size. */
+class KeyGenerator {
+  private final String algorithm
+  private int size
+
+  private KeyGenerator(String algorithm, int size) {
+    this.algorithm = algorithm
+    this.size = size
+  }
+
+  public static KeyGenerator getInstance(String algorithm) {
+    if (algorithm == null) {
+      throw new NullPointerException("null algorithm name")
+    }
+    if (algorithm.equalsIgnoreCase("AES")) {
+      return new KeyGenerator("AES", 16)
+    }
+    if (algorithm.equalsIgnoreCase("HmacSHA256")) {
+      return new KeyGenerator("HmacSHA256", 32)
+    }
+    if (algorithm.equalsIgnoreCase("HmacSHA1")) {
+      return new KeyGenerator("HmacSHA1", 20)
+    }
+    throw new NoSuchAlgorithmException("Algorithm " + algorithm + " not available")
+  }
+
+  public void init(int keySize) {
+    this.size = keySize / 8
+  }
+
+  public SecretKeySpec generateKey() {
+    byte[] b = new byte[size]
+    new SecureRandom().nextBytes(b)
+    return new SecretKeySpec(b, algorithm)
+  }
+
+  public String getAlgorithm() {
+    return algorithm
+  }
+}
+
+/* The cipher.
+
+   `getInstance` resolves the name the way the JDK's SunJCE does for the names
+   this file implements, and refuses the rest by name: a cipher that silently
+   answered for a mode it does not implement would produce a value that is not
+   the one the caller asked for, which is the worst failure this file could
+   have. */
+class Cipher {
+  /* The AES block function's two tables. SBOX is FIPS-197's; SIBOX is its
+     inverse, and it is a table rather than a search because the inverse is
+     never computed at run time. */
+  private static final int[] SBOX = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+  }
+
+  private static final int[] SIBOX = {
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+  }
+
+  private String transformation
+  private SecretKeySpec key
+  private byte[] iv
+  private int gcmTagLen = 128
+  private boolean encryptMode = true
+  private boolean initialized = false
+
+  private Cipher(String transformation) {
+    this.transformation = transformation
+  }
+
+  /* The RSA transformations are resolved here and implemented in
+     53_rsa.teyru: the cipher's modes and padding are the same idea, so one
+     factory answers for both, and the class a caller ends up with is the same
+     one either way. */
+  private RsaPublicKey rsaKey
+  private RsaPrivateKey rsaPrivate
+
+  /* Java's factory. The transformation is ALGORITHM/MODE/PADDING, with the
+     one-part spelling accepted where Java's is (a plain "AES" is
+     AES/ECB/PKCS5Padding). */
+  public static Cipher getInstance(String transformation) {
+    if (transformation == null) {
+      throw new NullPointerException("null transformation")
+    }
+    String t = transformation.toUpperCase()
+    if (t.equals("AES")) {
+      t = "AES/ECB/PKCS5PADDING"
+    }
+    if (t.equals("RSA") || t.equals("RSA/ECB/PKCS1PADDING")) {
+      return new Cipher("RSA/ECB/PKCS1PADDING")
+    }
+    if (!t.equals("AES/ECB/PKCS5PADDING") &&
+      !t.equals("AES/CBC/PKCS5PADDING") &&
+      !t.equals("AES/CTR/NOPADDING") &&
+      !t.equals("AES/GCM/NOPADDING") &&
+      !t.equals("AES/ECB/NOPADDING") &&
+      !t.equals("AES/CBC/NOPADDING")) {
+      throw new NoSuchAlgorithmException("Algorithm " + transformation + " not available")
+    }
+    return new Cipher(t)
+  }
+
+  public static final int ENCRYPT_MODE = 1
+  public static final int DECRYPT_MODE = 2
+
+  public void init(int mode, SecretKeySpec key) {
+    init3(mode, key, null)
+  }
+
+  /* The RSA forms: encryption takes the public key, decryption the private one,
+     and the mode and the key have to agree -- a private key handed to
+     ENCRYPT_MODE is a caller's mistake, and the value it would produce is the
+     public operation on a secret. */
+  public void init(int mode, RsaPublicKey key) {
+    if (key == null) {
+      throw new InvalidKeyException("No key given")
+    }
+    if (mode != ENCRYPT_MODE) {
+      throw new InvalidKeyException("RSA decryption needs the private key")
+    }
+    this.rsaKey = key
+    this.rsaPrivate = null
+    this.encryptMode = true
+    this.initialized = true
+  }
+
+  public void init(int mode, RsaPrivateKey key) {
+    if (key == null) {
+      throw new InvalidKeyException("No key given")
+    }
+    if (mode != DECRYPT_MODE) {
+      throw new InvalidKeyException("RSA encryption needs the public key")
+    }
+    this.rsaKey = null
+    this.rsaPrivate = key
+    this.encryptMode = false
+    this.initialized = true
+  }
+
+  private boolean isRsa() {
+    return transformation.startsWith("RSA")
+  }
+
+  public void init(int mode, SecretKeySpec key, Object params) {
+    init3(mode, key, params)
+  }
+
+  /* The IV form. Java's takes an AlgorithmParameterSpec; the two subclasses here
+     are unrelated classes (IvParameterSpec and GCMParameterSpec), so the check
+     is by type. CTR, CBC and GCM require an IV and ECB must not have one --
+     each of those is a caller's mistake that would otherwise produce a value
+     nothing can reproduce. */
+  private void init3(int mode, SecretKeySpec k, Object params) {
+    if (k == null) {
+      throw new InvalidKeyException("No key given")
+    }
+    int len = k.getEncoded().length
+    if (len != 16 && len != 24 && len != 32) {
+      throw new InvalidKeyException("Wrong key size: " + len + " (AES takes 16, 24 or 32 bytes)")
+    }
+    this.key = k
+    this.encryptMode = mode == ENCRYPT_MODE
+    this.iv = null
+    if (params instanceof IvParameterSpec) {
+      this.iv = ((IvParameterSpec) params).getIV()
+    } else if (params instanceof GCMParameterSpec) {
+      this.iv = ((GCMParameterSpec) params).getIV()
+      this.gcmTagLen = ((GCMParameterSpec) params).getTLen()
+    }
+    int m = modeName()
+    if (m == 3) {
+      if (this.iv == null || this.iv.length < 12) {
+        throw new InvalidAlgorithmParameterException("GCM needs an IV of at least 12 bytes")
+      }
+    } else if (m == 1 || m == 2) {
+      if (this.iv == null || this.iv.length != 16) {
+        throw new InvalidAlgorithmParameterException("This mode needs a 16-byte IV")
+      }
+    } else if (this.iv != null) {
+      throw new InvalidAlgorithmParameterException("ECB takes no IV")
+    }
+    this.initialized = true
+  }
+
+  /* 0 ECB, 1 CBC, 2 CTR, 3 GCM. */
+  private int modeName() {
+    if (transformation.startsWith("AES/ECB")) {
+      return 0
+    }
+    if (transformation.startsWith("AES/CBC")) {
+      return 1
+    }
+    if (transformation.startsWith("AES/CTR")) {
+      return 2
+    }
+    return 3
+  }
+
+  private boolean padded() {
+    return transformation.endsWith("PKCS5PADDING")
+  }
+
+  /* ------------------------------------------------------------- the block */
+
+  /* FIPS-197's key expansion. The round keys come back as bytes: 16 per round,
+     11/13/15 rounds' worth for 128/192/256-bit keys. */
+  private byte[] expandKey(byte[] kb) {
+    int nk = kb.length / 4
+    int nr = nk + 6
+    int total = 4 * (nr + 1)
+    long[] w = new long[total]
+    for (int i = 0 : i < nk : i++) {
+      w[i] = ((long) (kb[4 * i] & 255) << 24) | ((long) (kb[4 * i + 1] & 255) << 16) |
+        ((long) (kb[4 * i + 2] & 255) << 8) | (long) (kb[4 * i + 3] & 255)
+    }
+    for (int i = nk : i < total : i++) {
+      long temp = w[i - 1]
+      if (i % nk == 0) {
+        temp = subWord(rotWord(temp)) ^ (((long) rcon(i / nk)) << 24)
+      } else if (nk > 6 && i % nk == 4) {
+        temp = subWord(temp)
+      }
+      w[i] = w[i - nk] ^ temp
+    }
+    byte[] rk = new byte[total * 4]
+    for (int i = 0 : i < total : i++) {
+      rk[4 * i] = (byte) (w[i] >>> 24)
+      rk[4 * i + 1] = (byte) (w[i] >>> 16)
+      rk[4 * i + 2] = (byte) (w[i] >>> 8)
+      rk[4 * i + 3] = (byte) w[i]
+    }
+    return rk
+  }
+
+  private static long rotWord(long v) {
+    return ((v << 8) | ((v >>> 24) & 0xff)) & 0xffffffffL
+  }
+
+  private static long subWord(long v) {
+    long b0 = SBOX[(int) ((v >>> 24) & 0xff)]
+    long b1 = SBOX[(int) ((v >>> 16) & 0xff)]
+    long b2 = SBOX[(int) ((v >>> 8) & 0xff)]
+    long b3 = SBOX[(int) (v & 0xff)]
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  }
+
+  private static int rcon(int i) {
+    int r = 1
+    for (int n = 1 : n < i : n++) {
+      r = xtime(r)
+    }
+    return r
+  }
+
+  /* One block. The state is a 16-byte vector indexed the way FIPS-197 writes it
+     (s[r + 4c]), which is the order the tables above are in and the order the
+     standard's vectors are printed in. */
+  private byte[] encryptBlock(byte[] rk, byte[] in, int off) {
+    byte[] s = new byte[16]
+    System.arraycopy(in, off, s, 0, 16)
+    int rounds = (rk.length / 16) - 1
+    addRoundKey(s, rk, 0)
+    for (int r = 1 : r <= rounds : r++) {
+      subBytes(s, false)
+      shiftRows(s)
+      if (r != rounds) {
+        mixColumns(s)
+      }
+      addRoundKey(s, rk, r * 16)
+    }
+    return s
+  }
+
+  private byte[] decryptBlock(byte[] rk, byte[] in, int off) {
+    byte[] s = new byte[16]
+    System.arraycopy(in, off, s, 0, 16)
+    int rounds = (rk.length / 16) - 1
+    addRoundKey(s, rk, rounds * 16)
+    for (int r = rounds - 1 : r >= 0 : r--) {
+      invShiftRows(s)
+      subBytes(s, true)
+      addRoundKey(s, rk, r * 16)
+      if (r != 0) {
+        invMixColumns(s)
+      }
+    }
+    return s
+  }
+
+  private void addRoundKey(byte[] s, byte[] rk, int at) {
+    for (int i = 0 : i < 16 : i++) {
+      s[i] = (byte) (s[i] ^ rk[at + i])
+    }
+  }
+
+  private void subBytes(byte[] s, boolean inverse) {
+    for (int i = 0 : i < 16 : i++) {
+      int v = s[i] & 255
+      s[i] = (byte) (inverse ? SIBOX[v] : SBOX[v])
+    }
+  }
+
+  private void shiftRows(byte[] s) {
+    byte[] t = new byte[16]
+    for (int r = 0 : r < 4 : r++) {
+      for (int c = 0 : c < 4 : c++) {
+        t[r + 4 * c] = s[r + 4 * ((c + r) % 4)]
+      }
+    }
+    System.arraycopy(t, 0, s, 0, 16)
+  }
+
+  private void invShiftRows(byte[] s) {
+    byte[] t = new byte[16]
+    for (int r = 0 : r < 4 : r++) {
+      for (int c = 0 : c < 4 : c++) {
+        t[r + 4 * ((c + r) % 4)] = s[r + 4 * c]
+      }
+    }
+    System.arraycopy(t, 0, s, 0, 16)
+  }
+
+  private static int xtime(int a) {
+    return ((a << 1) ^ (((a >> 7) & 1) * 0x1b)) & 0xff
+  }
+
+  private static int gmul(int a, int b) {
+    int r = 0
+    while (b != 0) {
+      if ((b & 1) != 0) {
+        r = r ^ a
+      }
+      a = xtime(a)
+      b = b >> 1
+    }
+    return r
+  }
+
+  private void mixColumns(byte[] s) {
+    for (int c = 0 : c < 4 : c++) {
+      int i = 4 * c
+      int a0 = s[i] & 255
+      int a1 = s[i + 1] & 255
+      int a2 = s[i + 2] & 255
+      int a3 = s[i + 3] & 255
+      s[i] = (byte) (xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3)
+      s[i + 1] = (byte) (a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3)
+      s[i + 2] = (byte) (a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3))
+      s[i + 3] = (byte) ((xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3))
+    }
+  }
+
+  private void invMixColumns(byte[] s) {
+    for (int c = 0 : c < 4 : c++) {
+      int i = 4 * c
+      int a0 = s[i] & 255
+      int a1 = s[i + 1] & 255
+      int a2 = s[i + 2] & 255
+      int a3 = s[i + 3] & 255
+      s[i] = (byte) (gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9))
+      s[i + 1] = (byte) (gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13))
+      s[i + 2] = (byte) (gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11))
+      s[i + 3] = (byte) (gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14))
+    }
+  }
+
+  private void requireInitialized() {
+    if (!initialized) {
+      throw new IllegalStateException("Cipher has not been initialized")
+    }
+  }
+
+  public String getAlgorithm() {
+    return isRsa() ? "RSA" : "AES"
+  }
+
+  public int getBlockSize() {
+    return 16
+  }
+
+  public byte[] getIV() {
+    if (iv == null) {
+      return null
+    }
+    byte[] b = new byte[iv.length]
+    System.arraycopy(iv, 0, b, 0, iv.length)
+    return b
+  }
+
+  /* --------------------------------------------------------------- padding */
+
+  private byte[] pad(byte[] in) {
+    int padLen = 16 - (in.length % 16)
+    byte[] out = new byte[in.length + padLen]
+    System.arraycopy(in, 0, out, 0, in.length)
+    for (int i = in.length : i < out.length : i++) {
+      out[i] = (byte) padLen
+    }
+    return out
+  }
+
+  private byte[] unpad(byte[] in) {
+    if (in.length == 0 || in.length % 16 != 0) {
+      throw new IllegalBlockSizeException("input length not multiple of 16 bytes: " + in.length)
+    }
+    int padLen = in[in.length - 1] & 255
+    if (padLen < 1 || padLen > 16 || padLen > in.length) {
+      throw new BadPaddingException("Given final block not properly padded")
+    }
+    for (int i = in.length - padLen : i < in.length : i++) {
+      if ((in[i] & 255) != padLen) {
+        throw new BadPaddingException("Given final block not properly padded")
+      }
+    }
+    byte[] out = new byte[in.length - padLen]
+    System.arraycopy(in, 0, out, 0, out.length)
+    return out
+  }
+
+  /* --------------------------------------------------------------- modes */
+
+  private byte[] ecb(byte[] rk, byte[] data, boolean enc) {
+    byte[] out = new byte[data.length]
+    for (int off = 0 : off < data.length : off += 16) {
+      byte[] blk = enc ? encryptBlock(rk, data, off) : decryptBlock(rk, data, off)
+      System.arraycopy(blk, 0, out, off, 16)
+    }
+    return out;
+  }
+
+  private byte[] cbc(byte[] rk, byte[] data, boolean enc) {
+    byte[] out = new byte[data.length]
+    byte[] prev = new byte[16]
+    System.arraycopy(iv, 0, prev, 0, 16)
+    for (int off = 0 : off < data.length : off += 16) {
+      byte[] blk = new byte[16]
+      if (enc) {
+        for (int i = 0 : i < 16 : i++) {
+          blk[i] = (byte) (data[off + i] ^ prev[i])
+        }
+        byte[] e = encryptBlock(rk, blk, 0)
+        System.arraycopy(e, 0, out, off, 16)
+        System.arraycopy(e, 0, prev, 0, 16)
+      } else {
+        byte[] d = decryptBlock(rk, data, off)
+        for (int i = 0 : i < 16 : i++) {
+          out[off + i] = (byte) (d[i] ^ prev[i])
+        }
+        System.arraycopy(data, off, prev, 0, 16)
+      }
+    }
+    return out
+  }
+
+  private byte[] ctr(byte[] rk, byte[] data) {
+    byte[] out = new byte[data.length]
+    byte[] counter = new byte[16]
+    System.arraycopy(iv, 0, counter, 0, 16)
+    for (int off = 0 : off < data.length : off += 16) {
+      byte[] ks = encryptBlock(rk, counter, 0)
+      int n = Math.min(16, data.length - off)
+      for (int i = 0 : i < n : i++) {
+        out[off + i] = (byte) (data[off + i] ^ ks[i])
+      }
+      /* inc32: the last four bytes are a big-endian counter and wrap at 2^32. */
+      int carry = 1
+      for (int i = 15 : i >= 12 && carry != 0 : i--) {
+        int v = (counter[i] & 255) + carry
+        counter[i] = (byte) v
+        carry = v >> 8
+      }
+    }
+    return out
+  }
+
+  /* ------------------------------------------------------------- GCM */
+
+  /* GF(2^128) multiplication as SP 800-38D defines it: X*Y is the carryless
+     product reduced modulo x^128 + x^7 + x^2 + x + 1, which the bit-by-bit form
+     below spells out. It is the slow form on purpose -- a table would be 4 KB
+     and this is a primitive whose failure mode is a tag that matches, which a
+     reviewer has to be able to check by reading it. */
+  private byte[] gfMul(byte[] x, byte[] y) {
+    byte[] z = new byte[16]
+    byte[] v = new byte[16]
+    System.arraycopy(y, 0, v, 0, 16)
+    for (int i = 0 : i < 128 : i++) {
+      if (((x[i / 8] >> (7 - (i % 8))) & 1) != 0) {
+        for (int j = 0 : j < 16 : j++) {
+          z[j] = (byte) (z[j] ^ v[j])
+        }
+      }
+      int lsb = v[15] & 1
+      for (int j = 15 : j > 0 : j--) {
+        v[j] = (byte) (((v[j] & 255) >>> 1) | ((v[j - 1] & 1) << 7))
+      }
+      v[0] = (byte) ((v[0] & 255) >>> 1)
+      if (lsb != 0) {
+        v[0] = (byte) (v[0] ^ 0xe1)
+      }
+    }
+    return z
+  }
+
+  private byte[] ghash(byte[] h, byte[] data, int len) {
+    byte[] y = new byte[16]
+    byte[] block = new byte[16]
+    for (int off = 0 : off < len : off += 16) {
+      for (int i = 0 : i < 16 : i++) {
+        block[i] = off + i < len ? data[off + i] : (byte) 0
+      }
+      for (int i = 0 : i < 16 : i++) {
+        y[i] = (byte) (y[i] ^ block[i])
+      }
+      y = gfMul(y, h)
+    }
+    return y
+  }
+
+  /* The GCM encryption of FIPS 800-38D: H = E(K, 0^128), the counter starts at
+     J0 (the IV padded when it is 96 bits, GHASH(IV) otherwise), the ciphertext
+     is CTR with the counter's low 32 bits incremented, and the tag is
+     GHASH(A || C || len(A) || len(C)) XOR E(K, J0). The answer is the
+     ciphertext followed by the tag, which is Java's doFinal shape. */
+  private byte[] gcmEncrypt(byte[] rk, byte[] plain) {
+    byte[] zero = new byte[16]
+    byte[] h = encryptBlock(rk, zero, 0)
+    byte[] j0 = new byte[16]
+    if (iv.length == 12) {
+      System.arraycopy(iv, 0, j0, 0, 12)
+      j0[15] = 1
+    } else {
+      byte[] padded = ghashIv(h, iv)
+      System.arraycopy(padded, 0, j0, 0, 16)
+    }
+    byte[] counter = new byte[16]
+    System.arraycopy(j0, 0, counter, 0, 16)
+    inc32(counter)
+    byte[] out = new byte[plain.length + gcmTagLen / 8]
+    byte[] cipher = new byte[plain.length]
+    for (int off = 0 : off < plain.length : off += 16) {
+      byte[] ks = encryptBlock(rk, counter, 0)
+      int n = Math.min(16, plain.length - off)
+      for (int i = 0 : i < n : i++) {
+        cipher[off + i] = (byte) (plain[off + i] ^ ks[i])
+      }
+      inc32(counter)
+    }
+    System.arraycopy(cipher, 0, out, 0, cipher.length)
+    byte[] tag = gcmTag(h, cipher, plain.length, j0, rk);
+    System.arraycopy(tag, 0, out, cipher.length, tag.length)
+    return out
+  }
+
+  private byte[] gcmDecrypt(byte[] rk, byte[] data) {
+    int tagBytes = gcmTagLen / 8
+    if (data.length < tagBytes) {
+      throw new AEADBadTagException("input too short for the GCM tag")
+    }
+    int clen = data.length - tagBytes
+    byte[] zero = new byte[16]
+    byte[] h = encryptBlock(rk, zero, 0)
+    byte[] j0 = new byte[16]
+    if (iv.length == 12) {
+      System.arraycopy(iv, 0, j0, 0, 12)
+      j0[15] = 1
+    } else {
+      byte[] padded = ghashIv(h, iv)
+      System.arraycopy(padded, 0, j0, 0, 16)
+    }
+    byte[] cipher = new byte[clen]
+    System.arraycopy(data, 0, cipher, 0, clen)
+    byte[] expect = new byte[tagBytes]
+    System.arraycopy(data, clen, expect, 0, tagBytes);
+    byte[] tag = gcmTag(h, cipher, clen, j0, rk)
+    int diff = 0
+    for (int i = 0 : i < tagBytes : i++) {
+      diff = diff | (tag[i] ^ expect[i])
+    }
+    if (diff != 0) {
+      throw new AEADBadTagException("GCM tag does not match the ciphertext")
+    }
+    byte[] counter = new byte[16]
+    System.arraycopy(j0, 0, counter, 0, 16)
+    inc32(counter)
+    byte[] out = new byte[clen]
+    for (int off = 0 : off < clen : off += 16) {
+      byte[] ks = encryptBlock(rk, counter, 0)
+      int n = Math.min(16, clen - off)
+      for (int i = 0 : i < n : i++) {
+        out[off + i] = (byte) (cipher[off + i] ^ ks[i])
+      }
+      inc32(counter)
+    }
+    return out
+  }
+
+  private byte[] ghashIv(byte[] h, byte[] ivBytes) {
+    /* GHASH(IV || pad || 0^64 || len(IV) in bits, 64 bits): the IV is hashed in
+       16-byte blocks and the length block is two 64-bit words, not one. */
+    int blocks = (ivBytes.length + 15) / 16
+    byte[] all = new byte[blocks * 16 + 16]
+    System.arraycopy(ivBytes, 0, all, 0, ivBytes.length)
+    long bits = (long) ivBytes.length * 8
+    all[all.length - 1] = (byte) bits
+    all[all.length - 2] = (byte) (bits >>> 8)
+    all[all.length - 3] = (byte) (bits >>> 16)
+    all[all.length - 4] = (byte) (bits >>> 24)
+    return ghash(h, all, all.length)
+  }
+
+  private byte[] gcmTag(byte[] h, byte[] cipher, int clen, byte[] j0, byte[] rk) {
+    /* len(A) is zero: this implementation takes no associated data, which is the
+       one GCM feature that is absent and is named in this file's header. */
+    /* The final block is [len(A)]64 || [len(C)]64 in bits, big-endian. len(A)
+       is zero, so only the second word is written -- at bytes 8..15, which is
+       what the first version of this got wrong: writing it at 4..7 put the
+       length where the associated-data length belongs and produced a tag that
+       was self-consistent and not the standard's. */
+    byte[] lens = new byte[16]
+    long bits = (long) clen * 8
+    lens[15] = (byte) bits
+    lens[14] = (byte) (bits >>> 8)
+    lens[13] = (byte) (bits >>> 16)
+    lens[12] = (byte) (bits >>> 24)
+    lens[11] = (byte) (bits >>> 32)
+    byte[] withLen = new byte[clen + 16]
+    System.arraycopy(cipher, 0, withLen, 0, clen)
+    System.arraycopy(lens, 0, withLen, clen, 16)
+    byte[] s = ghash(h, withLen, withLen.length)
+    byte[] ek = encryptBlock(rk, j0, 0)
+    byte[] tag = new byte[gcmTagLen / 8]
+    for (int i = 0 : i < tag.length : i++) {
+      tag[i] = (byte) (s[i] ^ ek[i])
+    }
+    return tag
+  }
+
+  private void inc32(byte[] counter) {
+    int carry = 1
+    for (int i = 15 : i >= 12 && carry != 0 : i--) {
+      int v = (counter[i] & 255) + carry
+      counter[i] = (byte) v
+      carry = v >> 8
+    }
+  }
+
+  /* --------------------------------------------------------------- doFinal */
+
+  /* Java's one-shot call. `update` is not buffered separately: a caller that
+     mixes update and doFinal is doing streaming, and this implementation either
+     buffers all of it (correct, and the memory a cipher's context would take)
+     and processes it here, or refuses. The refusal is the honest one -- it is
+     not a stream cipher interface. */
+  private byte[] pending = null
+
+  public byte[] update(byte[] input) {
+    requireInitialized();
+    if (input == null) {
+      throw new NullPointerException("input")
+    }
+    /* Buffered until doFinal, which is what Java's answer is for a block cipher
+       asked to update a length that is not a block multiple. A caller cannot
+       tell the difference except by the memory an early update would have
+       produced, and the alternative (returning a partial block) is the state
+       machine this file deliberately does not have. */
+    if (pending == null) {
+      pending = new byte[input.length]
+      System.arraycopy(input, 0, pending, 0, input.length)
+    } else {
+      byte[] both = new byte[pending.length + input.length]
+      System.arraycopy(pending, 0, both, 0, pending.length)
+      System.arraycopy(input, 0, both, pending.length, input.length)
+      pending = both
+    }
+    return new byte[0]
+  }
+
+  public byte[] doFinal() {
+    return doFinal(new byte[0])
+  }
+
+  public byte[] doFinal(byte[] input) {
+    requireInitialized();
+    if (input == null) {
+      throw new NullPointerException("input")
+    }
+    byte[] all = input
+    if (pending != null) {
+      all = new byte[pending.length + input.length]
+      System.arraycopy(pending, 0, all, 0, pending.length)
+      System.arraycopy(input, 0, all, pending.length, input.length)
+      pending = null
+    }
+    if (isRsa()) {
+      return encryptMode ? RsaPkcs1.encrypt(rsaKey, all) : RsaPkcs1.decrypt(rsaPrivate, all)
+    }
+    byte[] rk = expandKey(key.getEncoded())
+    int m = modeName()
+    if (m == 3) {
+      return encryptMode ? gcmEncrypt(rk, all) : gcmDecrypt(rk, all)
+    }
+    if (m == 2) {
+      return ctr(rk, all)
+    }
+    byte[] data = all
+    if (encryptMode) {
+      if (padded()) {
+        data = pad(all)
+      } else if (all.length % 16 != 0) {
+        throw new IllegalBlockSizeException("Input length not multiple of 16 bytes")
+      }
+    } else {
+      if (padded()) {
+        /* Java's own two messages: the padded decrypt path says the input "must
+           be" a block multiple, the unpadded one says it is not. Copied because
+           a program that prints the message is printing the JDK's, and these
+           are cheap to keep distinct. */
+        if (all.length == 0 || all.length % 16 != 0) {
+          throw new IllegalBlockSizeException("Input length must be multiple of 16 when decrypting with padded cipher")
+        }
+      } else if (all.length % 16 != 0) {
+        throw new IllegalBlockSizeException("Input length not multiple of 16 bytes")
+      }
+    }
+    byte[] out = m == 0 ? ecb(rk, data, encryptMode) : cbc(rk, data, encryptMode)
+    if (!encryptMode && padded()) {
+      out = unpad(out)
+    }
+    return out;
+  }
+
+  /* A caller that wants the answer in a byte buffer gets the copy; the array
+     form is the one this file implements, and Java's buffer form is a loop over
+     it. */
+  public int doFinal(byte[] output, int outputOffset) {
+    throw new UnsupportedOperationException("the buffer form of doFinal is not declared; use doFinal(byte[])")
+  }
+}

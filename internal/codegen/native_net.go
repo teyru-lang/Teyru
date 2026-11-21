@@ -231,6 +231,115 @@ var nativeNetTable = registerNativeNet(map[string]nativeFn{
 	},
 })
 
+// nativeProcTable is lib/50_process.teyru's C half, in tyrt_proc.c. It is the
+// same convention as the socket table above -- a negative answer is a code, a
+// non-negative one is a descriptor or a count -- with one shape that is this
+// table's own: spawn0 writes what it found into a long[] the caller owns,
+// because a function cannot answer both a descriptor and four of them.
+var nativeProcTable = registerNativeNet(map[string]nativeFn{
+	"Proc.spawn0(AString,AString,String,Z,AJ)": {
+		fn:    "ty_proc_spawn",
+		proto: "int32_t ty_proc_spawn(tyarr *, tyarr *, tystr *, int32_t, tyarr *)",
+	},
+	"Proc.wait0(J,AI)": {
+		fn:    "ty_proc_wait",
+		proto: "int32_t ty_proc_wait(int64_t, tyarr *)",
+	},
+	"Proc.poll0(J,AI)": {
+		fn:    "ty_proc_poll",
+		proto: "int32_t ty_proc_poll(int64_t, tyarr *)",
+	},
+	"Proc.kill0(J)": {
+		fn:    "ty_proc_kill",
+		proto: "int32_t ty_proc_kill(int64_t)",
+	},
+	"Proc.read0(I,AB,I,I)": {
+		fn:    "ty_proc_read",
+		proto: "int32_t ty_proc_read(int32_t, tyarr *, int32_t, int32_t)",
+	},
+	"Proc.write0(I,AB,I,I)": {
+		fn:    "ty_proc_write",
+		proto: "int32_t ty_proc_write(int32_t, tyarr *, int32_t, int32_t)",
+	},
+	"Proc.writeStr0(I,String)": {
+		fn:    "ty_proc_write_str",
+		proto: "int32_t ty_proc_write_str(int32_t, tystr *)",
+	},
+	"Proc.close0(I)": {
+		fn:    "ty_proc_close",
+		proto: "int32_t ty_proc_close(int32_t)",
+	},
+	"Proc.strerror0(I)": {
+		fn:    "ty_proc_strerror",
+		proto: "tystr *ty_proc_strerror(int32_t)",
+	},
+})
+
+// nativeNioTable is lib/51_nio.teyru's C half, in tyrt_nio.c.
+var nativeNioTable = registerNativeNet(map[string]nativeFn{
+	"Nio.openTcp0()": {fn: "ty_nio_open_tcp", proto: "int32_t ty_nio_open_tcp(void)"},
+	"Nio.openUdp0()": {fn: "ty_nio_open_udp", proto: "int32_t ty_nio_open_udp(void)"},
+	"Nio.bindUdp0(I,String,I)": {
+		fn:    "ty_nio_bind_udp",
+		proto: "int32_t ty_nio_bind_udp(int32_t, tystr *, int32_t)",
+	},
+	"Nio.listen0(I,I)": {
+		fn:    "ty_nio_listen",
+		proto: "int32_t ty_nio_listen(int32_t, int32_t)",
+	},
+	"Nio.connect0(I,String,I)": {
+		fn:    "ty_nio_connect_start",
+		proto: "int32_t ty_nio_connect_start(int32_t, tystr *, int32_t)",
+	},
+	"Nio.connected0(I)": {
+		fn:    "ty_nio_connect_finish",
+		proto: "int32_t ty_nio_connect_finish(int32_t)",
+	},
+	"Nio.accept0(I)": {fn: "ty_nio_accept", proto: "int32_t ty_nio_accept(int32_t)"},
+	"Nio.read0(I,AB,I,I)": {
+		fn:    "ty_nio_read",
+		proto: "int32_t ty_nio_read(int32_t, tyarr *, int32_t, int32_t)",
+	},
+	"Nio.writeSome0(I,AB,I,I)": {
+		fn:    "ty_nio_write_some",
+		proto: "int32_t ty_nio_write_some(int32_t, tyarr *, int32_t, int32_t)",
+	},
+	"Nio.sendTo0(I,AB,I,I,String,I)": {
+		fn:    "ty_nio_sendto",
+		proto: "int32_t ty_nio_sendto(int32_t, tyarr *, int32_t, int32_t, tystr *, int32_t)",
+	},
+	"Nio.recvFrom0(I,AB,I,I,AI)": {
+		fn:    "ty_nio_recvfrom",
+		proto: "int32_t ty_nio_recvfrom(int32_t, tyarr *, int32_t, int32_t, tyarr *)",
+	},
+	"Nio.sender0()": {fn: "ty_nio_sender0", proto: "tystr *ty_nio_sender0(void)"},
+	"Nio.poll0(AI,AI,AI,I)": {
+		fn:    "ty_nio_poll",
+		proto: "int32_t ty_nio_poll(tyarr *, tyarr *, tyarr *, int32_t)",
+	},
+	"Nio.nonBlocking0(I,Z)": {
+		fn:    "ty_nio_nonblocking",
+		proto: "int32_t ty_nio_nonblocking(int32_t, int32_t)",
+	},
+	"Nio.setBlocking0(I,Z)": {
+		fn:    "ty_nio_set_blocking",
+		proto: "int32_t ty_nio_set_blocking(int32_t, int32_t)",
+	},
+	"Nio.localPort0(I)": {
+		fn:    "ty_nio_local_port",
+		proto: "int32_t ty_nio_local_port(int32_t)",
+	},
+	"Nio.shutdownWrite0(I)": {
+		fn:    "ty_nio_shutdown_write",
+		proto: "int32_t ty_nio_shutdown_write(int32_t)",
+	},
+	"Nio.close0(I)": {fn: "ty_nio_close", proto: "int32_t ty_nio_close(int32_t)"},
+	"Nio.strerror0(I)": {
+		fn:    "ty_nio_strerror",
+		proto: "tystr *ty_nio_strerror(int32_t)",
+	},
+})
+
 // registerNativeNet adds a table to the ones native.go merges into nativeTable,
 // and returns it so that the call can stand in a variable initializer. The
 // append is the whole job; the reason it is a function is the ordering

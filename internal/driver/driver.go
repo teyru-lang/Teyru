@@ -701,6 +701,8 @@ func runtimeHash(tgt *target) string {
 		{Name: "tyrt.c", Data: []byte(tyrt.Core)},
 		{Name: "tyrt2.c", Data: []byte(tyrt.Extra)},
 		{Name: "tyrt_net.c", Data: []byte(tyrt.Net)},
+		{Name: "tyrt_proc.c", Data: []byte(tyrt.Proc)},
+		{Name: "tyrt_nio.c", Data: []byte(tyrt.NIO)},
 		{Name: "tyrt_reflect.c", Data: []byte(tyrt.Reflect)},
 		{Name: "tyrt_thread.c", Data: []byte(tyrt.Thread)},
 		{Name: "tyrt_tls.c", Data: []byte(tyrt.TLS)},
@@ -1503,6 +1505,15 @@ func writeRuntime(dir string, tgt *target, link codegen.Link) string {
 	must(os.WriteFile(c4, []byte(tyrt.Reflect), 0o644))
 	c5 := filepath.Join(dir, "tyrt_thread.c")
 	must(os.WriteFile(c5, []byte(tyrt.Thread), 0o644))
+	// The process layer: posix_spawn/CreateProcess and the pipes it talks
+	// over. Small, and always compiled: unlike the TLS file it links nothing
+	// the C library does not already provide.
+	c10 := filepath.Join(dir, "tyrt_proc.c")
+	must(os.WriteFile(c10, []byte(tyrt.Proc), 0o644))
+	// The java.nio half: datagrams, non-blocking channel I/O, and the poll a
+	// Selector is written on.
+	c11 := filepath.Join(dir, "tyrt_nio.c")
+	must(os.WriteFile(c11, []byte(tyrt.NIO), 0o644))
 	// The Unicode tables: data, not code, and generated (internal/tools/
 	// genunicode). They are compiled with every program because a program that
 	// touches a string at all may reach one of their readers, and the linker
@@ -1514,7 +1525,7 @@ func writeRuntime(dir string, tgt *target, link codegen.Link) string {
 	// business rather than the C compiler's.
 	c6 := filepath.Join(dir, tgt.platSrc)
 	must(os.WriteFile(c6, []byte(tgt.platText), 0o644))
-	files := c1 + " " + c2 + " " + c3 + " " + c4 + " " + c5 + " " + c6 + " " + c9
+	files := c1 + " " + c2 + " " + c3 + " " + c4 + " " + c5 + " " + c6 + " " + c9 + " " + c10 + " " + c11
 	// The TLS file is the one part of the runtime a build may leave out, and
 	// leaving it out is the whole point of it being a file: it includes
 	// OpenSSL's headers and calls OpenSSL's functions, so a translation unit

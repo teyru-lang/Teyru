@@ -97,9 +97,17 @@ CI は `main` への push と PR のたびに `go build`、`go vet`、`go test` 
   名前付きの例外で拒否）、そして `java.util.concurrent` の形——`Executors`、
   `ExecutorService`、`Future`、`Callable`、`CountDownLatch`、`AtomicInteger`／
   `AtomicLong`、`ConcurrentHashMap`。
-* **その他**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`CRC32`、`Adler32`、
-  deflate／inflate と gzip、`BigInteger`／`BigDecimal`、リフレクション（`java.lang.reflect` の形、
-  アノテーションのメタデータを含む）、`java.util.logging` 形のログ。
+* **暗号**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`SecureRandom`（OS の
+  CSPRNG）、`Mac`（HMAC）、`Cipher`（ECB／CBC／CTR／GCM の AES-128／192／256、RSA
+  PKCS#1 v1.5）、`Signature`（RSA 検証）、`KeyFactory`（X.509／PKCS#8 DER）。すべて Teyru で
+  書かれ、OpenSSL にはリンクしない。
+* **I/O**：同期の `Socket`／`ServerSocket` と TLS、`java.nio` の `ByteBuffer`、非ブロッキングの
+  `SocketChannel`／`ServerSocketChannel`／`DatagramChannel` と `Selector`。
+* **子プロセス**：`ProcessBuilder`／`Process`（三つのストリーム、作業ディレクトリ、環境、
+  終了コード、`destroy`）。
+* **その他**：`CRC32`、`Adler32`、deflate／inflate と gzip、`BigInteger`／`BigDecimal`、
+  リフレクション（`java.lang.reflect` の形、アノテーションのメタデータを含む）、
+  `java.util.logging` 形のログ。
 
 ## ツール
 

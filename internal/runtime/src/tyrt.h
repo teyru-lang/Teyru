@@ -1174,6 +1174,44 @@ tystr *ty_test_capture_end(void);
    rand() and not seeded from a clock. */
 int64_t ty_random_bytes_fill(tyarr *out);
 
+/* ---- java.nio -----------------------------------------------------------
+   The C half of lib/51_nio.teyru, in tyrt_nio.c: datagrams (sendto/recvfrom),
+   non-blocking reads and writes, and the readiness poll a Selector is written
+   on. The convention is tyrt_net.c's. */
+int32_t ty_nio_open_udp(void);
+int32_t ty_nio_bind_udp(int32_t fd, tystr *host, int32_t port);
+int32_t ty_nio_sendto(int32_t fd, tyarr *buf, int32_t off, int32_t len, tystr *host, int32_t port);
+int32_t ty_nio_recvfrom(int32_t fd, tyarr *buf, int32_t off, int32_t len, tyarr *out);
+tystr *ty_nio_sender0(void);
+int32_t ty_nio_close(int32_t fd);
+int32_t ty_nio_write_some(int32_t fd, tyarr *buf, int32_t off, int32_t len);
+int32_t ty_nio_read(int32_t fd, tyarr *buf, int32_t off, int32_t len);
+int32_t ty_nio_nonblocking(int32_t fd, int32_t on);
+int32_t ty_nio_poll(tyarr *fds, tyarr *events, tyarr *revents, int32_t timeout_ms);
+int32_t ty_nio_open_tcp(void);
+int32_t ty_nio_connect_start(int32_t fd, tystr *host, int32_t port);
+int32_t ty_nio_connect_finish(int32_t fd);
+int32_t ty_nio_accept(int32_t fd);
+int32_t ty_nio_listen(int32_t port, int32_t backlog);
+int32_t ty_nio_local_port(int32_t fd);
+int32_t ty_nio_set_blocking(int32_t fd, int32_t on);
+int32_t ty_nio_shutdown_write(int32_t fd);
+tystr *ty_nio_strerror(int32_t code);
+
+/* ---- processes ---------------------------------------------------------
+   The C half of ProcessBuilder, in tyrt_proc.c. The convention is tyrt_net.c's: a
+   negative answer is -errno and the Teyru half turns it into an exception;
+   ty_proc_spawn writes what it found into a long[] the caller owns. */
+int32_t ty_proc_spawn(tyarr *argv, tyarr *env, tystr *dir, int32_t merge, tyarr *out);
+int32_t ty_proc_wait(int64_t pid, tyarr *status);
+int32_t ty_proc_poll(int64_t pid, tyarr *status);
+int32_t ty_proc_kill(int64_t pid);
+int32_t ty_proc_read(int32_t fd, tyarr *buf, int32_t off, int32_t len);
+int32_t ty_proc_write(int32_t fd, tyarr *buf, int32_t off, int32_t len);
+int32_t ty_proc_write_str(int32_t fd, tystr *s);
+int32_t ty_proc_close(int32_t fd);
+tystr *ty_proc_strerror(int32_t code);
+
 /* ---- prelude helpers --------------------------------------------------- */
 void ty_clinit(tyclass *c);
 void *ty_class_of(void *o);

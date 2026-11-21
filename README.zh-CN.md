@@ -93,9 +93,15 @@ CI 在每次推送到 `main` 与每个 PR 上运行 `go build`、`go vet` 与整
   以具名异常拒绝），以及 `java.util.concurrent` 的形状——`Executors`、
   `ExecutorService`、`Future`、`Callable`、`CountDownLatch`、`AtomicInteger`／
   `AtomicLong`、`ConcurrentHashMap`。
-* **其他**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`CRC32`、`Adler32`、
-  deflate／inflate 与 gzip、`BigInteger`／`BigDecimal`、反射（`java.lang.reflect` 的形状，
-  含注解的元数据）、`java.util.logging` 形状的日志。
+* **密码学**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`SecureRandom`（系统
+  CSPRNG）、`Mac`（HMAC）、`Cipher`（AES-128／192／256 于 ECB／CBC／CTR／GCM，RSA
+  PKCS#1 v1.5）、`Signature`（RSA 验證）、`KeyFactory`（X.509／PKCS#8 DER），全部以
+  Teyru 撰写、不链接 OpenSSL。
+* **I/O**：同步的 `Socket`／`ServerSocket` 与 TLS；`java.nio` 的 `ByteBuffer`、非阻塞
+  `SocketChannel`／`ServerSocketChannel`／`DatagramChannel` 与 `Selector`。
+* **子进程**：`ProcessBuilder`／`Process`（三个流、目录、环境、退出码、`destroy`）。
+* **其他**：`CRC32`、`Adler32`、deflate／inflate 与 gzip、`BigInteger`／`BigDecimal`、
+  反射（`java.lang.reflect` 的形状，含注解的元数据）、`java.util.logging` 形状的日志。
 
 ## 工具链
 
