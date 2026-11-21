@@ -28,6 +28,64 @@ void ty_ps_print_obj(void *self, void *o);
 void ty_ps_println_obj(void *self, void *o);
 void ty_ps_println_void(void *self);
 
+/* ---- test-runner output capture ---------------------------------------
+
+   stdout is redirected by descriptor, not by FILE*: every helper in this file
+   writes through the process's stdout (and PrintStream's stream-aware twin
+   reads it), so moving fd 1 onto a temporary file captures all of them without
+   each one having to know a capture is running. The file is a tmpfile(), which
+   the CRT deletes when it is closed, so a test that dies does not leave one
+   behind. Nesting is ignored: the runner captures one test at a time. */
+static FILE *ty_capture_file;
+static int ty_capture_saved = -1;
+
+void ty_test_capture_begin(void) {
+  FILE *f;
+  int fd, saved;
+  if (ty_capture_file) return;
+  fflush(stdout);
+  f = tmpfile();
+  if (!f) return;
+  fd = typlat_fileno(f);
+  saved = typlat_dup(typlat_fileno(stdout));
+  if (fd < 0 || saved < 0 || typlat_dup2(fd, typlat_fileno(stdout)) < 0) {
+    typlat_close_fd(saved);
+    fclose(f);
+    return;
+  }
+  ty_capture_file = f;
+  ty_capture_saved = saved;
+}
+
+tystr *ty_test_capture_end(void) {
+  long n = 0;
+  char *buf = NULL;
+  tystr *out;
+  if (!ty_capture_file) return ty_str_new("", 0);
+  fflush(stdout);
+  typlat_dup2(ty_capture_saved, typlat_fileno(stdout));
+  typlat_close_fd(ty_capture_saved);
+  ty_capture_saved = -1;
+  if (fseek(ty_capture_file, 0, SEEK_END) == 0) {
+    n = ftell(ty_capture_file);
+    if (n < 0) n = 0;
+    if (fseek(ty_capture_file, 0, SEEK_SET) == 0 && n > 0) {
+      buf = (char *)malloc((size_t)n);
+      if (buf) {
+        size_t got = fread(buf, 1, (size_t)n, ty_capture_file);
+        n = (long)got;
+      } else {
+        n = 0;
+      }
+    }
+  }
+  fclose(ty_capture_file);
+  ty_capture_file = NULL;
+  out = ty_str_new(buf ? buf : "", (int64_t)n);
+  free(buf);
+  return out;
+}
+
 /* ---- class initialisation --------------------------------------------- */
 
 void ty_unimplemented(const char *what) {
@@ -280,6 +338,19 @@ double ty_max_double(double a, double b) { return a > b ? a : b; }
 double ty_min_double(double a, double b) { return a < b ? a : b; }
 int64_t ty_round(double v) { return (int64_t)floor(v + 0.5); }
 double ty_random(void) { return (double)rand() / ((double)RAND_MAX + 1.0); }
+
+/* The bytes SecureRandom produces. The array is filled in place; the number
+   answered is its length on success and the platform's negative error code
+   when there is no source, which the caller turns into an exception rather
+   than into zero bytes that look like a successful call. */
+int64_t ty_random_bytes_fill(tyarr *out) {
+  int e;
+  if (!out) return -1;
+  if (out->len <= 0) return 0;
+  e = typlat_random_bytes(out->data, (size_t)out->len);
+  if (e < 0) return (int64_t)e;
+  return out->len;
+}
 int32_t ty_isnan(double v) { return isnan(v) ? 1 : 0; }
 /* Character.isDigit and Character.isLetter are not here: they answer for the
    whole of Unicode, from the generated tables, so they live beside those tables

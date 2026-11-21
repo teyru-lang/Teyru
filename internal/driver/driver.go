@@ -1340,7 +1340,10 @@ var targets = map[string]*target{
 		// came first and the link failed with `undefined reference to
 		// __imp_WSAStartup`, which is what a -l before its user looks like.
 		ldflags: []string{"-static"},
-		sysLibs: []string{"-lws2_32"},
+		// -lbcrypt is the system CSPRNG (BCryptGenRandom), which
+		// SecureRandom's bytes come from: the Windows side has no
+		// /dev/urandom, and rand() would be a different answer.
+		sysLibs: []string{"-lws2_32", "-lbcrypt"},
 		// A catch frame is a setjmp and a throw is a longjmp, and on x86-64
 		// Windows the C library's longjmp is an *unwinding* one: it walks the
 		// stack with RtlUnwindEx from the throw to the frame setjmp recorded,

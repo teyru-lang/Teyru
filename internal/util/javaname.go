@@ -133,7 +133,7 @@ func init() {
 	}
 	for _, n := range []string{
 		"MessageDigest", "DigestException", "GeneralSecurityException",
-		"NoSuchAlgorithmException",
+		"NoSuchAlgorithmException", "SecureRandom",
 	} {
 		javaClasses[n] = "java.security." + n
 	}

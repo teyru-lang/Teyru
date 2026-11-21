@@ -1156,6 +1156,24 @@ void ty_init(void);
 tystr *ty_readln(void);
 void ty_unimplemented(const char *what) __attribute__((noreturn));
 
+/* ---- test-runner output capture ---------------------------------------
+
+   `teyru test` captures one test's stdout and prints it only when the test
+   fails. begin() sends everything written to stdout into a private temporary
+   file and end() puts stdout back and answers what was written (an empty
+   string when no capture was running). The redirection is a descriptor
+   operation, which is why it is native; the runner's generated entry point is
+   the only caller. Nested begins are a no-op: a test that calls a test helper
+   still has one capture. */
+void ty_test_capture_begin(void);
+tystr *ty_test_capture_end(void);
+
+/* ty_random_bytes_fill fills the array with bytes from the system CSPRNG and
+   answers the number filled, or a negative error code when the system has no
+   source. java.security.SecureRandom is written on it; it is deliberately not
+   rand() and not seeded from a clock. */
+int64_t ty_random_bytes_fill(tyarr *out);
+
 /* ---- prelude helpers --------------------------------------------------- */
 void ty_clinit(tyclass *c);
 void *ty_class_of(void *o);

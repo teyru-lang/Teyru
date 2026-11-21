@@ -400,6 +400,15 @@ var nativeTable = map[string]nativeFn{
 	"StringBuffer.init(I)":  {fn: "ty_sb_init", recv: "void*"},
 
 	// ---- Enum
+	// ---- the test runner's capture
+	//
+	// One test's stdout is redirected into a private file and printed only when
+	// the test fails. Both helpers are declared in tyrt.h, so no entry needs a
+	// proto.
+	"SecureRandom.fill(AB)": {fn: "ty_random_bytes_fill", recv: "tyarr*"},
+	"TestCapture.begin()":   {fn: "ty_test_capture_begin"},
+	"TestCapture.end()":     {fn: "ty_test_capture_end"},
+
 	"Enum.ordinal()":      {fn: "ty_enum_ordinal", recv: "void*"},
 	"Enum.name()":         {fn: "ty_enum_name", recv: "void*"},
 	"Enum.toString()":     {fn: "ty_enum_name", recv: "void*"},

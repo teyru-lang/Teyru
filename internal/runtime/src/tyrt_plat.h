@@ -283,4 +283,21 @@ void typlat_temp_root(char *buf, size_t n);
    choose the same name. */
 int typlat_mkdtemp(char *tpl);
 
+/* The descriptor behind a stdio stream, and the two ways to move it. The test
+   runner's output capture swaps stdout onto a temporary file and back, and
+   "swap a descriptor" is an operating system call whichever C library spells
+   it; keeping the three here is what lets tyrt2.c stay free of <unistd.h>. */
+int typlat_fileno(void *stream);
+int typlat_dup(int fd);
+int typlat_dup2(int fd, int to);
+void typlat_close_fd(int fd);
+
+/* Fill buf with n bytes from the operating system's cryptographic source --
+   getrandom, /dev/urandom, or CryptGenRandom/BCryptGenRandom. Returns 0 on
+   success and a negative error code otherwise. This is not a PRNG and it is
+   not seeded from a clock: SecureRandom is only as good as this call, and a
+   SecureRandom built on a clock-seeded generator is the defect this exists to
+   avoid. n may be zero, which answers 0 without touching buf. */
+int typlat_random_bytes(void *buf, size_t n);
+
 #endif /* TYRT_PLAT_H */

@@ -105,7 +105,7 @@ CI 在每次 push 到 `main` 與每個 PR 上跑 `go build`、`go vet` 與整套
 |---|---|
 | `teyru fmt [-w]` | 固定風格格式化；冪等，註解逐字保留，格式化前後輸出相同 |
 | `teyru lsp` | stdin/stdout 上的語言伺服器：`TY-*` 診斷與同檔定義跳轉 |
-| `teyru test` | `@Test`／`@BeforeEach`／`Assert`，結束碼 0／1／2；套件自己的 `main` 不會被呼叫 |
+| `teyru test` | `@Test`／`@BeforeEach`／`Assert`，結束碼 0／1／2；每個測試的 stdout 被捕捉、逾時指名卡住的測試、`-run`／`-tag` 選取、`@Disabled`；套件自己的 `main` 不會被呼叫。怎麼寫測試見〈測試規範〉 |
 | `teyru build -g` | 產生的 C 帶 `#line`，DWARF 指回 `.teyru`；不加 `-g` 時輸出逐位元組不變 |
 
 CI 在每次 push 與每個 PR 上跑 `go build`、`go vet` 與整套 `go test`，`CC=gcc` 那條腿每天

@@ -1,0 +1,207 @@
+package teyru
+
+/* java.security.SecureRandom and javax.crypto.Mac: the two cryptographic
+   primitives a program reaches for before it reaches for a Cipher.
+
+   What this file is, and what it is not. SecureRandom is here because the
+   runtime has a real source of bytes -- getrandom//dev/urandom on POSIX,
+   BCryptGenRandom on Windows -- and a session id, a CSRF token or a salt built
+   on java.util.Random is a value an attacker can predict from the clock. That is
+   not a theoretical difference: java.util.Random is a 48-bit linear congruential
+   generator, and two ids made in the same millisecond differ by nothing an
+   observer cannot replay. SecureRandom draws from the system instead, and it is
+   the only generator in this library that does.
+
+   Mac is HMAC (RFC 2104) over the digests this library already implements, so
+   HmacMD5, HmacSHA1, HmacSHA224, HmacSHA256, HmacSHA384 and HmacSHA512 are
+   real HMACs rather than a keyed hash invented here. Each is written as the
+   standard writes it: the key is hashed when it is longer than the block,
+   padded with ipad/opad, and the two digests are chained.
+
+   Not here, and each for a reason rather than by omission:
+
+   * Cipher, Signature, KeyStore, KeyPairGenerator and the X.509 certificate
+     factories. AES and RSA are not in this runtime: the language could reach
+     them through OpenSSL, which the TLS layer already links, but that would make
+     every program that touches crypto carry libcrypto and would put the
+     algorithm identifiers behind a C API this library has no shape for yet. A
+     named absence is cheaper than a half-built Cipher that only answers for one
+     mode.
+   * Mac's streaming form (update(byte), update(byte[],int,int), clone) and
+     init(Key, AlgorithmParameterSpec). Java's Mac is a buffered state machine;
+     this one takes the message in one call, which is what a program verifying a
+     webhook actually writes. The absent methods are absent, not pretending.
+   * SecureRandom's provider, algorithm and self-seeding surface
+     (getInstanceStrong, getAlgorithm, setSeed's state, generateSeed). There is
+     one source of bytes here and it is the operating system's; naming another
+     would be a name that resolves to the same bytes.
+
+   How this file is verified. tests/programs/t318_hmac.teyru is the same program
+   as its t318_hmac.java.ref, compiled and run on OpenJDK 21, whose output is
+   t318_hmac.expected: the six algorithms over the RFC 4231 test vectors and over
+   keys longer and shorter than the block, which is the only oracle that says
+   whether the padding and the chaining are the standard's.
+   tests/programs/t319_securerandom.teyru asserts the properties a generator can
+   be held to from inside a program -- two draws differ, the array is filled,
+   the bytes are not a constant -- and prints booleans, so it is deterministic
+   even though the bytes are not.
+
+   The seed is accepted and has no effect, which is the JDK's self-seeding
+   behaviour and is tested: two SecureRandoms with the same seed still answer
+   different values, because every derived method goes through the overridden
+   next(), which reads the system. A program that wants reproducible values must
+   not use a SecureRandom; that is the whole point of the class. */
+
+/* java.security.SecureRandom, as far as a program uses it: bytes, and the
+   Random surface built on them. The generator is the operating system's, so
+   there is no state here to reproduce and no seed to promise: seed and
+   setSeed are accepted because Java declares them and a program that configures
+   its entropy source should compile, but the value does not decide the output
+   any more than it does in the JDK's own self-seeding mode. */
+class SecureRandom extends Random {
+  public SecureRandom() {
+    super(0L)
+  }
+
+  public SecureRandom(long seed) {
+    super(seed)
+  }
+
+  /* The one call that touches the system. A negative answer is "this platform
+     has no source", which is an error and not zero bytes: a caller that got
+     zeros back for a session id would not notice. */
+  public void nextBytes(byte[] bytes) {
+    if (bytes == null) {
+      throw new NullPointerException()
+    }
+    int n = SecureRandom.fill(bytes)
+    if (n < 0) {
+      throw new IllegalStateException("the system CSPRNG is not available on this platform")
+    }
+  }
+
+  /* Random's own derivation: the top `bits` of a word taken from the system.
+     Rejection sampling is in Random.nextInt(bound), so overriding next() is all
+     SecureRandom needs to answer every method Random declares. */
+  protected int next(int bits) {
+    byte[] b = new byte[4]
+    nextBytes(b)
+    int v = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF)
+    return v >>> (32 - bits)
+  }
+
+  /* Answers how many bytes it filled, or a negative code when the system has no
+     source. Declared private because nextBytes is the surface: an int return
+     that a program had to check would be a second way to get the same bytes
+     wrong. */
+  private static native int fill(byte[] bytes)
+}
+
+/* javax.crypto.Mac: HMAC over the digests in 40_digest.teyru.
+
+   The algorithm name is resolved once, in getInstance, and the block size comes
+   with it: HMAC pads the key to the digest's block, which is 64 bytes for the
+   32-bit-word digests and 128 for the 64-bit-word ones. Getting that number
+   wrong does not fail loudly -- it produces a different, still plausible MAC --
+   so it is written as a table beside the name, not derived. */
+class Mac {
+  private static final String HMAC_MD5 = "HmacMD5"
+  private static final String HMAC_SHA1 = "HmacSHA1"
+  private static final String HMAC_SHA224 = "HmacSHA224"
+  private static final String HMAC_SHA256 = "HmacSHA256"
+  private static final String HMAC_SHA384 = "HmacSHA384"
+  private static final String HMAC_SHA512 = "HmacSHA512"
+
+  private String algorithm
+  private String digestName
+  private int blockSize
+  private byte[] key
+
+  private Mac(String algorithm, String digestName, int blockSize) {
+    this.algorithm = algorithm
+    this.digestName = digestName
+    this.blockSize = blockSize
+  }
+
+  /* Java's names, exactly: the hyphenless digest spelling is not accepted here
+     because the JDK does not accept it either, and a name that silently
+     resolved to a different MAC would be the worst failure this class has. */
+  public static Mac getInstance(String algorithm) {
+    if (algorithm == null) {
+      throw new NullPointerException("null algorithm name")
+    }
+    if (algorithm.equalsIgnoreCase(HMAC_MD5)) {
+      return new Mac(HMAC_MD5, "MD5", 64)
+    }
+    if (algorithm.equalsIgnoreCase(HMAC_SHA1)) {
+      return new Mac(HMAC_SHA1, "SHA-1", 64)
+    }
+    if (algorithm.equalsIgnoreCase(HMAC_SHA224)) {
+      return new Mac(HMAC_SHA224, "SHA-224", 64)
+    }
+    if (algorithm.equalsIgnoreCase(HMAC_SHA256)) {
+      return new Mac(HMAC_SHA256, "SHA-256", 64)
+    }
+    if (algorithm.equalsIgnoreCase(HMAC_SHA384)) {
+      return new Mac(HMAC_SHA384, "SHA-384", 128)
+    }
+    if (algorithm.equalsIgnoreCase(HMAC_SHA512)) {
+      return new Mac(HMAC_SHA512, "SHA-512", 128)
+    }
+    throw new NoSuchAlgorithmException("Algorithm " + algorithm + " not available")
+  }
+
+  public String getAlgorithm() {
+    return algorithm
+  }
+
+  /* The length of the answer, which is the digest's. */
+  public int getMacLength() {
+    return MessageDigest.getInstance(digestName).getDigestLength()
+  }
+
+  /* The key. Java copies it, so a caller that reuses its array cannot change
+     the MAC after init; this copies for the same reason. An empty key is legal
+     (RFC 2104 says the padding of one zero-length key is the zero block) and so
+     is any length. */
+  public void init(byte[] key) {
+    if (key == null) {
+      throw new IllegalArgumentException("No key given")
+    }
+    /* Java's SecretKeySpec refuses an empty key, and a Mac that accepted one
+       would answer a MAC the JDK's own API cannot produce. RFC 2104 allows a
+       zero-length key, but "what the JDK's Mac does" is the contract here. */
+    if (key.length == 0) {
+      throw new IllegalArgumentException("Empty key")
+    }
+    this.key = Arrays.copyOf(key, key.length)
+  }
+
+  public byte[] doFinal(byte[] data) {
+    if (key == null) {
+      throw new IllegalStateException("MAC not initialized")
+    }
+    if (data == null) {
+      throw new IllegalArgumentException("No input buffer given")
+    }
+    byte[] k = key
+    if (k.length > blockSize) {
+      /* A key longer than the block is replaced by its own digest, which is
+         what makes HMAC's key space the digest's rather than the block's. */
+      k = MessageDigest.getInstance(digestName).digest(k)
+    }
+    byte[] inner = new byte[blockSize + data.length]
+    byte[] outer = new byte[blockSize]
+    for (int i = 0 : i < blockSize : i++) {
+      int b = i < k.length ? (k[i] & 0xFF) : 0
+      inner[i] = (byte) (b ^ 0x36)
+      outer[i] = (byte) (b ^ 0x5c)
+    }
+    System.arraycopy(data, 0, inner, blockSize, data.length)
+    byte[] innerDigest = MessageDigest.getInstance(digestName).digest(inner)
+    byte[] joined = new byte[blockSize + innerDigest.length]
+    System.arraycopy(outer, 0, joined, 0, blockSize)
+    System.arraycopy(innerDigest, 0, joined, blockSize, innerDigest.length)
+    return MessageDigest.getInstance(digestName).digest(joined)
+  }
+}

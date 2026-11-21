@@ -109,7 +109,7 @@ CI は `main` への push と PR のたびに `go build`、`go vet`、`go test` 
 |---|---|
 | `teyru fmt [-w]` | 固定スタイルで整形。冪等で、コメントは 1 バイトも変えず、整形の前後で出力は同じ |
 | `teyru lsp` | stdin/stdout 上の言語サーバー：`TY-*` 診断と同一ファイル内の定義ジャンプ |
-| `teyru test` | `@Test`／`@BeforeEach`／`Assert`、終了コード 0／1／2。パッケージ自身の `main` は呼ばれない |
+| `teyru test` | `@Test`／`@BeforeEach`／`Assert`、終了コード 0／1／2。各テストの stdout は捕捉され、タイムアウトは固まったテストを名指しし、`-run`／`-tag` で選択、`@Disabled` でスキップ。パッケージ自身の `main` は呼ばれない。テストの書き方は「テスト規範」へ |
 | `teyru build -g` | 生成される C に `#line` が入り、DWARF が `.teyru` を指す。`-g` なしの出力はバイト単位で不変 |
 
 CI は push と PR のたびに `go build`、`go vet`、`go test` 一式を実行し、`CC=gcc` の脚は

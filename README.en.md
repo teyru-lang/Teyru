@@ -112,7 +112,7 @@ Four tools live inside the same `teyru`, not in plugins:
 |---|---|
 | `teyru fmt [-w]` | Formats in the canonical style; idempotent, comments preserved byte for byte, same program output before and after |
 | `teyru lsp` | A language server on stdin/stdout: `TY-*` diagnostics and same-file go-to-definition |
-| `teyru test` | `@Test` / `@BeforeEach` / `Assert`; exit code 0/1/2; the package's own `main` is not called |
+| `teyru test` | `@Test` / `@BeforeEach` / `Assert`; exit code 0/1/2; each test's stdout is captured, a timeout names the hung test, `-run`/`-tag` select, `@Disabled` skips; the package's own `main` is not called. Writing tests: the testing standard |
 | `teyru build -g` | The generated C carries `#line` and DWARF points back at the `.teyru`; without `-g` the output is byte-identical |
 
 CI runs `go build`, `go vet` and the whole `go test` suite on every push and pull request, and the

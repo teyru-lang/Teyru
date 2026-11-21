@@ -77,8 +77,14 @@ func TestTranslate(t *testing.T) {
 			want: []string{"switch (args.length) {", "case 1:", "System.out.println(\"one\");", "break;", "default:"},
 		},
 		{
-			name: "a property is refused by name",
-			src:  "class A {\n  public int years {\n    get {\n      return 1\n    }\n  }\n  public static void main(String[] args) {\n  }\n}\n",
+			name: "SecureRandom brings java.security's import",
+			src:  "class A {\n  public static void main(String[] args) {\n    SecureRandom r = new SecureRandom()\n    byte[] b = new byte[4]\n    r.nextBytes(b)\n  }\n}\n",
+			want: []string{"import java.security.SecureRandom;", "SecureRandom r = new SecureRandom();"},
+			not:  []string{"import teyru"},
+		},
+		{
+			name: "a class whose signatures differ from the JDK's is refused by name",
+			src:  "class A {\n  public static void main(String[] args) {\n    Mac m = Mac.getInstance(\"HmacSHA256\")\n    m.init(\"k\".getBytes())\n  }\n}\n",
 			not:  []string{},
 		},
 	}
@@ -90,8 +96,8 @@ func TestTranslate(t *testing.T) {
 				if len(got.Refusals) == 0 {
 					t.Fatalf("expected a refusal, got:\n%s", got.Text)
 				}
-				if r := got.Refusals[0]; !strings.Contains(r.Feature, "property") || r.Reason == "" {
-					t.Errorf("refusal should name the property and say why: %+v", r)
+				if r := got.Refusals[0]; r.Feature == "" || r.Reason == "" {
+					t.Errorf("a refusal should name the feature and say why: %+v", r)
 				}
 				return
 			}

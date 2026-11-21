@@ -403,3 +403,52 @@ void typlat_temp_root(char *buf, size_t n) {
 }
 
 int typlat_mkdtemp(char *tpl) { return mkdtemp(tpl) != NULL; }
+
+int typlat_fileno(void *stream) { return fileno((FILE *)stream); }
+int typlat_dup(int fd) { return dup(fd); }
+int typlat_dup2(int fd, int to) { return dup2(fd, to); }
+void typlat_close_fd(int fd) { if (fd >= 0) close(fd); }
+
+/* ------------------------------------------------------- cryptographic bytes */
+
+/* The operating system's source, and only that source: getrandom when the
+   kernel has it, /dev/urandom otherwise. There is deliberately no fallback to
+   rand() or to a clock -- a program asking for bytes it can key a session with
+   gets an error rather than a guess, because a guess is indistinguishable from
+   success at the call site. */
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
+
+int typlat_random_bytes(void *buf, size_t n) {
+  uint8_t *p = (uint8_t *)buf;
+  size_t got = 0;
+  if (n == 0) return 0;
+#if defined(__linux__)
+  while (got < n) {
+    ssize_t k = getrandom(p + got, n - got, 0);
+    if (k > 0) {
+      got += (size_t)k;
+      continue;
+    }
+    if (k < 0 && errno == EINTR) continue;
+    break; /* ENOSYS on an old kernel, or a real failure: try the file */
+  }
+  if (got == n) return 0;
+#endif
+  {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return errno ? -errno : -1;
+    while (got < n) {
+      ssize_t k = read(fd, p + got, n - got);
+      if (k <= 0) {
+        if (k < 0 && errno == EINTR) continue;
+        close(fd);
+        return errno ? -errno : -1;
+      }
+      got += (size_t)k;
+    }
+    close(fd);
+  }
+  return 0;
+}

@@ -12,33 +12,100 @@ package teyru.test
 // there is no JUnit here -- a test that imported it would be a test the
 // compiler cannot compile. The short names are what a test file writes, which
 // is what makes a test read the way a JUnit test reads.
+@interface Test {}
 
-@interface Test {
+@interface BeforeEach {}
+
+@interface AfterEach {}
+
+@interface BeforeAll {}
+
+@interface AfterAll {}
+
+/* @Disabled skips a test (or every test of a class). The reason is optional;
+   when it is there the runner prints it after the test's name, so a skipped
+   test says why it was skipped instead of disappearing. */
+@interface Disabled {
+  String value() default ""
 }
 
-@interface BeforeEach {
-}
-
-@interface AfterEach {
-}
-
-@interface BeforeAll {
-}
-
-@interface AfterAll {
+/* @Tag labels a test for selection: `teyru test -tag slow` runs only the tests
+   carrying that tag. A test without tags is not selected by -tag. */
+@interface Tag {
+  String value() default ""
 }
 
 // Assert is the assertion set. A failure is an AssertionError whose message
 // names both values, because the report a reader gets from a failing test is
 // the message and the exception, and "assertion failed" names neither.
+//
+// Every assertion has a message overload. The message is not decoration: a
+// test method is the only location a failure report names, so a table-driven
+// test has no other way to say which row failed. The message is printed before
+// the values (`message: expected ..., but was ...`), which is how Go's
+// t.Fatalf reads and the order a reader scans for.
+//
+// Arrays have their own assertion. `assertEquals(int[], int[])` cannot be
+// fixed: the Object overload compares references, so two equal arrays fail and
+// the message prints two heap addresses. assertArrayEquals compares contents
+// and prints both arrays the way Arrays.toString does.
 class Assert {
+  private static String withMessage(String message, String detail) {
+    if (message == null) {
+      return detail
+    }
+    return message + ": " + detail
+  }
+
+  /* The value and its type, when the two values are not of the same class.
+     assertEquals("1", 1) used to print "expected 1, but was 1", which names
+     neither side's type and cannot be diagnosed from the message; a
+     mismatched pair is exactly the case where the type is the answer. */
+  private static String describeValue(Object v) {
+    return String.valueOf(v)
+  }
+
+  private static String typeSuffix(Object expected, Object actual) {
+    if (expected == null || actual == null) {
+      return ""
+    }
+    String e = expected.getClass().getName()
+    String a = actual.getClass().getName()
+    if (e.equals(a)) {
+      return ""
+    }
+    return " (" + e + ")"
+  }
+
+  private static String typeSuffixActual(Object expected, Object actual) {
+    if (expected == null || actual == null) {
+      return ""
+    }
+    String e = expected.getClass().getName()
+    String a = actual.getClass().getName()
+    if (e.equals(a)) {
+      return ""
+    }
+    return " (" + a + ")"
+  }
+
   public static void fail(String message) {
     throw new AssertionError(message)
+  }
+
+  public static void fail() {
+    throw new AssertionError()
   }
 
   public static void assertTrue(boolean condition) {
     if (!condition) {
       fail("expected true, but was false")
+    }
+  }
+
+  public static void assertTrue(boolean condition, String message) {
+    if (!condition) {
+      fail(withMessage(message, "expected true, but was false"))
     }
   }
 
@@ -48,9 +115,21 @@ class Assert {
     }
   }
 
+  public static void assertFalse(boolean condition, String message) {
+    if (condition) {
+      fail(withMessage(message, "expected false, but was true"))
+    }
+  }
+
   public static void assertNull(Object actual) {
     if (actual != null) {
       fail("expected null, but was " + actual)
+    }
+  }
+
+  public static void assertNull(Object actual, String message) {
+    if (actual != null) {
+      fail(withMessage(message, "expected null, but was " + actual))
     }
   }
 
@@ -60,15 +139,26 @@ class Assert {
     }
   }
 
+  public static void assertNotNull(Object actual, String message) {
+    if (actual == null) {
+      fail(withMessage(message, "expected not null, but was null"))
+    }
+  }
+
   public static void assertEquals(Object expected, Object actual) {
+    assertEquals(expected, actual, null)
+  }
+
+  public static void assertEquals(Object expected, Object actual, String message) {
     if (expected == null) {
       if (actual != null) {
-        fail("expected null, but was " + actual)
+        fail(withMessage(message, "expected null, but was " + describeValue(actual)))
       }
       return
     }
-    if (!expected.equals(actual)) {
-      fail("expected " + expected + ", but was " + actual)
+    if (actual == null ||!expected.equals(actual)) {
+      fail(withMessage(message, "expected " + describeValue(expected) + typeSuffix(expected, actual) +
+        ", but was " + (actual == null ? "null" : describeValue(actual) + typeSuffixActual(expected, actual))))
     }
   }
 
@@ -78,9 +168,21 @@ class Assert {
     }
   }
 
+  public static void assertEquals(int expected, int actual, String message) {
+    if (expected != actual) {
+      fail(withMessage(message, "expected " + expected + ", but was " + actual))
+    }
+  }
+
   public static void assertEquals(long expected, long actual) {
     if (expected != actual) {
       fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(long expected, long actual, String message) {
+    if (expected != actual) {
+      fail(withMessage(message, "expected " + expected + ", but was " + actual))
     }
   }
 
@@ -90,18 +192,272 @@ class Assert {
     }
   }
 
+  public static void assertEquals(char expected, char actual, String message) {
+    if (expected != actual) {
+      fail(withMessage(message, "expected " + expected + ", but was " + actual))
+    }
+  }
+
   public static void assertEquals(boolean expected, boolean actual) {
     if (expected != actual) {
       fail("expected " + expected + ", but was " + actual)
     }
   }
 
+  public static void assertEquals(boolean expected, boolean actual, String message) {
+    if (expected != actual) {
+      fail(withMessage(message, "expected " + expected + ", but was " + actual))
+    }
+  }
+
   /* Doubles compare the way Double.equals does -- NaN equals NaN and the two
      zeros differ -- so a test of a computed double is not flaky on the value
-     the arithmetic actually produced. */
+     the arithmetic actually produced. A test that has a tolerance uses the
+     delta overload below. */
   public static void assertEquals(double expected, double actual) {
     if (Double.compare(expected, actual) != 0) {
       fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(double expected, double actual, String message) {
+    if (Double.compare(expected, actual) != 0) {
+      fail(withMessage(message, "expected " + expected + ", but was " + actual))
+    }
+  }
+
+  /* Java's delta form: the two values are equal when the distance between them
+     is at most delta, and an exact match passes even when the arithmetic
+     produced the same non-finite value (NaN compares unequal to itself).
+     A negative delta is a caller's mistake and says so. */
+  public static void assertEquals(double expected, double actual, double delta) {
+    assertEquals(expected, actual, delta, null)
+  }
+
+  public static void assertEquals(double expected, double actual, double delta, String message) {
+    if (delta < 0 || delta != delta) {
+      fail(withMessage(message, "delta must be non-negative and not NaN: " + delta))
+    }
+    if (Double.compare(expected, actual) == 0) {
+      return
+    }
+    if (Math.abs(expected - actual) <= delta) {
+      return
+    }
+    fail(withMessage(message, "expected " + expected + ", but was " + actual + " (delta " + delta + ")"))
+  }
+
+  public static void assertEquals(float expected, float actual) {
+    if (Float.compare(expected, actual) != 0) {
+      fail("expected " + expected + ", but was " + actual)
+    }
+  }
+
+  public static void assertEquals(float expected, float actual, String message) {
+    if (Float.compare(expected, actual) != 0) {
+      fail(withMessage(message, "expected " + expected + ", but was " + actual))
+    }
+  }
+
+  public static void assertEquals(float expected, float actual, float delta) {
+    assertEquals(expected, actual, delta, null)
+  }
+
+  public static void assertEquals(float expected, float actual, float delta, String message) {
+    if (delta < 0 || delta != delta) {
+      fail(withMessage(message, "delta must be non-negative and not NaN: " + delta))
+    }
+    if (Float.compare(expected, actual) == 0) {
+      return
+    }
+    if (Math.abs(expected - actual) <= delta) {
+      return
+    }
+    fail(withMessage(message, "expected " + expected + ", but was " + actual + " (delta " + delta + ")"))
+  }
+
+  public static void assertNotEquals(Object unexpected, Object actual) {
+    assertNotEquals(unexpected, actual, null)
+  }
+
+  public static void assertNotEquals(Object unexpected, Object actual, String message) {
+    if (Objects.equals(unexpected, actual)) {
+      fail(withMessage(message, "expected not equal to " + describeValue(unexpected) + ", but was equal"))
+    }
+  }
+
+  public static void assertNotEquals(int unexpected, int actual) {
+    if (unexpected == actual) {
+      fail("expected not equal to " + unexpected + ", but was equal")
+    }
+  }
+
+  public static void assertNotEquals(int unexpected, int actual, String message) {
+    if (unexpected == actual) {
+      fail(withMessage(message, "expected not equal to " + unexpected + ", but was equal"))
+    }
+  }
+
+  public static void assertNotEquals(long unexpected, long actual) {
+    if (unexpected == actual) {
+      fail("expected not equal to " + unexpected + ", but was equal")
+    }
+  }
+
+  public static void assertNotEquals(long unexpected, long actual, String message) {
+    if (unexpected == actual) {
+      fail(withMessage(message, "expected not equal to " + unexpected + ", but was equal"))
+    }
+  }
+
+  public static void assertNotEquals(double unexpected, double actual) {
+    if (Double.compare(unexpected, actual) == 0) {
+      fail("expected not equal to " + unexpected + ", but was equal")
+    }
+  }
+
+  public static void assertNotEquals(double unexpected, double actual, String message) {
+    if (Double.compare(unexpected, actual) == 0) {
+      fail(withMessage(message, "expected not equal to " + unexpected + ", but was equal"))
+    }
+  }
+
+  public static void assertNotEquals(char unexpected, char actual) {
+    if (unexpected == actual) {
+      fail("expected not equal to " + unexpected + ", but was equal")
+    }
+  }
+
+  public static void assertNotEquals(boolean unexpected, boolean actual) {
+    if (unexpected == actual) {
+      fail("expected not equal to " + unexpected + ", but was equal")
+    }
+  }
+
+  /* Identity. `==` on two objects is the same reference, which assertEquals
+     cannot say: equal strings are frequently different objects. */
+  public static void assertSame(Object expected, Object actual) {
+    assertSame(expected, actual, null)
+  }
+
+  public static void assertSame(Object expected, Object actual, String message) {
+    if (expected != actual) {
+      fail(withMessage(message, "expected same reference " + describeValue(expected) +
+        ", but was " + describeValue(actual)))
+    }
+  }
+
+  public static void assertNotSame(Object unexpected, Object actual) {
+    assertNotSame(unexpected, actual, null)
+  }
+
+  public static void assertNotSame(Object unexpected, Object actual, String message) {
+    if (unexpected == actual) {
+      fail(withMessage(message, "expected a different reference, but both were " + describeValue(actual)))
+    }
+  }
+
+  /* Arrays compare by contents, and the message prints both arrays rather than
+     their identities. The overloads are per element type so that the call
+     binds here instead of to the Object overload; a program that passes two
+     arrays to assertEquals gets the Object one, which is why this family is
+     named separately. */
+  public static void assertArrayEquals(int[] expected, int[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(int[] expected, int[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(long[] expected, long[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(long[] expected, long[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(char[] expected, char[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(char[] expected, char[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(byte[] expected, byte[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(byte[] expected, byte[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(short[] expected, short[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(short[] expected, short[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(boolean[] expected, boolean[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(boolean[] expected, boolean[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(float[] expected, float[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(float[] expected, float[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(double[] expected, double[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(double[] expected, double[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
+    }
+  }
+
+  public static void assertArrayEquals(Object[] expected, Object[] actual) {
+    assertArrayEquals(expected, actual, null)
+  }
+
+  public static void assertArrayEquals(Object[] expected, Object[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      fail(withMessage(message, "expected " + Arrays.toString(expected) +
+        ", but was " + Arrays.toString(actual)))
     }
   }
 
@@ -109,8 +465,12 @@ class Assert {
      the message or a field of the exception it expected. A different
      exception is a failure, and the message says which one arrived. */
   public static Throwable assertThrows(Class expected, Runnable action) {
+    return assertThrows(expected, action, null)
+  }
+
+  public static Throwable assertThrows(Class expected, Runnable action, String message) {
     if (expected == null) {
-      fail("expected exception class is null")
+      fail(withMessage(message, "expected exception class is null"))
     }
     try {
       action.run()
@@ -118,11 +478,59 @@ class Assert {
       if (expected.isInstance(t)) {
         return t
       }
-      fail("expected " + expected.getName() + ", but was " + t.toString())
+      fail(withMessage(message, "expected " + expected.getName() + ", but was " + t.toString()))
     }
-    fail("expected " + expected.getName() + ", but nothing was thrown")
+    fail(withMessage(message, "expected " + expected.getName() + ", but nothing was thrown"))
     return null
   }
+
+  /* The action must finish without throwing. It is the positive twin of
+     assertThrows: a test that only cares that a call is accepted need not wrap
+     it in a try/catch of its own. */
+  public static void assertDoesNotThrow(Runnable action) {
+    assertDoesNotThrow(action, null)
+  }
+
+  public static void assertDoesNotThrow(Runnable action, String message) {
+    try {
+      action.run()
+    } catch (Throwable t) {
+      fail(withMessage(message, "expected no exception, but was " + t.toString()))
+    }
+  }
+
+  /* Run every action even when one fails, then report them together. JUnit's
+     assertAll exists so that a test of several independent properties reports
+     all the broken ones in one run instead of one per fix. The count in the
+     first line is the number of failures; each line names the action's index,
+     because the actions in a table-driven test are the rows. */
+  public static void assertAll(Runnable...actions) {
+    int failures = 0
+    StringBuilder report = new StringBuilder()
+    for (int i = 0 : i < actions.length : i++) {
+      try {
+        actions[i].run()
+      } catch (Throwable t) {
+        failures++
+        report.append("\n  [" + (i + 1) + "] " + TestReport.message(t))
+      }
+    }
+    if (failures > 0) {
+      fail("multiple failures (" + failures + " of " + actions.length + ")" + report.toString())
+    }
+  }
+}
+
+/* TestCapture is the runner's stdout redirection: begin() sends everything
+   written to stdout into a private file, and end() restores stdout and returns
+   what was written. The generated entry point calls it around each test so a
+   test that prints cannot corrupt the report the runner is writing, and so the
+   output is printed only when the test fails (or under -v). The methods are
+   native because redirecting a file descriptor is a runtime operation, not
+   something the language can express. */
+class TestCapture {
+  public static native void begin()
+  public static native String end()
 }
 
 // TestReport is the runner's formatting, not an assertion: the generated entry
@@ -142,5 +550,20 @@ class TestReport {
   /* The exception line under it: Java's toString, class name and message. */
   public static String describe(Throwable t) {
     return t.toString()
+  }
+
+  /* Print the output a test captured, if it captured anything. The first line
+     says where the text came from, because a run with several failing tests
+     prints several of these and the reader has to know which FAIL line above
+     it the text belongs to. Nothing is printed for an empty capture. */
+  public static void output(String captured) {
+    if (captured == null || captured.length() == 0) {
+      return
+    }
+    System.out.print("output: ")
+    System.out.print(captured)
+    if (!captured.endsWith("\n")) {
+      System.out.println()
+    }
   }
 }

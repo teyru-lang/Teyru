@@ -168,6 +168,17 @@ func init() {
 	}
 	refuseStdlib["Logger"] = logging
 	refuseStdlib["Log"] = logging
+	/* The three whose signatures differ from the JDK's rather than whose class
+	   does: Mac.init takes Key rather than a byte[], and Semaphore.tryAcquire
+	   and ReentrantLock.tryLock take milliseconds rather than a TimeUnit --
+	   this library has no TimeUnit, as its own concurrency page says. A
+	   program naming one of them is refused by name instead of being printed
+	   into a program javac rejects for a reason the reader has to reconstruct. */
+	timeUnits := "the class is java.util.concurrent's, but this library has no TimeUnit: the timed forms take milliseconds"
+	for _, n := range []string{"Semaphore", "ReentrantLock"} {
+		refuseStdlib[n] = timeUnits
+	}
+	refuseStdlib["Mac"] = "javax.crypto.Mac takes a Key here where this library's takes the bytes: there is no Key interface"
 	for _, n := range []string{"Reflect", "Annotation", "Array"} {
 		if _, isJava := util.JavaClassOf(n); !isJava {
 			refuseStdlib[n] = reflect

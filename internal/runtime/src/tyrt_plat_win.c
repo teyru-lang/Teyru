@@ -49,6 +49,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <bcrypt.h>
 
 /* The first of the Winsock error codes. Everything above it is WSA*, everything
    below it is a C library errno, and the two spaces do not overlap. */
@@ -383,6 +384,23 @@ int typlat_socket_name(int32_t fd, int peer, struct sockaddr *addr, int *len) {
   int r = peer ? getpeername(as_socket(fd), addr, &slen) : getsockname(as_socket(fd), addr, &slen);
   if (r == SOCKET_ERROR) return neg_wsa();
   *len = slen;
+  return 0;
+}
+
+int typlat_fileno(void *stream) { return _fileno((FILE *)stream); }
+int typlat_dup(int fd) { return _dup(fd); }
+int typlat_dup2(int fd, int to) { return _dup2(fd, to); }
+void typlat_close_fd(int fd) { if (fd >= 0) _close(fd); }
+
+/* ------------------------------------------------------- cryptographic bytes */
+
+/* BCryptGenRandom is the system CSPRNG. The flags say neither to use a key
+   nor to supply one: this is the same generator CryptGenRandom was, behind the
+   modern name, and it needs no WSAStartup or CryptoAPI provider handle. */
+int typlat_random_bytes(void *buf, size_t n) {
+  if (n == 0) return 0;
+  NTSTATUS st = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (st < 0) return -1;
   return 0;
 }
 

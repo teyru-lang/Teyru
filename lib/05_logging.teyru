@@ -1,23 +1,507 @@
 package teyru
 
+/* java.util.logging, as far as a program actually configures: a level per
+   logger, a level per handler, a formatter that decides the shape of a line, and
+   a root handler that everything inherits.
+
+   Why this file exists at all. The logger it replaces was 23 lines of
+   System.out.println with the level spelled in the text, which cannot be turned
+   down: a library's debug line prints on production traffic because there is no
+   switch to turn it off, and a program that wants only warnings has to edit the
+   library. A logger with a level is the smallest thing that fixes that.
+
+   The design is the JDK's, and deliberately no more than it:
+
+     * Logger.getLogger(name) hands out one shared logger per name. A logger
+       with a null level inherits from its parent in the dotted-name hierarchy,
+       the way java.util.logging.DemandedLogger does, and the root is named "".
+     * A LogHandler is where a line goes; ConsoleHandler writes to stderr and
+       StreamHandler writes to a PrintStream the caller passes. Both apply their
+       own level before formatting, so a program can log DEBUG at INFO without a
+       handler change and still keep the debug line for a test.
+     * A Formatter decides the text. SimpleFormatter is the one-line shape
+       ("LEVEL logger message", exception on the next lines) and JsonFormatter
+       is a single line of JSON, which is what a log shipper parses.
+     * The global level, Logger.setGlobalLevel, applies to every logger that has
+       not set its own, which is how a program changes the level of its
+       dependencies without knowing their names.
+
+   What is not here, and why: no Appender graph, no rotation, no async queue.
+   Those belong to a logging framework built on top of this; a standard library
+   that shipped them would be choosing a framework. java.util.logging's own
+   handler hierarchy is also absent -- its MemoryHandler, FileHandler and
+   SocketHandler -- because ConsoleHandler and StreamHandler cover the two
+   destinations a program sets up in code, and the rest are configuration.
+
+   How this file is verified. tests/programs/t320_logging.teyru drives every
+   level, the inheritance through dotted names, the global level, both
+   formatters and both handlers, and prints what each one wrote. The expected
+   output is the JDK's SimpleFormatter shape where the shape is shared and this
+   file's own where it is not (JsonFormatter has no JDK counterpart). */
+
+/* LogLevel is a level, in java.util.logging's seven steps and its order.
+   Plain ints rather than an enum because the file predates this library's enums
+   mattering here and a level is compared far more often than it is named. */
+class LogLevel {
+  public static final int OFF = Integer.MAX_VALUE
+  public static final int SEVERE = 1000
+  public static final int WARNING = 900
+  public static final int INFO = 800
+  public static final int CONFIG = 700
+  public static final int FINE = 500
+  public static final int FINER = 400
+  public static final int FINEST = 300
+  public static final int ALL = Integer.MIN_VALUE
+
+  /* The name a formatter prints, which is java.util.logging.Level's. */
+  public static String name(int level) {
+    if (level == OFF) {
+      return "OFF"
+    }
+    if (level >= SEVERE) {
+      return "SEVERE"
+    }
+    if (level >= WARNING) {
+      return "WARNING"
+    }
+    if (level >= INFO) {
+      return "INFO"
+    }
+    if (level >= CONFIG) {
+      return "CONFIG"
+    }
+    if (level >= FINE) {
+      return "FINE"
+    }
+    if (level >= FINER) {
+      return "FINER"
+    }
+    return "FINEST"
+  }
+}
+
+/* LogRecord is one line waiting to be formatted: the level, the logger, the
+   message and the throwable, because a formatter that had to reach back into
+   the logger would be a formatter that cannot be handed a record. */
+class LogRecord {
+  public int level
+  public String loggerName
+  public String message
+  public Throwable thrown
+
+  public LogRecord(int level, String loggerName, String message, Throwable thrown) {
+    this.level = level
+    this.loggerName = loggerName
+    this.message = message
+    this.thrown = thrown
+  }
+}
+
+/* LogFormatter decides the text of a record. format returns the line without its
+   terminating newline; a handler appends it, so a formatter can be tested by
+   comparing strings. */
+abstract class LogFormatter {
+  public abstract String format(LogRecord r)
+
+  /* The stack of a throwable is not available here -- Throwable has no
+     getStackTrace -- so the text is the throwable's toString (its type and its
+     message), on its own line, indented as the JDK's SimpleFormatter indents
+     it. */
+  protected String throwableText(LogRecord r) {
+    if (r.thrown == null) {
+      return ""
+    }
+    return "\n" + r.thrown.toString()
+  }
+}
+
+/* The one-line shape: LEVEL logger message, and the exception after it. There is
+   no timestamp, deliberately: a timestamp makes every test that prints a log
+   line non-deterministic, and the JDK's SimpleFormatter carries one. A program
+   that wants time adds it with its own LogFormatter, which is why LogFormatter is
+   abstract and public. */
+class SimpleFormatter extends LogFormatter {
+  public String format(LogRecord r) {
+    return LogLevel.name(r.level) + " " + r.loggerName + " " + r.message + throwableText(r)
+  }
+}
+
+/* One line of JSON per record. The fields are the ones a shipper indexes on:
+   level, logger, message, and exception when there is one. Quotes and control
+   characters are escaped the way JSON requires, because a log line is parsed by
+   something and a message with a quote in it must not break the parse. */
+class JsonFormatter extends LogFormatter {
+  public String format(LogRecord r) {
+    StringBuilder b = new StringBuilder()
+    b.append("{\"level\":\"" + LogLevel.name(r.level) + "\",\"logger\":\"")
+    escape(b, r.loggerName)
+    b.append("\",\"message\":\"")
+    escape(b, r.message)
+    b.append("\"")
+    if (r.thrown != null) {
+      b.append(",\"exception\":\"")
+      escape(b, r.thrown.toString())
+      b.append("\"")
+    }
+    b.append("}")
+    return b.toString()
+  }
+
+  private void escape(StringBuilder b, String s) {
+    if (s == null) {
+      return
+    }
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c == '"') {
+        b.append("\\\"")
+      } else if (c == '\\') {
+        b.append("\\\\")
+      } else if (c == '\n') {
+        b.append("\\n")
+      } else if (c == '\r') {
+        b.append("\\r")
+      } else if (c == '\t') {
+        b.append("\\t")
+      } else if (c < 0x20) {
+        b.append("\\u00")
+        b.append("0123456789abcdef".charAt((c >> 4) & 0xF))
+        b.append("0123456789abcdef".charAt(c & 0xF))
+      } else {
+        b.append(c)
+      }
+    }
+  }
+}
+
+/* A destination. publish checks its own level before formatting, so a handler
+   can be stricter than its logger and a program can keep the debug lines for a
+   test without raising the logger's level. */
+abstract class LogHandler {
+  public int level = LogLevel.ALL
+  public LogFormatter formatter = new SimpleFormatter()
+
+  public abstract void publish(LogRecord r)
+
+  public void setLevel(int level) {
+    this.level = level
+  }
+
+  public int getLevel() {
+    return this.level
+  }
+
+  public void setFormatter(LogFormatter f) {
+    if (f == null) {
+      throw new NullPointerException("formatter")
+    }
+    this.formatter = f
+  }
+
+  public LogFormatter getFormatter() {
+    return this.formatter
+  }
+}
+
+/* The Lombok shape: LEVEL name - message, on stdout. This is what
+   `new Logger("Name")` -- the field @Log and its siblings generate -- writes,
+   and keeping its text is what keeps every program that annotates a class and
+   logs from it working. Configured loggers use SimpleFormatter or
+   JsonFormatter; this one is the default the legacy constructor installs. */
+class PlainFormatter extends LogFormatter {
+  public String format(LogRecord r) {
+    return LogLevel.name(r.level) + " " + r.loggerName + " - " + r.message + throwableText(r)
+  }
+}
+
+/* Writes to stderr: java.util.logging's ConsoleHandler. A logger's output going
+   to stdout would interleave with what the program is printing, which is the
+   opposite of what a log is for. */
+class ConsoleHandler extends LogHandler {
+  public void publish(LogRecord r) {
+    if (r.level < this.level) {
+      return
+    }
+    System.err.println(this.formatter.format(r))
+  }
+}
+
+/* Writes to a stream the caller names. This is what a test uses to capture the
+   lines and what a program uses to send them anywhere else. */
+class StreamHandler extends LogHandler {
+  private PrintStream out
+
+  public StreamHandler(PrintStream out) {
+    if (out == null) {
+      throw new NullPointerException("out")
+    }
+    this.out = out
+  }
+
+  public void publish(LogRecord r) {
+    if (r.level < this.level) {
+      return
+    }
+    this.out.println(this.formatter.format(r))
+  }
+}
+
+/* The logger itself. A level of ALL means "everything"; a logger created with
+   getLogger inherits, and only setLevel breaks the inheritance for that logger
+   and its dotted children that have not set their own. */
 class Logger {
+  /* The level that every logger with no level of its own inherits. ALL is the
+     JDK's information-level default made explicit; a program that ships raises
+     it, and a test lowers it. */
+  public static int globalLevel = LogLevel.INFO
+
+  private static Map<String, Logger> loggers = new HashMap<String, Logger>()
+
   private String name
+  /* hasLevel separates "this logger was configured" from "it inherits": ALL is
+     a level like any other (it means everything), so it cannot also be the
+     sentinel for unset. */
+  private boolean hasLevel
+  private int level = LogLevel.ALL
+  private LogHandler handler
+  /* True for a logger the legacy constructor made: it writes to stdout in the
+     PlainFormatter shape when nothing in its chain has a handler, which is what
+     @Log's generated field did before handlers existed. */
+  private boolean legacy
+
+  /* The constructor @Log and its siblings generate. A logger made this way is
+     the shared logger of that name, and when nothing has configured it yet it
+     writes to stdout at INFO in the shape those annotations have always
+     produced (PlainFormatter). A program that wants the lines somewhere else,
+     or at another level, calls setHandler/setLevel on the same object --
+     getLogger(name) answers it. */
   public Logger(String name) {
-    this.name = name
+    if (name == null) {
+      name = ""
+    }
+    Logger prior = loggers.get(name)
+    if (prior == null) {
+      this.name = name
+      this.legacy = true
+      loggers.put(name, this)
+    } else {
+      this.name = prior.name
+      this.level = prior.level
+      this.hasLevel = prior.hasLevel
+      this.handler = prior.handler
+      this.legacy = prior.legacy
+    }
   }
-  public void trace(String msg) {
-    System.out.println("TRACE " + name + " - " + msg)
+
+  /* One logger per name, which is what makes getLogger("a.b") called from two
+     places the same object. The map is not synchronized: a logger is created at
+     class-initialisation time, which the runtime serialises, and a program that
+     creates one per request has a different problem. */
+  public static Logger getLogger(String name) {
+    if (name == null) {
+      name = ""
+    }
+    Logger l = loggers.get(name)
+    if (l == null) {
+      l = new Logger(name)
+    }
+    return l
   }
-  public void debug(String msg) {
-    System.out.println("DEBUG " + name + " - " + msg)
+
+  /* The root logger, which is every logger's ancestor. */
+  public static Logger getRootLogger() {
+    return getLogger("")
   }
-  public void info(String msg) {
-    System.out.println("INFO " + name + " - " + msg)
+
+  /* Raises or lowers every logger that has not set a level of its own. This is
+     the switch a program uses on its dependencies: it does not know their names
+     and does not need to. */
+  public static void setGlobalLevel(int level) {
+    globalLevel = level
   }
-  public void warn(String msg) {
-    System.out.println("WARN " + name + " - " + msg)
+
+  public static int getGlobalLevel() {
+    return globalLevel
   }
-  public void error(String msg) {
-    System.out.println("ERROR " + name + " - " + msg)
+
+  public String getName() {
+    return name
+  }
+
+  /* The level that applies, which is this logger's own or the one it inherits:
+     a reader asks what will be printed, not who configured it. isLoggable
+     compares against the same answer. */
+  public int getLevel() {
+    return hasLevel ? level : effectiveLevel()
+  }
+
+  public void setLevel(int level) {
+    this.level = level
+    this.hasLevel = true
+  }
+
+  /* Whether at least one record of this level would reach a handler: the level
+     chain, then the handler's own level. A logger with no handler still answers
+     by the level, because the handlers it would inherit may exist. */
+  public boolean isLoggable(int level) {
+    return level >= effectiveLevel()
+  }
+
+  /* The first level the dotted-name chain answers with. A logger that set its
+     own stops the search, which is what makes "com.example" at WARNING silence
+     "com.example.internal" unless the latter sets its own. */
+  private int effectiveLevel() {
+    Logger l = this
+    while (l != null) {
+      if (l.hasLevel) {
+        return l.level
+      }
+      l = l.parentOf()
+    }
+    return globalLevel
+  }
+
+  private Logger parentOf() {
+    String n = this.name
+    int dot = n.lastIndexOf('.')
+    if (dot < 0) {
+      if (n.length() == 0) {
+        return null
+      }
+      return getLogger("")
+    }
+    return getLogger(n.substring(0, dot))
+  }
+
+  public void setHandler(LogHandler h) {
+    this.handler = h
+  }
+
+  public LogHandler getHandler() {
+    return this.handler
+  }
+
+  /* The handler this logger writes through: its own if it has one, otherwise
+     its ancestors'. A logger with none anywhere writes nowhere, which is the
+     one place java.util.logging's root-handler default differs -- there is no
+     default root handler here, because a library that quietly writes to stderr
+     is the behaviour this file exists to make configurable. */
+  private LogHandler effectiveHandler() {
+    Logger l = this
+    while (l != null) {
+      if (l.handler != null) {
+        return l.handler
+      }
+      if (l.legacy) {
+        return Logger.defaultHandler()
+      }
+      l = l.parentOf()
+    }
+    return null
+  }
+
+  private static LogHandler fallback
+
+  /* The handler a legacy logger writes through when nothing configured one:
+     stdout, PlainFormatter, at the logger's level. Created once, so every such
+     logger shares it. */
+  private static LogHandler defaultHandler() {
+    if (fallback == null) {
+      StreamHandler h = new StreamHandler(System.out)
+      h.setFormatter(new PlainFormatter())
+      fallback = h
+    }
+    return fallback
+  }
+
+  public void log(int level, String message) {
+    log(level, message, null)
+  }
+
+  public void log(int level, String message, Throwable thrown) {
+    if (!isLoggable(level)) {
+      return
+    }
+    LogHandler h = effectiveHandler()
+    if (h == null) {
+      return
+    }
+    h.publish(new LogRecord(level, this.name, message, thrown))
+  }
+
+  public void severe(String message) {
+    log(LogLevel.SEVERE, message)
+  }
+
+  public void severe(String message, Throwable thrown) {
+    log(LogLevel.SEVERE, message, thrown)
+  }
+
+  public void warning(String message) {
+    log(LogLevel.WARNING, message)
+  }
+
+  public void warning(String message, Throwable thrown) {
+    log(LogLevel.WARNING, message, thrown)
+  }
+
+  public void info(String message) {
+    log(LogLevel.INFO, message)
+  }
+
+  public void info(String message, Throwable thrown) {
+    log(LogLevel.INFO, message, thrown)
+  }
+
+  public void config(String message) {
+    log(LogLevel.CONFIG, message)
+  }
+
+  public void config(String message, Throwable thrown) {
+    log(LogLevel.CONFIG, message, thrown)
+  }
+
+  /* The names Lombok's @Log family maps onto java.util.logging: trace is
+     FINER, debug is FINE, warn is WARNING, error is SEVERE. They are here so
+     that the field those annotations generate is usable without a translation
+     table in the reader's head. */
+  public void trace(String message) {
+    log(LogLevel.FINER, message)
+  }
+
+  public void debug(String message) {
+    log(LogLevel.FINE, message)
+  }
+
+  public void warn(String message) {
+    log(LogLevel.WARNING, message)
+  }
+
+  public void warn(String message, Throwable thrown) {
+    log(LogLevel.WARNING, message, thrown)
+  }
+
+  public void error(String message) {
+    log(LogLevel.SEVERE, message)
+  }
+
+  public void error(String message, Throwable thrown) {
+    log(LogLevel.SEVERE, message, thrown)
+  }
+
+  public void fine(String message) {
+    log(LogLevel.FINE, message)
+  }
+
+  public void fine(String message, Throwable thrown) {
+    log(LogLevel.FINE, message, thrown)
+  }
+
+  public void finer(String message) {
+    log(LogLevel.FINER, message)
+  }
+
+  public void finest(String message) {
+    log(LogLevel.FINEST, message)
   }
 }

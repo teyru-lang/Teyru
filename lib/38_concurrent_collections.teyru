@@ -139,8 +139,7 @@ class CountDownLatch {
 class AtomicInteger {
   private int value
 
-  public AtomicInteger() {
-  }
+  public AtomicInteger() {}
 
   public AtomicInteger(int initialValue) {
     this.value = initialValue
@@ -200,8 +199,7 @@ class AtomicInteger {
 class AtomicLong {
   private long value
 
-  public AtomicLong() {
-  }
+  public AtomicLong() {}
 
   public AtomicLong(long initialValue) {
     this.value = initialValue
@@ -338,5 +336,328 @@ class ConcurrentHashMap<K, V> {
   /* Java's map toString: {k=v, k=v}. */
   public synchronized String toString() {
     return this.map.toString()
+  }
+}
+
+/* java.util.concurrent.Semaphore: a count of permits, acquired and released.
+ *
+ * The count lives under the semaphore's own monitor and every waiter is inside
+ * Object.wait on that same monitor, so a release that raises the count above
+ * zero wakes everyone and each waiter re-tests the count before taking one.
+ * That re-test is what makes a wake-up that arrives for another reason cost a
+ * loop rather than a lost permit.
+ *
+ * No fairness. Java's fair semaphore hands permits out in arrival order; this
+ * one does not promise an order at all, which is also what Java's unfair
+ * constructor means, and the tests do not depend on one. */
+class Semaphore {
+  private int permits
+
+  public Semaphore(int permits) {
+    if (permits < 0) {
+      throw new IllegalArgumentException("permits must be non-negative: " + permits)
+    }
+    this.permits = permits
+  }
+
+  public Semaphore(int permits, boolean fair) {
+    this(permits)
+    /* fair is accepted and ignored, and the class comment says why: this
+       semaphore has no queue, and a constructor that silently did nothing would
+       be worse if it did not say so. */
+  }
+
+  public void acquire() {
+    synchronized (this) {
+      while (this.permits <= 0) {
+        this.wait(-1L)
+      }
+      this.permits = this.permits - 1
+    }
+  }
+
+  /* Take a permit if there is one, without waiting. */
+  public boolean tryAcquire() {
+    synchronized (this) {
+      if (this.permits <= 0) {
+        return false
+      }
+      this.permits = this.permits - 1
+      return true
+    }
+  }
+
+  /* Wait up to millis for a permit; false when it never came. The deadline and
+     the re-test are the CountDownLatch's, for the same reason: a notify that
+     was not for this condition must not turn into a lost permit. */
+  public boolean tryAcquire(long millis) {
+    long deadline = System.nanoTime() + millis * 1000000L
+    synchronized (this) {
+      while (this.permits <= 0) {
+        long left = deadline - System.nanoTime()
+        if (left <= 0) {
+          return false
+        }
+        long ms = left / 1000000L
+        if (ms <= 0) {
+          ms = 1
+        }
+        this.wait(ms)
+      }
+      this.permits = this.permits - 1
+      return true
+    }
+  }
+
+  public void release() {
+    release(1)
+  }
+
+  /* Java's release(int) adds permits and has no upper bound; it also does not
+     wait, because nothing is ever waited for on a release. */
+  public void release(int n) {
+    if (n < 0) {
+      throw new IllegalArgumentException("permits must be non-negative: " + n)
+    }
+    synchronized (this) {
+      this.permits = this.permits + n
+      this.notifyAll()
+    }
+  }
+
+  public int availablePermits() {
+    synchronized (this) {
+      return this.permits
+    }
+  }
+
+  /* Answer the current count and take it to zero, which is what a caller uses
+     to discard the permits a stopped producer had left. */
+  public int drainPermits() {
+    synchronized (this) {
+      int n = this.permits
+      this.permits = 0
+      return n
+    }
+  }
+}
+
+/* java.util.concurrent.CyclicBarrier: a meeting point for a fixed number of
+ * threads, reusable after the meeting.
+ *
+ * The generation counter is the whole of "cyclic": a thread that was woken by a
+ * trip must not mistake the next generation's arrival signal for its own, so
+ * every caller records the generation it is waiting on and re-tests it. The
+ * last thread to arrive runs the barrier action, then publishes the next
+ * generation and wakes everybody -- the action runs on the arriving thread,
+ * under the monitor, which is what Java does too (its implementation runs it
+ * inside the lock). */
+class CyclicBarrier {
+  private int parties
+  private int waiting
+  private int generation
+  private boolean broken
+  private Runnable action
+
+  public CyclicBarrier(int parties) {
+    if (parties <= 0) {
+      throw new IllegalArgumentException("parties must be positive: " + parties)
+    }
+    this.parties = parties
+  }
+
+  public CyclicBarrier(int parties, Runnable action) {
+    this(parties)
+    this.action = action
+  }
+
+  public int getParties() {
+    synchronized (this) {
+      return this.parties
+    }
+  }
+
+  public int getNumberWaiting() {
+    synchronized (this) {
+      return this.waiting
+    }
+  }
+
+  public boolean isBroken() {
+    synchronized (this) {
+      return this.broken
+    }
+  }
+
+  /* Wait until every party has arrived, and answer the party's arrival index:
+     the first to arrive is 0, the one that trips the barrier is parties - 1,
+     as Java's await does. The action runs once per generation. */
+  public int await() {
+    synchronized (this) {
+      if (this.broken) {
+        throw new BrokenBarrierException()
+      }
+      int gen = this.generation
+      int index = this.waiting
+      this.waiting = this.waiting + 1
+      if (this.waiting == this.parties) {
+        Runnable act = this.action
+        if (act != null) {
+          /* The action is Java's to run in the last arriving thread, and its
+             failure breaks the barrier for everybody else -- which is why it
+             runs here, inside the monitor, before the generation turns. */
+          try {
+            act.run()
+          } catch (Throwable t) {
+            this.broken = true
+            this.waiting = 0
+            this.generation = this.generation + 1
+            this.notifyAll()
+            throw new BrokenBarrierException()
+          }
+        }
+        this.waiting = 0
+        this.generation = this.generation + 1
+        this.notifyAll()
+        return index
+      }
+      while (!this.broken && gen == this.generation) {
+        this.wait(-1L)
+      }
+      if (this.broken) {
+        throw new BrokenBarrierException()
+      }
+      return index
+    }
+  }
+
+  /* Break the barrier: every waiter is released with BrokenBarrierException and
+     a later arrival sees the same. Java's reset does the same and then clears
+     the flag for the next generation. */
+  public void reset() {
+    synchronized (this) {
+      this.broken = false
+      this.waiting = 0
+      this.generation = this.generation + 1
+      this.notifyAll()
+    }
+  }
+}
+
+/* java.util.concurrent.BrokenBarrierException: what a waiter on a broken
+ * barrier is told. Java makes it checked; the checked-exception rule here skips
+ * the standard library's own bodies, and a program catching it is unaffected by
+ * which side of that line it is on. */
+class BrokenBarrierException extends RuntimeException {
+  public BrokenBarrierException() {}
+
+  public BrokenBarrierException(String message) {
+    super(message)
+  }
+}
+
+/* java.util.concurrent.ReentrantLock: a mutual-exclusion lock with the two
+ * properties Java's has -- it is reentrant, and unlock by a thread that does
+ * not hold it is an error.
+ *
+ * It is a monitor, not a CAS, like everything in this file: lock() is
+ * synchronized and takes the object's monitor, then counts. That means a
+ * ReentrantLock held by one thread blocks another thread's lock() the same way
+ * `synchronized` does, which is the observable behaviour a program uses; the
+ * difference is that the monitor is reentered explicitly here, so a thread that
+ * takes the lock twice must release twice, and getHoldCount says so. */
+class ReentrantLock {
+  private Thread owner
+  private int holds
+
+  public ReentrantLock() {}
+
+  public ReentrantLock(boolean fair) {
+    /* fair is accepted and ignored, for the reason Semaphore states: no queue
+       exists to order, and a flag that did nothing silently would mislead. */
+  }
+
+  public void lock() {
+    synchronized (this) {
+      Thread me = Thread.currentThread()
+      while (this.owner != null && this.owner != me) {
+        this.wait(-1L)
+      }
+      this.owner = me
+      this.holds = this.holds + 1
+    }
+  }
+
+  /* False when another thread holds the lock; true when it was free or already
+     this thread's, in which case the hold count rises, as Java's does. */
+  public boolean tryLock() {
+    synchronized (this) {
+      Thread me = Thread.currentThread()
+      if (this.owner != null && this.owner != me) {
+        return false
+      }
+      this.owner = me
+      this.holds = this.holds + 1
+      return true
+    }
+  }
+
+  public boolean tryLock(long millis) {
+    long deadline = System.nanoTime() + millis * 1000000L
+    synchronized (this) {
+      Thread me = Thread.currentThread()
+      while (this.owner != null && this.owner != me) {
+        long left = deadline - System.nanoTime()
+        if (left <= 0) {
+          return false
+        }
+        long ms = left / 1000000L
+        if (ms <= 0) {
+          ms = 1
+        }
+        this.wait(ms)
+      }
+      this.owner = me
+      this.holds = this.holds + 1
+      return true
+    }
+  }
+
+  /* Unlock one hold. The last one releases the owner and wakes the waiters; a
+     caller that does not own the lock is IllegalMonitorStateException, which is
+     also what java.util.concurrent.ReentrantLock throws. */
+  public void unlock() {
+    synchronized (this) {
+      Thread me = Thread.currentThread()
+      if (this.owner != me) {
+        throw new IllegalMonitorStateException("current thread is not owner")
+      }
+      this.holds = this.holds - 1
+      if (this.holds == 0) {
+        this.owner = null
+        this.notifyAll()
+      }
+    }
+  }
+
+  public boolean isLocked() {
+    synchronized (this) {
+      return this.owner != null
+    }
+  }
+
+  public boolean isHeldByCurrentThread() {
+    synchronized (this) {
+      return this.owner == Thread.currentThread()
+    }
+  }
+
+  public int getHoldCount() {
+    synchronized (this) {
+      if (this.owner != Thread.currentThread()) {
+        return 0
+      }
+      return this.holds
+    }
   }
 }

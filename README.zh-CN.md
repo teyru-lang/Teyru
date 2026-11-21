@@ -105,7 +105,7 @@ CI 在每次推送到 `main` 与每个 PR 上运行 `go build`、`go vet` 与整
 |---|---|
 | `teyru fmt [-w]` | 固定风格格式化；幂等，注释逐字保留，格式化前后输出相同 |
 | `teyru lsp` | stdin/stdout 上的语言服务器：`TY-*` 诊断与同文件定义跳转 |
-| `teyru test` | `@Test`／`@BeforeEach`／`Assert`，退出码 0／1／2；包自己的 `main` 不会被调用 |
+| `teyru test` | `@Test`／`@BeforeEach`／`Assert`，退出码 0／1／2；每个测试的 stdout 被捕捉、超时指名卡住的测试、`-run`／`-tag` 选取、`@Disabled`；包自己的 `main` 不会被调用。怎么写测试见〈测试规范〉 |
 | `teyru build -g` | 生成的 C 带 `#line`，DWARF 指回 `.teyru`；不加 `-g` 时输出逐字节不变 |
 
 CI 在每次推送与每个 PR 上运行 `go build`、`go vet` 与整套 `go test`，`CC=gcc` 那条腿每天

@@ -161,7 +161,12 @@ source → lexer → parser → ast → sema → codegen
   `-Wa,-mbig-obj`（`targetCflags`）。
 - **Teyru 自己的測試**：語言層級的單元測試用 `teyru test`（`@Test`／`@BeforeEach`／
   `Assert`，見〈工具鏈〉），放在 `tests/test-framework/`。它驗的是**標準庫與語言語意**；
-  編譯器本身的 Go 測試仍用 `go test`，兩者不互相取代。
+  編譯器本身的 Go 測試仍用 `go test`，兩者不互相取代。**怎麼寫**測試（命名、一個方法
+  一個行為、expected 在前、陣列用 `assertArrayEquals`、浮點用 delta、不用 `Thread.sleep`
+  當同步、table-driven 要帶 message）以 docs 的〈測試規範〉為正本，`teyru-lang/docs`
+  三個 locale 各一份。runner 的契約：逾時指名卡住的那個測試、每個測試的 stdout 被捕捉、
+  找不到測試是 exit 2（`-no-tests-ok` 才是接受空集合）、`-run`／`-tag` 選取、
+  `@Disabled`／`@Tag`。
 - **端到端**：在 `tests/programs/` 放 `xxx.teyru` 與 `xxx.expected`。
   需要命令列參數時另外放 `xxx.args`（每行一個）。`go test` 會自動編譯並比對輸出。
   `tests/` 是 `teyru-lang/tests` 的 submodule：改測試要在**那個**倉庫提交，這裡只會
@@ -279,6 +284,7 @@ allow 條目過期」，因為後者可能是 O2-clang 與 O2-gcc 之間的差�
 | `teyru-lang/docs` 的〈架構〉 | 編譯流程與執行期模型 | 架構改變時 |
 | `teyru-lang/docs` 的〈JSON〉／〈Web 框架〉／〈模組〉 | 各主題的完整說明 | 該主題行為改變時 |
 | `teyru-lang/docs` 的〈工具鏈〉 | `teyru fmt`／`lsp`／`test`、`-g` 與 CI 的用法與限制 | 任一工具的行為、旗標或限制改變時 |
+| `teyru-lang/docs` 的〈測試規範〉 | 怎麼寫 Teyru 測試：命名、結構、斷言、決定性、選取 | 測試規範或 runner 的契約改變時 |
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
 
