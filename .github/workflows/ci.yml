@@ -15,6 +15,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A run that failed before the tree could be read -- a submodule push that
+  # landed a moment after the commit that named it, which is what happened when
+  # tests/ gained a commit the parent's gitlink pointed at -- cannot be retried
+  # by re-running the job, because the checkout is the step that failed. This is
+  # the way to ask for it again.
+  workflow_dispatch:
 
 permissions:
   contents: read
