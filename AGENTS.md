@@ -167,6 +167,12 @@ source → lexer → parser → ast → sema → codegen
   三個 locale 各一份。runner 的契約：逾時指名卡住的那個測試、每個測試的 stdout 被捕捉、
   找不到測試是 exit 2（`-no-tests-ok` 才是接受空集合）、`-run`／`-tag` 選取、
   `@Disabled`／`@Tag`。
+- **新增執行期檔案時的清單**：`internal/runtime/src/` 多一個 `.c` 就要同時改
+  `internal/runtime/embed.go`（`//go:embed` 與 doc comment）、`internal/driver/driver.go`
+  的 `runtimeHash` 與 `writeRuntime`（兩處，LLVM 後端共用後者）、以及
+  `scripts/check-notices.sh` 會生出來的 `THIRD-PARTY-NOTICES.md` 檔案清單（`make notices`
+  重跑）。漏掉 `runtimeHash` 會讓快取的標準庫物件在執行期改變之後仍然命中——那是安靜的
+  錯誤答案，不是慢建置。
 - **端到端**：在 `tests/programs/` 放 `xxx.teyru` 與 `xxx.expected`。
   需要命令列參數時另外放 `xxx.args`（每行一個）。`go test` 會自動編譯並比對輸出。
   `tests/` 是 `teyru-lang/tests` 的 submodule：改測試要在**那個**倉庫提交，這裡只會
