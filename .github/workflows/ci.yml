@@ -40,6 +40,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: build
         run: go build ./...
@@ -66,6 +69,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: build the compiler
         run: go build -o teyru ./cmd/teyru

@@ -63,6 +63,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: set up the JDK the differential compares against
         uses: actions/setup-java@v4
@@ -128,6 +131,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: the C compiler it builds with
         run: sudo apt-get update && sudo apt-get install -y clang
@@ -166,6 +172,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: the C compilers the cells build with
         run: sudo apt-get update && sudo apt-get install -y clang gcc
@@ -213,6 +222,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: fetch every cell's record
         uses: actions/download-artifact@v4
@@ -253,6 +265,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # go.mod has no requirements, so there is no go.sum and nothing to
+          # cache; without this the restore step warns on every run.
+          cache: false
 
       - name: build the release binaries
         run: |
