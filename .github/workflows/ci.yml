@@ -31,13 +31,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: check out the tree and the suite submodule
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # tests/ is the teyru-lang/tests submodule and the suite is its data
           submodules: recursive
 
       - name: set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           # go.mod has no requirements, so there is no go.sum and nothing to
@@ -61,12 +61,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: check out the tree and the suite submodule
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           # go.mod has no requirements, so there is no go.sum and nothing to
