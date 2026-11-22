@@ -1975,6 +1975,10 @@ abstract class DateFormat extends Format {
     return new SimpleDateFormat(timeStylePattern(style))
   }
 
+  public static DateFormat getTimeInstance(int style, Locale locale) {
+    return new SimpleDateFormat(LocaleFormats.timePattern(locale, style), locale)
+  }
+
   public static DateFormat getDateTimeInstance(int dateStyle, int timeStyle) {
     return new SimpleDateFormat(dateStylePattern(dateStyle) + ", " + timeStylePattern(timeStyle))
   }
