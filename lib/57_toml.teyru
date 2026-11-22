@@ -899,6 +899,14 @@ class TomlParser {
       consume("nan")
       return new TomlFloat(Double.NaN)
     }
+    if (startsWith("-nan")) {
+      consume("-nan")
+      return new TomlFloat(Double.NaN)
+    }
+    if (startsWith("+nan")) {
+      consume("+nan")
+      return new TomlFloat(Double.NaN)
+    }
     return numberOrDate()
   }
 
@@ -967,6 +975,29 @@ class TomlParser {
 
   private void keyValueInline(TomlTable t) {
     String key = oneKey()
+    /* A dotted key inside an inline table ("{b.c = 1}") builds the same nested
+       table it would at the top level. */
+    while (true) {
+      skipSpaces()
+      if (at < src.length() && peek() == '.') {
+        advance()
+        skipSpaces()
+        String sub = oneKey()
+        TomlNode n = t.get(key)
+        if (n == null) {
+          TomlTable made = new TomlTable()
+          t.put(key, made)
+          t = made
+        } else if (n instanceof TomlTable) {
+          t = (TomlTable) n
+        } else {
+          fail("key '" + key + "' is not a table")
+        }
+        key = sub
+        continue
+      }
+      break
+    }
     skipSpaces()
     if (at >= src.length() || peek() != '=') {
       fail("expected '='")
@@ -996,6 +1027,29 @@ class TomlParser {
     String tok = b.toString()
     if (tok.length() == 0) {
       fail("expected a value")
+    }
+    /* TOML allows a space instead of "T" between a date and a time
+       ("1979-05-27 07:32:00"), so the time after such a date is part of the
+       same value and not trailing content. */
+    if (tok.length() == 10 && tok.charAt(4) == '-' && at < src.length() && peek() == ' ') {
+      int save = at
+      advance()
+      StringBuilder t = new StringBuilder()
+      while (at < src.length()) {
+        char c = peek()
+        if (c == ':' || (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' || c == 'Z' || c == 'z') {
+          t.append(c)
+          advance()
+          continue
+        }
+        break
+      }
+      String time = t.toString()
+      if (time.length() >= 8 && time.charAt(2) == ':' && time.charAt(5) == ':') {
+        tok = tok + " " + time
+      } else {
+        at = save
+      }
     }
     if (isDateTime(tok)) {
       return new TomlDateTime(tok, dateTimeKind(tok))
@@ -1043,6 +1097,15 @@ class TomlParser {
       s = s.substring(1)
     }
     s = s.replace("_", "")
+    try {
+      return parseNumberBody(s, negative)
+    } catch (NumberFormatException e) {
+      fail("not a number: " + tok)
+      return null
+    }
+  }
+
+  private TomlNode parseNumberBody(String s, boolean negative) {
     long v
     if (s.startsWith("0x")) {
       v = Long.parseLong(s.substring(2), 16)
