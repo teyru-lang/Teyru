@@ -273,6 +273,14 @@ final class XmlWriter {
     }
   }
 
+  /* What the writer does with whitespace, stated once because it is the one
+     thing it does not preserve: an element whose only text children are blank
+     and which has element children is treated as layout, so the blank runs are
+     dropped and the children are indented. Every other text run is written
+     byte for byte (a CR becomes a character reference, because a literal CR is
+     normalised to LF by an XML parser). A caller that needs the original bytes
+     preserves them by not asking for layout: XmlElement.toXml() is the compact
+     form and keeps no indentation at all. */
   static void writeElement(XmlElement e, StringBuilder b, int depth, boolean pretty) {
     writeNode(e, b, depth, pretty, false)
   }
@@ -315,7 +323,14 @@ final class XmlWriter {
           if (layout) {
             indent(b, depth + 1)
           }
-          b.append("<![CDATA[").append(t.text).append("]]>")
+          if (t.text.indexOf('\r') >= 0 || t.text.indexOf("]]>") >= 0) {
+            /* A literal CR inside CDATA is normalised to LF by an XML parser, and
+               "]]>" would end the section early; the escaped text form keeps
+               both, at the cost of the literal spelling. */
+            b.append(escapeText(t.text))
+          } else {
+            b.append("<![CDATA[").append(t.text).append("]]>")
+          }
           if (layout) {
             b.append('\n')
           }

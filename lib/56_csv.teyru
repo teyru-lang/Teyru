@@ -17,6 +17,11 @@ package teyru
        that quotes everything is valid but unreadable, and one that quotes
        nothing is wrong the moment a comma appears.
 
+   One writer rule is not in the RFC but is forced by the reader: a record of a
+   single empty field is written as an explicit "" rather than an empty line,
+   because an empty line between records is skipped (by this reader and by most
+   others) and the field would come back as no record at all.
+
    The rules, from RFC 4180 §2:
      - fields are separated by commas and records by CRLF; a lone LF is
        accepted on input and written as the writer's line separator;
@@ -199,6 +204,14 @@ class CsvWriter {
   }
 
   public CsvWriter writeRecord(String[] fields) {
+    /* A record of one empty field would otherwise be a blank line, and a blank
+       line between records is skipped by the reader (and by most readers): the
+       explicit empty quoted field is the spelling that survives. */
+    if (fields.length == 1 && (fields[0] == null || fields[0].length() == 0)) {
+      out.append(quote).append(quote)
+      out.append(lineSeparator)
+      return this
+    }
     for (int i = 0 : i < fields.length : i++) {
       if (i > 0) {
         out.append(delimiter)
