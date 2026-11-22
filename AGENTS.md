@@ -160,7 +160,8 @@ source → lexer → parser → ast → sema → codegen
   冷快取的標準庫單元會超過它（`t93_json` 是 35,655），所以 mingw 的旗標裡有
   `-Wa,-mbig-obj`（`targetCflags`）。
 - **Teyru 自己的測試**：語言層級的單元測試用 `teyru test`（`@Test`／`@BeforeEach`／
-  `Assert`，見〈工具鏈〉），放在 `tests/test-framework/`。它驗的是**標準庫與語言語意**；
+  `Assert`，見〈工具鏈〉；測試怎麼寫的規範在 `teyru-lang/docs` 的〈測試〉），放在
+  `tests/test-framework/`。它驗的是**標準庫與語言語意**；
   編譯器本身的 Go 測試仍用 `go test`，兩者不互相取代。**怎麼寫**測試（命名、一個方法
   一個行為、expected 在前、陣列用 `assertArrayEquals`、浮點用 delta、不用 `Thread.sleep`
   當同步、table-driven 要帶 message）以 docs 的〈測試規範〉為正本，`teyru-lang/docs`
@@ -290,7 +291,7 @@ allow 條目過期」，因為後者可能是 O2-clang 與 O2-gcc 之間的差�
 | `teyru-lang/docs` 的〈架構〉 | 編譯流程與執行期模型 | 架構改變時 |
 | `teyru-lang/docs` 的〈JSON〉／〈Web 框架〉／〈模組〉 | 各主題的完整說明 | 該主題行為改變時 |
 | `teyru-lang/docs` 的〈工具鏈〉 | `teyru fmt`／`lsp`／`test`、`-g` 與 CI 的用法與限制 | 任一工具的行為、旗標或限制改變時 |
-| `teyru-lang/docs` 的〈測試規範〉 | 怎麼寫 Teyru 測試：命名、結構、斷言、決定性、選取 | 測試規範或 runner 的契約改變時 |
+| `teyru-lang/docs` 的〈測試〉 | 怎麼寫 Teyru 測試：命名、結構、斷言、決定性、選取，以及 `@Test` 家族、`Assert` 的多載、`-run`／`-tag`／`-timeout`／`-deadline` 與輸出隔離 | 測試規範、測試框架、runner 旗標或 `Assert` 介面改變時 |
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
 
@@ -828,6 +829,22 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   `(16,32)` 不崩，因為它們的 `TY_ALIGN` 還是 16——`malloc` 的 16 剛好就是那個測試要的。修法：
   `chunk_new` 改用 `aligned_alloc(TY_ALIGN, cap)`（`TY_CHUNK` 是 `TY_ALIGN` 的倍數，要求成立）。
   崩潰、診斷、兩次錯誤結論與量測都寫在 `scripts/w14-analysis.md` 的那一節。
+- **資料格式與地區：實作了什麼、拒絕了什麼（`lib/54`–`lib/60`）**：CSV（RFC 4180）、
+  TOML 1.0、XML 1.0、YAML 1.2 四個讀寫器與 `Locale`／`DateFormatSymbols`／
+  `LocaleFormats` 三張表。資料不是憑記憶打的：locale 的數字、貨幣、日期 pattern
+  與名稱都由 OpenJDK 21.0.11+10 讀出（`t326_locale` 與它的 `.java.ref` 是同一個程式，
+  期望值是 JDK 的輸出，逐行相同）。**刻意拒絕、不是還沒做**：XML 的 `DOCTYPE` 與
+  處理指令（內部 DTD 可以改寫實體，那是 XXE 的洞；要完整的 XML 堆疊不是這一層的
+  工作）、YAML 的錨點／別名／合併鍵／顯式標籤（要整份文件的圖與循環檢查）、
+  TOML 的重複鍵與衝突標頭（TOML 比 JSON 嚴，安靜挑一個比拒絕糟）。CSV 沒有型別
+  推論：`007` 是字串，呼叫者自己 `parseInt`。
+- **正則引擎的完整度與它拒絕的三件事（`lib/21`）**：Java 的常見語法都做了——前後視
+  （兩個方向、可否定）、反向參考、具名群組、佔有量詞、原子群組、行內與作用域旗標、
+  `\p{...}`（含 `&&` 交集）、`\Q...\E`、錨點、`\x{...}`／`\uHHHH`。`t325_regex_advanced`
+  與 `.java.ref` 是同一個程式，期望值是 OpenJDK 21 的輸出（66 個案例）。**仍然具名拒絕**：
+  `\G`、`\R`、`\X`、`\h`／`\v`、POSIX 方括號類別 `[[:alpha:]]`、八進位 `\0`，以及
+  `\p{...}` 的 script／block 名；這些以前會被當成字面值（`\R` 比對字母 R），那是
+  「安靜地給另一個答案」，現在是 `PatternSyntaxException`，`t329_regex_refusals` 逐條釘住。
 - **W14 第 9 項（`TY_HDR` 與 `TY_ALIGN`）的第一個實驗：那兩個常數不是兩個常數。** 這一項要的是
   「收窄 8 或 16 位元組在真實基準上值多少」，而做這件事需要一個能單獨調這兩個數字的變體。
   試了：`TY_HDR` 16→32 與 `TY_ALIGN` 16→32 **各自單獨改**，`examples/bench_escape`（4000 萬次）

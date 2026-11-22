@@ -100,6 +100,10 @@ CI 在每次 push 到 `main` 與每個 PR 上跑 `go build`、`go vet` 與整套
 * **I/O**：同步的 `Socket`／`ServerSocket` 與 TLS；`java.nio` 的 `ByteBuffer`、非阻塞
   `SocketChannel`／`ServerSocketChannel`／`DatagramChannel` 與 `Selector`。
 * **子行程**：`ProcessBuilder`／`Process`（三個串流、目錄、環境、結束碼、`destroy`）。
+* **資料格式與地區**：CSV（`CsvReader`／`CsvWriter`，RFC 4180）、TOML 1.0（`TomlDocument`）、
+  XML 1.0（`XmlDocument`；`DOCTYPE` 是具名拒絕，因為內部 DTD 可以改寫實體——那是 XXE 的洞）、
+  YAML 1.2（`YamlDocument`；錨點、別名與標籤具名拒絕）；`Locale` 與 `DateFormatSymbols`
+  帶著每個 locale 真正的數字、貨幣、日期 pattern 與名稱（讀自 OpenJDK 21）。
 * **其他**：`CRC32`、`Adler32`、deflate／inflate 與 gzip、`BigInteger`／`BigDecimal`、
   反射（`java.lang.reflect` 的形狀，含註解的中繼資料）、`java.util.logging` 形狀的日誌。
 
@@ -114,8 +118,9 @@ CI 在每次 push 到 `main` 與每個 PR 上跑 `go build`、`go vet` 與整套
 | `teyru test` | `@Test`／`@BeforeEach`／`Assert`，結束碼 0／1／2；每個測試的 stdout 被捕捉、逾時指名卡住的測試、`-run`／`-tag` 選取、`@Disabled`；套件自己的 `main` 不會被呼叫。怎麼寫測試見〈測試規範〉 |
 | `teyru build -g` | 產生的 C 帶 `#line`，DWARF 指回 `.teyru`；不加 `-g` 時輸出逐位元組不變 |
 
-CI 在每次 push 與每個 PR 上跑 `go build`、`go vet` 與整套 `go test`，`CC=gcc` 那條腿每天
-跑一次。細節見 <https://docs.teyru.dev/docs/tooling>。
+CI 在每次 push 與每個 PR 上跑 `go build`、`go vet` 與整套 `go test`；`CC=gcc` 那條腿與
+JDK 差分在 `make ci` 裡，只有發佈時（`release.yml`）自動跑。細節見
+<https://docs.teyru.dev/docs/tooling>。
 
 ## 量測
 

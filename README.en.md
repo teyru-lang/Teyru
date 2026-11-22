@@ -108,6 +108,12 @@ every platform.
   non-blocking `SocketChannel`/`ServerSocketChannel`/`DatagramChannel` and `Selector`.
 * **Processes**: `ProcessBuilder`/`Process` (three streams, directory, environment, exit status,
   `destroy`).
+* **Data formats and locales**: CSV (`CsvReader`/`CsvWriter`, RFC 4180), TOML 1.0
+  (`TomlDocument`), XML 1.0 (`XmlDocument`; `DOCTYPE` is a named refusal, because an
+  internal DTD can redefine entities -- that is the XXE hole), YAML 1.2 (`YamlDocument`;
+  anchors, aliases and tags are refused by name), and `Locale` with `DateFormatSymbols`
+  carrying each locale's real number, currency and date patterns and names (read out of
+  OpenJDK 21).
 * **Other**: `CRC32`, `Adler32`, deflate/inflate and gzip, `BigInteger`/`BigDecimal`, reflection
   (the shape of `java.lang.reflect`, including annotation metadata), `java.util.logging`-shaped
   logging.
@@ -123,8 +129,9 @@ Four tools live inside the same `teyru`, not in plugins:
 | `teyru test` | `@Test` / `@BeforeEach` / `Assert`; exit code 0/1/2; each test's stdout is captured, a timeout names the hung test, `-run`/`-tag` select, `@Disabled` skips; the package's own `main` is not called. Writing tests: the testing standard |
 | `teyru build -g` | The generated C carries `#line` and DWARF points back at the `.teyru`; without `-g` the output is byte-identical |
 
-CI runs `go build`, `go vet` and the whole `go test` suite on every push and pull request, and the
-`CC=gcc` leg once a day. Details in <https://docs.teyru.dev/en/docs/tooling>.
+CI runs `go build`, `go vet` and the whole `go test` suite on every push and pull request; the
+`CC=gcc` leg and the JDK differential live in `make ci`, which runs automatically only at release
+time (`release.yml`). Details in <https://docs.teyru.dev/en/docs/tooling>.
 
 ## Measurements
 

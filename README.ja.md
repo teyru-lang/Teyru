@@ -105,6 +105,11 @@ CI は `main` への push と PR のたびに `go build`、`go vet`、`go test` 
   `SocketChannel`／`ServerSocketChannel`／`DatagramChannel` と `Selector`。
 * **子プロセス**：`ProcessBuilder`／`Process`（三つのストリーム、作業ディレクトリ、環境、
   終了コード、`destroy`）。
+* **データ形式とロケール**：CSV（`CsvReader`／`CsvWriter`、RFC 4180）、TOML 1.0（`TomlDocument`）、
+  XML 1.0（`XmlDocument`。`DOCTYPE` は名前付きの拒否——内部 DTD は実体を再定義でき、
+  それが XXE の穴だから）、YAML 1.2（`YamlDocument`。アンカー・エイリアス・タグは名前付きの拒否）、
+  そして `Locale` と `DateFormatSymbols` が各ロケールの実際の数値・通貨・日付パターンと名前を
+  持ちます（OpenJDK 21 から読み出し）。
 * **その他**：`CRC32`、`Adler32`、deflate／inflate と gzip、`BigInteger`／`BigDecimal`、
   リフレクション（`java.lang.reflect` の形、アノテーションのメタデータを含む）、
   `java.util.logging` 形のログ。
@@ -120,8 +125,9 @@ CI は `main` への push と PR のたびに `go build`、`go vet`、`go test` 
 | `teyru test` | `@Test`／`@BeforeEach`／`Assert`、終了コード 0／1／2。各テストの stdout は捕捉され、タイムアウトは固まったテストを名指しし、`-run`／`-tag` で選択、`@Disabled` でスキップ。パッケージ自身の `main` は呼ばれない。テストの書き方は「テスト規範」へ |
 | `teyru build -g` | 生成される C に `#line` が入り、DWARF が `.teyru` を指す。`-g` なしの出力はバイト単位で不変 |
 
-CI は push と PR のたびに `go build`、`go vet`、`go test` 一式を実行し、`CC=gcc` の脚は
-毎日 1 回実行します。詳細は <https://docs.teyru.dev/en/docs/tooling>。
+CI は push と PR のたびに `go build`、`go vet`、`go test` 一式を実行します。`CC=gcc` の脚と
+JDK 差分は `make ci` にあり、自動で走るのはリリース時（`release.yml`）だけです。詳細は
+<https://docs.teyru.dev/en/docs/tooling>。
 
 ## 計測
 
