@@ -83,6 +83,9 @@ class String extends Object implements Comparable<String>, CharSequence {
      Unicode 15 table the runtime carries -- so this is not a slower path than
      the native one, only a longer one. */
   public String toUpperCase(Locale locale) {
+    if (locale.getLanguage().equals("lt")) {
+      return toUpperCaseLithuanian()
+    }
     if (!locale.isTurkishLike()) {
       return toUpperCase()
     }
@@ -96,47 +99,86 @@ class String extends Object implements Comparable<String>, CharSequence {
     return b.toString()
   }
 
-  public String toLowerCase(Locale locale) {
-    if (locale.isTurkishLike() &&!locale.getLanguage().equals("lt")) {
-      StringBuilder b = new StringBuilder()
-      int i = 0
-      while (i < length()) {
-        int cp = codePointAt(i)
-        b.append((char) locale.toLowerCase(cp))
-        i += Character.charCount(cp)
-      }
-      return b.toString()
-    }
-    if (!locale.getLanguage().equals("lt")) {
-      return toLowerCase()
-    }
-    /* Lithuanian: a lower-case i or j keeps its dot when an accent follows it,
-       which is the one rule that needs the next character. Java's answer is
-       "i" plus U+0307, and the accent is whatever combining mark comes next. */
+  /* Lithuanian upper case drops the dot above a lower-case i or j, which is
+     SpecialCasing's conditional rule: "i\u0307" is "I", not "I\u0307". The
+     combining mark is consumed with the letter, and a mark that is not U+0307
+     stays where it was. */
+  private String toUpperCaseLithuanian() {
     StringBuilder b = new StringBuilder()
     int i = 0
     while (i < length()) {
       int cp = codePointAt(i)
-      int next = i + Character.charCount(cp)
-      boolean accented = false
-      if (next < length()) {
-        int ncp = codePointAt(next)
-        accented = ncp == 0x0300 || ncp == 0x0301 || ncp == 0x0303
+      i += Character.charCount(cp)
+      if ((cp == 'i' || cp == 'j') && i < length() && codePointAt(i) == 0x0307) {
+        i += Character.charCount(0x0307)
+        b.append((char) (cp == 'i' ? 'I' : 'J'))
+        continue
       }
-      int low = locale.toLowerCase(cp)
-      if ((cp == 'I' || cp == 0x00cc || cp == 0x00cd || cp == 0x0128) && accented) {
-        /* The capital I with and without an accent lowers to i + the dot when
-           something combining follows, which is the rule the JDK's
-           toLowerCase(LT) applies. */
-        b.append('i')
-        b.append('\u0307')
-      } else {
-        b.append((char) low)
-      }
+      b.append((char) Character.toUpperCase(cp))
+    }
+    return b.toString()
+  }
+
+  public String toLowerCase(Locale locale) {
+    String lang = locale.getLanguage()
+    if (lang.equals("lt")) {
+      return toLowerCaseLithuanian()
+    }
+    if (!locale.isTurkishLike()) {
+      return toLowerCase()
+    }
+    StringBuilder b = new StringBuilder()
+    int i = 0
+    while (i < length()) {
+      int cp = codePointAt(i)
+      b.append((char) locale.toLowerCase(cp))
       i += Character.charCount(cp)
     }
     return b.toString()
   }
+
+  /* Lithuanian lower case, the rules SpecialCasing names for lt:
+       - a capital I or J followed by a combining mark keeps the dot above, so
+         "I\u0307" is "i\u0307\u0307" -- the letter's dot plus the mark;
+       - Ì, Í and Ĩ decompose into i + dot above + the accent (three
+         unconditional rules in SpecialCasing.txt);
+       - Į lower-cases to į, as it does everywhere.
+     What is not here: the JDK's exact More_Above test (which combining marks
+     count). This treats the combining-diacritical range as the condition, which
+     agrees with the JDK on the shapes in t333_locale_case.teyru. */
+  private String toLowerCaseLithuanian() {
+    StringBuilder b = new StringBuilder()
+    int i = 0
+    while (i < length()) {
+      int cp = codePointAt(i)
+      i += Character.charCount(cp)
+      if (cp == 0x00cc) {
+        b.append('i').append('\u0307').append('\u0300')
+        continue
+      }
+      if (cp == 0x00cd) {
+        b.append('i').append('\u0307').append('\u0301')
+        continue
+      }
+      if (cp == 0x0128) {
+        b.append('i').append('\u0307').append('\u0303')
+        continue
+      }
+      if ((cp == 'I' || cp == 'J') && i < length() && isCombiningAbove(codePointAt(i))) {
+        b.append((char) (cp == 'I' ? 'i' : 'j')).append('\u0307')
+        continue
+      }
+      b.append((char) Character.toLowerCase(cp))
+    }
+    return b.toString()
+  }
+
+  /* The combining marks the JDK's More_Above rule looks at: the diacritical
+     marks, which all carry a non-zero combining class. */
+  private static boolean isCombiningAbove(int cp) {
+    return (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) || (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f)
+  }
+
   public native char[] toCharArray()
   public native byte[] getBytes()
   public native String intern()
