@@ -406,38 +406,135 @@ class DecimalFormatSymbols {
   private String internationalCurrencySymbol = "USD"
   private char monetaryDecimalSeparator = '.'
   private String exponentSeparator = "E"
+  /* The percent sign's side and spacing differ by locale: "26%" in en and ja,
+     "26 %" with a no-break space in de, fr and ru. The JDK gets this from the
+     percent pattern; here it is a flag beside the symbols. */
+  private boolean percentSuffix = false
+  private boolean nbspBeforePercent = false
+  private boolean currencyPrefix = true
 
-  public DecimalFormatSymbols() {
+  public boolean percentAfter() {
+    return percentSuffix
+  }
+  public boolean percentNbsp() {
+    return nbspBeforePercent
   }
 
-  public char getZeroDigit() { return zeroDigit }
-  public void setZeroDigit(char c) { zeroDigit = c }
-  public char getGroupingSeparator() { return groupingSeparator }
-  public void setGroupingSeparator(char c) { groupingSeparator = c }
-  public char getDecimalSeparator() { return decimalSeparator }
-  public void setDecimalSeparator(char c) { decimalSeparator = c }
-  public String getPerMill() { return perMill }
-  public void setPerMill(String s) { perMill = s }
-  public char getPercent() { return percent }
-  public void setPercent(char c) { percent = c }
-  public char getDigit() { return digit }
-  public void setDigit(char c) { digit = c }
-  public char getPatternSeparator() { return patternSeparator }
-  public void setPatternSeparator(char c) { patternSeparator = c }
-  public String getInfinity() { return infinity }
-  public void setInfinity(String s) { infinity = s }
-  public String getNaN() { return nan }
-  public void setNaN(String s) { nan = s }
-  public char getMinusSign() { return minusSign }
-  public void setMinusSign(char c) { minusSign = c }
-  public String getCurrencySymbol() { return currencySymbol }
-  public void setCurrencySymbol(String s) { currencySymbol = s }
-  public String getInternationalCurrencySymbol() { return internationalCurrencySymbol }
-  public void setInternationalCurrencySymbol(String s) { internationalCurrencySymbol = s }
-  public char getMonetaryDecimalSeparator() { return monetaryDecimalSeparator }
-  public void setMonetaryDecimalSeparator(char c) { monetaryDecimalSeparator = c }
-  public String getExponentSeparator() { return exponentSeparator }
-  public void setExponentSeparator(String s) { exponentSeparator = s }
+  public DecimalFormatSymbols() {}
+
+  /* The JDK's getInstance(Locale), built from the locale's row in
+     lib/54_locale.teyru. Anything not in that table answers ROOT, which is
+     what makes an unsupported locale visible rather than wrong-looking. */
+  public static DecimalFormatSymbols getInstance(Locale locale) {
+    DecimalFormatSymbols s = new DecimalFormatSymbols()
+    Object[] d = locale.numberData()
+    s.groupingSeparator = ((String) d[1]).charAt(0)
+    s.decimalSeparator = ((String) d[2]).charAt(0)
+    s.monetaryDecimalSeparator = s.decimalSeparator
+    s.zeroDigit = ((Character) d[3]).charValue()
+    s.currencySymbol = (String) d[4]
+    s.internationalCurrencySymbol = (String) d[5]
+    s.percentSuffix = (Boolean) d[6] == Boolean.TRUE
+    s.currencyPrefix = (Boolean) d[7] == Boolean.TRUE
+    s.nbspBeforePercent = (Boolean) d[8] == Boolean.TRUE
+    return s
+  }
+
+  public static DecimalFormatSymbols getInstance() {
+    return getInstance(Locale.getDefault())
+  }
+
+  /* True when the currency symbol goes before the number in this locale's
+     currency pattern. The JDK decides it with the pattern's shape; this is the
+     same answer, read out of the data table. */
+  public boolean currencyFirst() {
+    return currencyPrefix
+  }
+
+  public char getZeroDigit() {
+    return zeroDigit
+  }
+  public void setZeroDigit(char c) {
+    zeroDigit = c
+  }
+  public char getGroupingSeparator() {
+    return groupingSeparator
+  }
+  public void setGroupingSeparator(char c) {
+    groupingSeparator = c
+  }
+  public char getDecimalSeparator() {
+    return decimalSeparator
+  }
+  public void setDecimalSeparator(char c) {
+    decimalSeparator = c
+  }
+  public String getPerMill() {
+    return perMill
+  }
+  public void setPerMill(String s) {
+    perMill = s
+  }
+  public char getPercent() {
+    return percent
+  }
+  public void setPercent(char c) {
+    percent = c
+  }
+  public char getDigit() {
+    return digit
+  }
+  public void setDigit(char c) {
+    digit = c
+  }
+  public char getPatternSeparator() {
+    return patternSeparator
+  }
+  public void setPatternSeparator(char c) {
+    patternSeparator = c
+  }
+  public String getInfinity() {
+    return infinity
+  }
+  public void setInfinity(String s) {
+    infinity = s
+  }
+  public String getNaN() {
+    return nan
+  }
+  public void setNaN(String s) {
+    nan = s
+  }
+  public char getMinusSign() {
+    return minusSign
+  }
+  public void setMinusSign(char c) {
+    minusSign = c
+  }
+  public String getCurrencySymbol() {
+    return currencySymbol
+  }
+  public void setCurrencySymbol(String s) {
+    currencySymbol = s
+  }
+  public String getInternationalCurrencySymbol() {
+    return internationalCurrencySymbol
+  }
+  public void setInternationalCurrencySymbol(String s) {
+    internationalCurrencySymbol = s
+  }
+  public char getMonetaryDecimalSeparator() {
+    return monetaryDecimalSeparator
+  }
+  public void setMonetaryDecimalSeparator(char c) {
+    monetaryDecimalSeparator = c
+  }
+  public String getExponentSeparator() {
+    return exponentSeparator
+  }
+  public void setExponentSeparator(String s) {
+    exponentSeparator = s
+  }
 
   /* copy is Java's clone: getDecimalFormatSymbols hands out one of these, so a
      program that mutates the result of that call changes nothing, exactly as in
@@ -456,6 +553,9 @@ class DecimalFormatSymbols {
     s.minusSign = minusSign
     s.currencySymbol = currencySymbol
     s.internationalCurrencySymbol = internationalCurrencySymbol
+    s.percentSuffix = percentSuffix
+    s.nbspBeforePercent = nbspBeforePercent
+    s.currencyPrefix = currencyPrefix
     s.monetaryDecimalSeparator = monetaryDecimalSeparator
     s.exponentSeparator = exponentSeparator
     return s
@@ -484,28 +584,65 @@ abstract class NumberFormat extends Format {
   protected boolean parseIntegerOnly = false
 
   public static NumberFormat getInstance() {
-    return new DecimalFormat()
+    return getInstance(Locale.getDefault())
+  }
+
+  public static NumberFormat getInstance(Locale locale) {
+    return localized("#,##0.###", locale)
   }
 
   public static NumberFormat getNumberInstance() {
-    return new DecimalFormat()
+    return getNumberInstance(Locale.getDefault())
+  }
+
+  public static NumberFormat getNumberInstance(Locale locale) {
+    return localized("#,##0.###", locale)
+  }
+
+  /* The bridge between a Locale and a DecimalFormat: the pattern is the ROOT
+     one and the locale supplies the separators, the zero digit and the currency
+     symbol, which is how the JDK's own instances are built (its patterns are the
+     CLDR ones, and they are the same "#,##0.###" for every locale here). */
+  private static NumberFormat localized(String pattern, Locale locale) {
+    DecimalFormatSymbols sym = DecimalFormatSymbols.getInstance(locale)
+    return new DecimalFormat(pattern, sym)
   }
 
   /* getIntegerInstance is a DecimalFormat over "#,##0" with parseIntegerOnly
      set, which is what the JDK builds: the pattern is what makes it round to a
      whole number, the flag is what makes parse stop at the point. */
   public static NumberFormat getIntegerInstance() {
-    DecimalFormat f = new DecimalFormat("#,##0")
+    return getIntegerInstance(Locale.getDefault())
+  }
+
+  public static NumberFormat getIntegerInstance(Locale locale) {
+    DecimalFormat f = (DecimalFormat) localized("#,##0", locale)
     f.setParseIntegerOnly(true)
     return f
   }
 
   public static NumberFormat getPercentInstance() {
-    return new DecimalFormat("#,##0%")
+    return getPercentInstance(Locale.getDefault())
+  }
+
+  public static NumberFormat getPercentInstance(Locale locale) {
+    return localized("#,##0%", locale)
   }
 
   public static NumberFormat getCurrencyInstance() {
-    return new DecimalFormat("¤#,##0.00")
+    return getCurrencyInstance(Locale.getDefault())
+  }
+
+  /* The currency pattern's symbol position is the locale's: the JDK's German
+     pattern is "#,##0.00 ¤", its French one is the same, and its English one is
+     "¤#,##0.00". A locale whose data says the symbol comes first gets the
+     prefix pattern and one that does not gets the suffix. */
+  public static NumberFormat getCurrencyInstance(Locale locale) {
+    DecimalFormatSymbols sym = DecimalFormatSymbols.getInstance(locale)
+    /* The pattern is the locale's, not a prefix/suffix flag: the JDK's German
+       one separates the symbol with a no-break space, and its Japanese one has
+       no fraction digits at all ("\u00a4#,##0"), which a flag cannot say. */
+    return new DecimalFormat(LocaleFormats.currencyPattern(locale), sym)
   }
 
   public abstract String format(double number)
@@ -550,16 +687,32 @@ abstract class NumberFormat extends Format {
     return parse(source, pos)
   }
 
-  public boolean isParseIntegerOnly() { return parseIntegerOnly }
-  public void setParseIntegerOnly(boolean v) { parseIntegerOnly = v }
+  public boolean isParseIntegerOnly() {
+    return parseIntegerOnly
+  }
+  public void setParseIntegerOnly(boolean v) {
+    parseIntegerOnly = v
+  }
 
-  public boolean isGroupingUsed() { return groupingUsed }
-  public void setGroupingUsed(boolean v) { groupingUsed = v }
+  public boolean isGroupingUsed() {
+    return groupingUsed
+  }
+  public void setGroupingUsed(boolean v) {
+    groupingUsed = v
+  }
 
-  public int getMaximumIntegerDigits() { return maximumIntegerDigits }
-  public int getMinimumIntegerDigits() { return minimumIntegerDigits }
-  public int getMaximumFractionDigits() { return maximumFractionDigits }
-  public int getMinimumFractionDigits() { return minimumFractionDigits }
+  public int getMaximumIntegerDigits() {
+    return maximumIntegerDigits
+  }
+  public int getMinimumIntegerDigits() {
+    return minimumIntegerDigits
+  }
+  public int getMaximumFractionDigits() {
+    return maximumFractionDigits
+  }
+  public int getMinimumFractionDigits() {
+    return minimumFractionDigits
+  }
 
   /* Java clamps the four digit limits against each other rather than letting
      them cross: setting a minimum above the maximum raises the maximum, setting
@@ -647,23 +800,49 @@ class DecimalFormat extends NumberFormat {
     symbols = s.copy()
   }
 
-  public boolean isDecimalSeparatorAlwaysShown() { return decimalSeparatorAlwaysShown }
-  public void setDecimalSeparatorAlwaysShown(boolean v) { decimalSeparatorAlwaysShown = v }
+  public boolean isDecimalSeparatorAlwaysShown() {
+    return decimalSeparatorAlwaysShown
+  }
+  public void setDecimalSeparatorAlwaysShown(boolean v) {
+    decimalSeparatorAlwaysShown = v
+  }
 
-  public int getMultiplier() { return multiplier }
-  public void setMultiplier(int m) { multiplier = m }
+  public int getMultiplier() {
+    return multiplier
+  }
+  public void setMultiplier(int m) {
+    multiplier = m
+  }
 
-  public int getGroupingSize() { return groupingSize }
+  public int getGroupingSize() {
+    return groupingSize
+  }
 
-  public String getPositivePrefix() { return expandAffix(positivePrefixPattern) }
-  public String getPositiveSuffix() { return expandAffix(positiveSuffixPattern) }
-  public String getNegativePrefix() { return expandAffix(negativePrefixPattern) }
-  public String getNegativeSuffix() { return expandAffix(negativeSuffixPattern) }
+  public String getPositivePrefix() {
+    return expandAffix(positivePrefixPattern)
+  }
+  public String getPositiveSuffix() {
+    return expandAffix(positiveSuffixPattern)
+  }
+  public String getNegativePrefix() {
+    return expandAffix(negativePrefixPattern)
+  }
+  public String getNegativeSuffix() {
+    return expandAffix(negativeSuffixPattern)
+  }
 
-  public void setPositivePrefix(String s) { positivePrefixPattern = s }
-  public void setPositiveSuffix(String s) { positiveSuffixPattern = s }
-  public void setNegativePrefix(String s) { negativePrefixPattern = s }
-  public void setNegativeSuffix(String s) { negativeSuffixPattern = s }
+  public void setPositivePrefix(String s) {
+    positivePrefixPattern = s
+  }
+  public void setPositiveSuffix(String s) {
+    positiveSuffixPattern = s
+  }
+  public void setNegativePrefix(String s) {
+    negativePrefixPattern = s
+  }
+  public void setNegativeSuffix(String s) {
+    negativeSuffixPattern = s
+  }
 
   // ------------------------------------------------------------ pattern
 
@@ -679,7 +858,7 @@ class DecimalFormat extends NumberFormat {
       throw new NullPointerException()
     }
     String[] parts = splitSubpatterns(pattern)
-    if (parts[1] != null && !hasDigitPlace(parts[0])) {
+    if (parts[1] != null &&!hasDigitPlace(parts[0])) {
       // "x;0" and ";0" are Java's "Unquoted special character ';'": a
       // subpattern separator only separates two subpatterns, and the first
       // one is not a subpattern until it has a digit place.
@@ -952,7 +1131,7 @@ class DecimalFormat extends NumberFormat {
     // integer digit, and a '0' anywhere in the number part ("#.0") is what
     // stops it; a '0' in the exponent ("#.##E0") is not the pattern's own
     // digit place and does not count.
-    if (minInt == 0 && maxInt > 0 && !sawZero && sawDot) {
+    if (minInt == 0 && maxInt > 0 &&!sawZero && sawDot) {
       minInt = 1
     }
     if (multChars > 1) {
@@ -1071,7 +1250,7 @@ class DecimalFormat extends NumberFormat {
     b.append(positivePrefixPattern)
     b.append(useExponentialNotation ? exponentialBody() : fixedBody())
     b.append(positiveSuffixPattern)
-    if (!negativePrefixPattern.equals("-" + positivePrefixPattern) || !negativeSuffixPattern.equals(positiveSuffixPattern)) {
+    if (!negativePrefixPattern.equals("-" + positivePrefixPattern) ||!negativeSuffixPattern.equals(positiveSuffixPattern)) {
       b.append(symbols.getPatternSeparator())
       b.append(negativePrefixPattern)
       b.append(useExponentialNotation ? exponentialBody() : fixedBody())
@@ -1235,6 +1414,13 @@ class DecimalFormat extends NumberFormat {
           i = close + 1
         }
       } else if (c == '%') {
+        /* The JDK's percent pattern for de, fr and ru is "#,##0\u00a0%": the
+           sign goes after the number with a no-break space, while en and ja have
+           it tight. The affix carries a '%' wherever the pattern wrote it, so
+           the spacing is added here, in front, when the locale asks for it. */
+        if (symbols.percentNbsp()) {
+          b.append('\u00a0')
+        }
         b.append(symbols.getPercent())
         i = i + 1
       } else if (affix.startsWith("‰", i)) {
@@ -1252,7 +1438,6 @@ class DecimalFormat extends NumberFormat {
   }
 
   // ------------------------------------------------------------ format
-
   public String format(double number) {
     return format(number, new StringBuilder()).toString()
   }
@@ -1346,7 +1531,7 @@ class DecimalFormat extends NumberFormat {
         intDigits = "0" + intDigits
       }
     }
-    if (intDigits.length() == 0 && fracDigits.length() == 0 && !decimalSeparatorAlwaysShown) {
+    if (intDigits.length() == 0 && fracDigits.length() == 0 &&!decimalSeparatorAlwaysShown) {
       // an empty integer part is only legal when a fraction follows it
       intDigits = "0"
     }
@@ -1472,7 +1657,6 @@ class DecimalFormat extends NumberFormat {
   }
 
   // ------------------------------------------------------------ parse
-
   public Number parse(String source) {
     ParsePosition pos = new ParsePosition(0)
     Number n = parse(source, pos)
@@ -1530,14 +1714,14 @@ class DecimalFormat extends NumberFormat {
         j = j + 1
         continue
       }
-      if (c == symbols.getGroupingSeparator() && !hasDot) {
+      if (c == symbols.getGroupingSeparator() &&!hasDot) {
         if (j + 1 < source.length() && isAsciiDigit(source.charAt(j + 1))) {
           j = j + 1
           continue
         }
         break
       }
-      if (c == symbols.getDecimalSeparator() && !hasDot) {
+      if (c == symbols.getDecimalSeparator() &&!hasDot) {
         hasDot = true
         any = true
         j = j + 1
@@ -1640,21 +1824,63 @@ class DateFormatSymbols {
   private String[] amPmStrings = { "AM", "PM" }
   private String[] eras = { "BC", "AD" }
 
-  public DateFormatSymbols() {
+  public DateFormatSymbols() {}
+
+  /* The JDK's getInstance(Locale): the month and AM/PM names this library
+     carries for the language, from the table in DateSymbols below. A language
+     whose names are not there answers the English ones, which is what the
+     library did before there was a Locale at all. */
+  public static DateFormatSymbols getInstance(Locale locale) {
+    DateFormatSymbols s = new DateFormatSymbols()
+    Object[] row = LocaleFormats.dateSymbols(locale)
+    s.months = (String[]) row[1]
+    s.shortMonths = (String[]) row[2]
+    s.weekdays = (String[]) row[3]
+    s.shortWeekdays = (String[]) row[4]
+    s.amPmStrings = (String[]) row[5]
+    return s
   }
 
-  public String[] getMonths() { return months }
-  public void setMonths(String[] v) { months = v }
-  public String[] getShortMonths() { return shortMonths }
-  public void setShortMonths(String[] v) { shortMonths = v }
-  public String[] getWeekdays() { return weekdays }
-  public void setWeekdays(String[] v) { weekdays = v }
-  public String[] getShortWeekdays() { return shortWeekdays }
-  public void setShortWeekdays(String[] v) { shortWeekdays = v }
-  public String[] getAmPmStrings() { return amPmStrings }
-  public void setAmPmStrings(String[] v) { amPmStrings = v }
-  public String[] getEras() { return eras }
-  public void setEras(String[] v) { eras = v }
+  public static DateFormatSymbols getInstance() {
+    return getInstance(Locale.getDefault())
+  }
+
+  public String[] getMonths() {
+    return months
+  }
+  public void setMonths(String[] v) {
+    months = v
+  }
+  public String[] getShortMonths() {
+    return shortMonths
+  }
+  public void setShortMonths(String[] v) {
+    shortMonths = v
+  }
+  public String[] getWeekdays() {
+    return weekdays
+  }
+  public void setWeekdays(String[] v) {
+    weekdays = v
+  }
+  public String[] getShortWeekdays() {
+    return shortWeekdays
+  }
+  public void setShortWeekdays(String[] v) {
+    shortWeekdays = v
+  }
+  public String[] getAmPmStrings() {
+    return amPmStrings
+  }
+  public void setAmPmStrings(String[] v) {
+    amPmStrings = v
+  }
+  public String[] getEras() {
+    return eras
+  }
+  public void setEras(String[] v) {
+    eras = v
+  }
 
   public DateFormatSymbols copy() {
     DateFormatSymbols s = new DateFormatSymbols()
@@ -1732,6 +1958,19 @@ abstract class DateFormat extends Format {
     return new SimpleDateFormat(dateStylePattern(style))
   }
 
+  public static DateFormat getDateInstance(int style, Locale locale) {
+    return new SimpleDateFormat(LocaleFormats.datePattern(locale, style), locale)
+  }
+
+  public static DateFormat getInstance(Locale locale) {
+    return new SimpleDateFormat(LocaleFormats.dateTimeShortPattern(locale), locale)
+  }
+
+  public static DateFormat getDateTimeInstance(int dateStyle, int timeStyle, Locale locale) {
+    return new SimpleDateFormat(LocaleFormats.datePattern(locale, dateStyle) + ", "
+      + LocaleFormats.timePattern(locale, timeStyle), locale)
+  }
+
   public static DateFormat getTimeInstance(int style) {
     return new SimpleDateFormat(timeStylePattern(style))
   }
@@ -1740,7 +1979,7 @@ abstract class DateFormat extends Format {
     return new SimpleDateFormat(dateStylePattern(dateStyle) + ", " + timeStylePattern(timeStyle))
   }
 
-  public static String dateStylePattern(int style) {
+  static String dateStylePattern(int style) {
     if (style == FULL) {
       return "EEEE, MMMM d, y"
     }
@@ -1762,7 +2001,7 @@ abstract class DateFormat extends Format {
      these four strings are meant to be the patterns Java prints for the time
      styles. A pattern a program writes itself keeps whatever space it has --
      "h:mm a" is five ASCII characters and formats with one. */
-  public static String timeStylePattern(int style) {
+  static String timeStylePattern(int style) {
     if (style == FULL) {
       return "h:mm:ss\u202Fa zzzz"
     }
@@ -1817,8 +2056,12 @@ abstract class DateFormat extends Format {
     return parse(source, pos)
   }
 
-  public boolean isLenient() { return lenientFlag }
-  public void setLenient(boolean v) { lenientFlag = v }
+  public boolean isLenient() {
+    return lenientFlag
+  }
+  public void setLenient(boolean v) {
+    lenientFlag = v
+  }
 }
 
 /* DateFields is the accumulator a parse writes into and the normaliser then
@@ -1874,7 +2117,22 @@ class SimpleDateFormat extends DateFormat {
     applyPattern(pattern)
   }
 
-  public DateFormatSymbols getDateFormatSymbols() { return symbols.copy() }
+  /* Java's locale constructor. A locale with data answers that locale's names;
+     one without answers ROOT's English, which DateFormatSymbols.getInstance
+     already does, so there is nothing else to decide here. */
+  public SimpleDateFormat(String pattern, Locale locale) {
+    this.symbols = DateFormatSymbols.getInstance(locale)
+    applyPattern(pattern)
+  }
+
+  public SimpleDateFormat(String pattern, Locale locale, DateFormatSymbols symbols) {
+    this.symbols = symbols.copy()
+    applyPattern(pattern)
+  }
+
+  public DateFormatSymbols getDateFormatSymbols() {
+    return symbols.copy()
+  }
   public void setDateFormatSymbols(DateFormatSymbols s) {
     if (s == null) {
       throw new NullPointerException()
@@ -1882,9 +2140,15 @@ class SimpleDateFormat extends DateFormat {
     symbols = s.copy()
   }
 
-  public String toPattern() { return pattern }
-  public String toLocalizedPattern() { return pattern }
-  public void applyLocalizedPattern(String p) { applyPattern(p) }
+  public String toPattern() {
+    return pattern
+  }
+  public String toLocalizedPattern() {
+    return pattern
+  }
+  public void applyLocalizedPattern(String p) {
+    applyPattern(p)
+  }
 
   /* applyPattern checks the letters before it stores anything, so a pattern
      with an illegal one leaves the formatter as it was -- the JDK checks as it
@@ -1909,7 +2173,7 @@ class SimpleDateFormat extends DateFormat {
         }
         continue
       }
-      if (isAsciiLetter(c) && !isPatternLetter(c)) {
+      if (isAsciiLetter(c) &&!isPatternLetter(c)) {
         throw new IllegalArgumentException("Illegal pattern character '" + c + "'")
       }
       i = i + 1
@@ -1923,10 +2187,7 @@ class SimpleDateFormat extends DateFormat {
   /* The JDK's set of fields, exactly: D E F G H K L M S W X Y Z and a d h k m s
      u w y z. Everything else in the alphabet is rejected. */
   private static boolean isPatternLetter(char c) {
-    return c == 'D' || c == 'E' || c == 'F' || c == 'G' || c == 'H' || c == 'K'
-        || c == 'L' || c == 'M' || c == 'S' || c == 'W' || c == 'X' || c == 'Y'
-        || c == 'Z' || c == 'a' || c == 'd' || c == 'h' || c == 'k' || c == 'm'
-        || c == 's' || c == 'u' || c == 'w' || c == 'y' || c == 'z'
+    return c == 'D' || c == 'E' || c == 'F' || c == 'G' || c == 'H' || c == 'K' || c == 'L' || c == 'M' || c == 'S' || c == 'W' || c == 'X' || c == 'Y' || c == 'Z' || c == 'a' || c == 'd' || c == 'h' || c == 'k' || c == 'm' || c == 's' || c == 'u' || c == 'w' || c == 'y' || c == 'z'
   }
 
   /* spaceSeparatorLength answers whether a Zs character starts at s[i] -- the
@@ -1943,7 +2204,7 @@ class SimpleDateFormat extends DateFormat {
     }
     char c = s.charAt(i)
     if (c == ' ' || c == '\u00A0' || c == '\u1680' || c == '\u202F' ||
-        c == '\u205F' || c == '\u3000') {
+      c == '\u205F' || c == '\u3000') {
       return 1
     }
     if (c >= '\u2000' && c <= '\u200A') {
@@ -1969,7 +2230,6 @@ class SimpleDateFormat extends DateFormat {
   }
 
   // ------------------------------------------------------------ format
-
   public String format(Instant instant) {
     return format(instant, new StringBuilder()).toString()
   }
@@ -2017,7 +2277,7 @@ class SimpleDateFormat extends DateFormat {
       while (i + count < pattern.length() && pattern.charAt(i + count) == c) {
         count = count + 1
       }
-      if (!isAsciiLetter(c) || !isPatternLetter(c)) {
+      if (!isAsciiLetter(c) ||!isPatternLetter(c)) {
         // the run is appended as the text it is and not one code unit at a
         // time: a literal that is not ASCII -- the narrow no-break space of the
         // CLDR time patterns, a currency sign -- may be held as a surrogate
@@ -2162,7 +2422,6 @@ class SimpleDateFormat extends DateFormat {
   }
 
   // ------------------------------------------------------------ parse
-
   public Instant parse(String source) {
     ParsePosition pos = new ParsePosition(0)
     Instant result = parse(source, pos)
@@ -2210,7 +2469,7 @@ class SimpleDateFormat extends DateFormat {
       while (p + count < pattern.length() && pattern.charAt(p + count) == c) {
         count = count + 1
       }
-      if (!isAsciiLetter(c) || !isPatternLetter(c)) {
+      if (!isAsciiLetter(c) ||!isPatternLetter(c)) {
         // A literal character has to appear in the text, with one exception:
         // any character of Unicode category Zs matches any other, so a pattern
         // with the narrow no-break space the CLDR styles use parses text typed
@@ -2367,9 +2626,15 @@ class SimpleDateFormat extends DateFormat {
       f.sawEra = true
       return i + symbols.getEras()[e].length()
     }
-    if (c == 'd') { return readInt(f, s, i, 1, width) }
-    if (c == 'D') { return readInt(f, s, i, 10, width) }
-    if (c == 'F') { return readInt(f, s, i, 11, width) }
+    if (c == 'd') {
+      return readInt(f, s, i, 1, width)
+    }
+    if (c == 'D') {
+      return readInt(f, s, i, 10, width)
+    }
+    if (c == 'F') {
+      return readInt(f, s, i, 11, width)
+    }
     if (c == 'E') {
       // Four letters or more is the full name and three or fewer the
       // abbreviation, the same split the formatter uses; a name of the other
@@ -2386,7 +2651,9 @@ class SimpleDateFormat extends DateFormat {
       }
       return i + first[d].length()
     }
-    if (c == 'u') { return readInt(f, s, i, 9, width) }
+    if (c == 'u') {
+      return readInt(f, s, i, 9, width)
+    }
     if (c == 'a') {
       int n = matchName(s, i, symbols.getAmPmStrings(), 2)
       if (n < 0) {
@@ -2397,29 +2664,47 @@ class SimpleDateFormat extends DateFormat {
     }
     if (c == 'H') {
       int r = readInt(f, s, i, 5, width)
-      if (r >= 0) { f.sawHourOfDay = true }
+      if (r >= 0) {
+        f.sawHourOfDay = true
+      }
       return r
     }
     if (c == 'k') {
       int r = readInt(f, s, i, 4, width)
-      if (r >= 0) { f.sawHour1To24 = true }
+      if (r >= 0) {
+        f.sawHour1To24 = true
+      }
       return r
     }
     if (c == 'K') {
       int r = readInt(f, s, i, 16, width)
-      if (r >= 0) { f.sawHour0To11 = true }
+      if (r >= 0) {
+        f.sawHour0To11 = true
+      }
       return r
     }
     if (c == 'h') {
       int r = readInt(f, s, i, 15, width)
-      if (r >= 0) { f.sawHour12 = true }
+      if (r >= 0) {
+        f.sawHour12 = true
+      }
       return r
     }
-    if (c == 'm') { return readInt(f, s, i, 6, width) }
-    if (c == 's') { return readInt(f, s, i, 7, width) }
-    if (c == 'S') { return readInt(f, s, i, 8, width) }
-    if (c == 'w') { return readInt(f, s, i, 12, width) }
-    if (c == 'W') { return readInt(f, s, i, 13, width) }
+    if (c == 'm') {
+      return readInt(f, s, i, 6, width)
+    }
+    if (c == 's') {
+      return readInt(f, s, i, 7, width)
+    }
+    if (c == 'S') {
+      return readInt(f, s, i, 8, width)
+    }
+    if (c == 'w') {
+      return readInt(f, s, i, 12, width)
+    }
+    if (c == 'W') {
+      return readInt(f, s, i, 13, width)
+    }
     if (c == 'z') {
       // a zone name: consumed and ignored, since the calendar here is UTC and
       // the JDK's own zone database is not something this file has
@@ -2450,13 +2735,21 @@ class SimpleDateFormat extends DateFormat {
       n = width
     }
     int v = Integer.parseInt(s.substring(at, at + n))
-    if (which == 1) { f.day = v }
-    else if (which == 4) { f.hour = (v == 24 ? 0 : v) }
-    else if (which == 5) { f.hour = v }
-    else if (which == 6) { f.minute = v }
-    else if (which == 7) { f.second = v }
-    else if (which == 8) { f.milli = v }
-    else if (which == 15 || which == 16) { f.hour = v }
+    if (which == 1) {
+      f.day = v
+    } else if (which == 4) {
+      f.hour = (v == 24 ? 0 : v)
+    } else if (which == 5) {
+      f.hour = v
+    } else if (which == 6) {
+      f.minute = v
+    } else if (which == 7) {
+      f.second = v
+    } else if (which == 8) {
+      f.milli = v
+    } else if (which == 15 || which == 16) {
+      f.hour = v
+    }
     // 9, 10, 11, 12 and 13 are the derived fields, and the JDK lets a pattern
     // name them; they are consumed here so the pattern still matches, but the
     // date is built from the primitive ones, as Java's Calendar does too.
@@ -2682,9 +2975,15 @@ class DateTimeFormatter {
   }
 
   private static int styleOrdinal(FormatStyle style) {
-    if (style == FormatStyle.FULL) { return DateFormat.FULL }
-    if (style == FormatStyle.LONG) { return DateFormat.LONG }
-    if (style == FormatStyle.MEDIUM) { return DateFormat.MEDIUM }
+    if (style == FormatStyle.FULL) {
+      return DateFormat.FULL
+    }
+    if (style == FormatStyle.LONG) {
+      return DateFormat.LONG
+    }
+    if (style == FormatStyle.MEDIUM) {
+      return DateFormat.MEDIUM
+    }
     return DateFormat.SHORT
   }
 
@@ -2702,7 +3001,9 @@ class DateTimeFormatter {
     return f
   }
 
-  public ResolverStyle getResolverStyle() { return resolver }
+  public ResolverStyle getResolverStyle() {
+    return resolver
+  }
 
   /* translate rewrites a java.time pattern as a SimpleDateFormat one. Only two
      letters actually move: 'u' is the proleptic year here and the plain year
@@ -2720,8 +3021,7 @@ class DateTimeFormatter {
         continue
       }
       if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-        if (c != 'G' && c != 'u' && c != 'y' && c != 'M' && c != 'L' && c != 'd' && c != 'D'
-            && c != 'E' && c != 'H' && c != 'h' && c != 'm' && c != 's' && c != 'S' && c != 'a') {
+        if (c != 'G' && c != 'u' && c != 'y' && c != 'M' && c != 'L' && c != 'd' && c != 'D' && c != 'E' && c != 'H' && c != 'h' && c != 'm' && c != 's' && c != 'S' && c != 'a') {
           throw new IllegalArgumentException("Unknown pattern letter: " + c)
         }
         if (c == 'u' || c == 'G' || c == 'D') {
@@ -2756,7 +3056,6 @@ class DateTimeFormatter {
   }
 
   // ------------------------------------------------------------ format
-
   public String format(LocalDate date) {
     if (isIso()) {
       checkFields(fieldPattern(), true, false)
@@ -2803,8 +3102,7 @@ class DateTimeFormatter {
   }
 
   private boolean isIso() {
-    return kind.equals("iso-date") || kind.equals("iso-time") || kind.equals("iso-datetime")
-        || kind.equals("iso-instant") || kind.equals("basic-date")
+    return kind.equals("iso-date") || kind.equals("iso-time") || kind.equals("iso-datetime") || kind.equals("iso-instant") || kind.equals("basic-date")
   }
 
   /* Java refuses to format a value with a pattern that names a field the value
@@ -2816,21 +3114,51 @@ class DateTimeFormatter {
      below. The name in the message is java.time's ChronoField name, which is
      what the JDK's UnsupportedTemporalTypeException carries. */
   private static String fieldOf(char c) {
-    if (c == 'G') { return "Era" }
-    if (c == 'u') { return "Year" }
-    if (c == 'y') { return "YearOfEra" }
-    if (c == 'M' || c == 'L') { return "MonthOfYear" }
-    if (c == 'd') { return "DayOfMonth" }
-    if (c == 'D') { return "DayOfYear" }
-    if (c == 'E') { return "DayOfWeek" }
-    if (c == 'a') { return "AmPmOfDay" }
-    if (c == 'h') { return "ClockHourOfAmPm" }
-    if (c == 'H') { return "HourOfDay" }
-    if (c == 'k') { return "ClockHourOfDay" }
-    if (c == 'K') { return "HourOfAmPm" }
-    if (c == 'm') { return "MinuteOfHour" }
-    if (c == 's') { return "SecondOfMinute" }
-    if (c == 'S') { return "NanoOfSecond" }
+    if (c == 'G') {
+      return "Era"
+    }
+    if (c == 'u') {
+      return "Year"
+    }
+    if (c == 'y') {
+      return "YearOfEra"
+    }
+    if (c == 'M' || c == 'L') {
+      return "MonthOfYear"
+    }
+    if (c == 'd') {
+      return "DayOfMonth"
+    }
+    if (c == 'D') {
+      return "DayOfYear"
+    }
+    if (c == 'E') {
+      return "DayOfWeek"
+    }
+    if (c == 'a') {
+      return "AmPmOfDay"
+    }
+    if (c == 'h') {
+      return "ClockHourOfAmPm"
+    }
+    if (c == 'H') {
+      return "HourOfDay"
+    }
+    if (c == 'k') {
+      return "ClockHourOfDay"
+    }
+    if (c == 'K') {
+      return "HourOfAmPm"
+    }
+    if (c == 'm') {
+      return "MinuteOfHour"
+    }
+    if (c == 's') {
+      return "SecondOfMinute"
+    }
+    if (c == 'S') {
+      return "NanoOfSecond"
+    }
     return null
   }
 
@@ -2851,10 +3179,10 @@ class DateTimeFormatter {
       }
       if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
         boolean time = isTimeLetter(c)
-        if (time && !timeOk) {
+        if (time &&!timeOk) {
           throw new UnsupportedTemporalTypeException("Unsupported field: " + fieldOf(c))
         }
-        if (!time && !dateOk) {
+        if (!time &&!dateOk) {
           throw new UnsupportedTemporalTypeException("Unsupported field: " + fieldOf(c))
         }
       }
@@ -2957,7 +3285,6 @@ class DateTimeFormatter {
   }
 
   // ------------------------------------------------------------ parse
-
   public LocalDate parseDate(String text) {
     if (kind.equals("basic-date")) {
       int[] f = readBasicIsoDate(text)
@@ -3118,7 +3445,7 @@ class DateTimeFormatter {
   }
 
   private static int readTwo(String s, int at, int[] out, int slot) {
-    if (at + 1 >= s.length() || !isDigit(s.charAt(at)) || !isDigit(s.charAt(at + 1))) {
+    if (at + 1 >= s.length() ||!isDigit(s.charAt(at)) ||!isDigit(s.charAt(at + 1))) {
       throw new DateTimeParseException("Text '" + s + "' could not be parsed at index " + at, s, at)
     }
     out[slot] = (s.charAt(at) - '0') * 10 + (s.charAt(at + 1) - '0')
@@ -3198,8 +3525,12 @@ class DateTimeParseException extends DateTimeException {
     this.errorIndex = errorIndex
   }
 
-  public String getParsedString() { return parsedString }
-  public int getErrorIndex() { return errorIndex }
+  public String getParsedString() {
+    return parsedString
+  }
+  public int getErrorIndex() {
+    return errorIndex
+  }
 }
 
 // ---------------------------------------------------------------- choice and messages
@@ -3790,7 +4121,6 @@ class MessageFormat extends Format {
   }
 
   // ------------------------------------------------------------ format
-
   public String format(Object[] arguments) {
     if (arguments == null) {
       arguments = new Object[0]
@@ -3845,12 +4175,11 @@ class MessageFormat extends Format {
     return format(one)
   }
 
-  public static String format(String pattern, Object... arguments) {
+  public static String format(String pattern, Object...arguments) {
     return new MessageFormat(pattern).format(arguments)
   }
 
   // ------------------------------------------------------------ parse
-
   public Object[] parse(String source) throws ParseException {
     ParsePosition pos = new ParsePosition(0)
     Object[] result = parse(source, pos)

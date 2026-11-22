@@ -1,0 +1,389 @@
+package teyru
+
+/* java.util.Locale, as far as this standard library can carry it honestly: a
+   language, a country and a variant, the handful of locales whose data this
+   library actually ships, and the factory that resolves a tag onto one of them.
+
+   The design decision, stated once because everything else follows from it.
+
+   A Locale here is a *name*, not a database. The JDK resolves a locale into a
+   CLDR resource bundle of several thousand entries; this library carries a
+   table (below) of the locales whose number, date and currency data it has
+   verified against the JDK at 21 -- and for a tag whose data is not in that
+   table it answers the ROOT locale's data rather than pretending. That is
+   visible and it is deliberate: `NumberFormat.getInstance(Locale.forLanguageTag(
+   "sw"))` formats with the ROOT separators, which is what a program may not
+   expect from the JDK, and `Locale.getAvailableLocales()` says exactly which
+   ones are carried instead of returning the JDK's seven hundred.
+
+   What each carried locale actually has:
+
+     - the decimal and grouping separators, and the zero digit;
+     - the currency symbol and the international code;
+     - the percent pattern's placement of the sign, and the NBSP the JDK puts
+       between a number and a percent sign in the locales that have one;
+     - the month names, short month names and AM/PM strings, for the date side;
+     - the case mapping rules for Turkish, Azerbaijani and Lithuanian, which are
+       the three the language's locale-insensitive default gets wrong.
+
+   Data provenance: every row below was read out of OpenJDK 21.0.11+10 with a
+   small Java program on this machine, not typed from memory, and
+   tests/programs/t326_locale.teyru compares this library's output with the
+   JDK's for the same program.
+
+   Not here, each for a reason:
+     - `getDisplayCountry`/`getDisplayLanguage` for every locale: the display
+       names are translated CLDR strings, and a table of 40 languages' names in
+       40 languages is a resource bundle, not a class.
+     - `ResourceBundle`, `Collator`, `BreakIterator`, `DateFormatSymbols`
+       beyond the one table: those are their own data sets.
+     - `Locale.Builder`, extensions and the `u`/`x` keyword space. */
+class Locale {
+  /* ROOT is the empty language: it is the one locale whose data every other
+     locale falls back to, and the one this library always has. */
+  public static final Locale ROOT = new Locale("", "", "")
+  public static final Locale ENGLISH = new Locale("en", "", "")
+  public static final Locale US = new Locale("en", "US", "")
+  public static final Locale UK = new Locale("en", "GB", "")
+  public static final Locale CANADA = new Locale("en", "CA", "")
+  public static final Locale GERMANY = new Locale("de", "DE", "")
+  public static final Locale FRANCE = new Locale("fr", "FR", "")
+  public static final Locale JAPAN = new Locale("ja", "JP", "")
+  public static final Locale ITALY = new Locale("it", "IT", "")
+  public static final Locale KOREA = new Locale("ko", "KR", "")
+  public static final Locale CHINA = new Locale("zh", "CN", "")
+  public static final Locale TAIWAN = new Locale("zh", "TW", "")
+
+  /* The languages and countries this file carries data for. Anything else
+     resolves to the language-only locale with the ROOT data, and the list is
+     what getAvailableLocales answers with -- so a program can ask whether the
+     locale it wants is really there instead of formatting with the wrong
+     separators and finding out from the output. */
+  private static final String[] LANGUAGES = {
+    "", "en", "de", "fr", "ja", "zh", "es", "it", "pt", "ru", "ko", "ar",
+    "nl", "pl", "sv", "tr", "az", "lt", "uk", "cs", "el", "he", "th", "vi",
+    "id", "fi", "da", "no", "hu", "ro", "bg", "hr", "sk", "sl", "et", "lv", "ca"
+  }
+
+  private static final String[] COUNTRIES = {
+    "", "US", "GB", "CA", "DE", "FR", "JP", "IT", "KR", "CN", "TW", "BR", "MX",
+    "ES", "RU", "NL", "PL", "SE", "TR", "AZ", "LT", "UA", "CZ", "GR", "IL", "TH",
+    "VN", "ID", "FI", "DK", "NO", "HU", "RO", "BG", "HR", "SK", "SI", "EE", "LV", "CA"
+  }
+
+  public final String language
+  public final String country
+  public final String variant
+
+  public Locale(String language) {
+    this(language, "", "")
+  }
+
+  public Locale(String language, String country) {
+    this(language, country, "")
+  }
+
+  public Locale(String language, String country, String variant) {
+    this.language = language == null ? "" : language.toLowerCase()
+    this.country = country == null ? "" : country.toUpperCase()
+    this.variant = variant == null ? "" : variant
+  }
+
+  /* forLanguageTag: "de-DE", "zh-TW", "en", and the underscore form the JDK's
+     own toString produces. An unknown tag is not refused -- the JDK does not
+     refuse one either -- it simply carries no data this library knows. */
+  public static Locale forLanguageTag(String tag) {
+    if (tag == null || tag.length() == 0 || tag.equalsIgnoreCase("und")) {
+      return ROOT
+    }
+    String t = tag.replace('_', '-')
+    String lang = ""
+    String country = ""
+    int dash = t.indexOf('-')
+    if (dash < 0) {
+      lang = t
+    } else {
+      lang = t.substring(0, dash)
+      String rest = t.substring(dash + 1)
+      int dash2 = rest.indexOf('-')
+      if (dash2 < 0) {
+        country = rest
+      } else {
+        country = rest.substring(0, dash2)
+      }
+    }
+    return new Locale(lang, country, "")
+  }
+
+  public String toLanguageTag() {
+    if (language.length() == 0) {
+      return "und"
+    }
+    if (country.length() == 0) {
+      return language
+    }
+    return language + "-" + country
+  }
+
+  public String getLanguage() {
+    return language
+  }
+  public String getCountry() {
+    return country
+  }
+  public String getVariant() {
+    return variant
+  }
+
+  public boolean isRoot() {
+    return language.length() == 0 && country.length() == 0
+  }
+
+  /* Java's toString: language_country_variant, with the empty parts dropped --
+     so ROOT is "" and US is "en_US". */
+  public String toString() {
+    if (language.length() == 0) {
+      return variant.length() > 0 ? "_" + variant : ""
+    }
+    if (country.length() == 0) {
+      return variant.length() > 0 ? language + "__" + variant : language
+    }
+    return variant.length() > 0 ? language + "_" + country + "_" + variant : language + "_" + country
+  }
+
+  public boolean equals(Object o) {
+    if (!(o instanceof Locale)) {
+      return false
+    }
+    Locale l = (Locale) o
+    return l.language.equals(language) && l.country.equals(country) && l.variant.equals(variant)
+  }
+
+  public int hashCode() {
+    return language.hashCode() * 31 + country.hashCode() * 17 + variant.hashCode()
+  }
+
+  /* The locales this library carries. The JDK answers with every locale the
+     CLDR has; this answers with the ones whose data is in the table, which is
+     what makes "is it there" an answerable question rather than a hopeful one. */
+  public static Locale[] getAvailableLocales() {
+    List<Locale> out = new ArrayList<Locale>()
+    out.add(ROOT)
+    for (int i = 0 : i < LANGUAGES.length : i++) {
+      if (LANGUAGES[i].length() == 0) {
+        continue
+      }
+      out.add(new Locale(LANGUAGES[i], "", ""))
+    }
+    for (int i = 0 : i < COUNTRIES.length : i++) {
+      if (COUNTRIES[i].length() == 0) {
+        continue
+      }
+      out.add(new Locale("", COUNTRIES[i], ""))
+    }
+    /* The region-qualified locales whose data differs from the language's, and
+       the language-only ones a program reaches for. */
+    String[][] pairs = {
+      { "en", "US" }, { "en", "GB" }, { "en", "CA" }, { "de", "DE" }, { "fr", "FR" }, { "ja", "JP" }, { "zh", "TW" }, { "zh", "CN" }, { "pt", "BR" }, { "es", "ES" }, { "ru", "RU" }, { "ko", "KR" }, { "it", "IT" }
+    }
+    for (int i = 0 : i < pairs.length : i++) {
+      out.add(new Locale(pairs[i][0], pairs[i][1], ""))
+    }
+    return (Locale[]) out.toArray()
+  }
+
+  /* The JDK's getDefault: the operating system's locale, from the standard
+     environment variables a POSIX system sets. LC_ALL wins over LANG, as
+     setlocale does, and a value with an encoding or a modifier tail
+     ("en_US.UTF-8", "de_DE@euro") is cut back to the tag. A machine with none
+     of them -- or with the C/POSIX locale, which is what a daemon usually has --
+     answers en-US, because that is what the JDK answers: `env -u LANG java`
+     prints en_US on this machine. */
+  public static Locale getDefault() {
+    String v = System.getenv("LC_ALL")
+    if (v == null || v.length() == 0) {
+      v = System.getenv("LC_MESSAGES")
+    }
+    if (v == null || v.length() == 0) {
+      v = System.getenv("LANG")
+    }
+    /* The JDK's answer with nothing set is en_US, and it treats the C and POSIX
+       locales the same way: a process that never chose a locale formats the way
+       English does, it does not fall back to a locale with no data. */
+    if (v == null || v.length() == 0) {
+      return US
+    }
+    int dot = v.indexOf('.')
+    if (dot >= 0) {
+      v = v.substring(0, dot)
+    }
+    int at = v.indexOf('@')
+    if (at >= 0) {
+      v = v.substring(0, at)
+    }
+    if (v.equals("C") || v.equals("POSIX")) {
+      return US
+    }
+    return forLanguageTag(v)
+  }
+
+  /* ---------------------------------------------------------------- data */
+
+  /* One language's number and date data. Row 0 of NUMBER_DATA is ROOT. The
+     fields are what the number formatters and the date symbols need; the
+     currency code is the JDK's for the region, and the symbol is the one
+     getCurrencyInstance(locale) prints. */
+  private static final Object[][] NUMBER_DATA = {
+    /* tag, grouping, decimal, zeroDigit, currencySymbol, currencyCode,
+       percentSuffix (true when the JDK prints "26 %" rather than "26%"),
+       currencyPrefix (true when the symbol comes first), nbspBeforePercent */
+    {
+      "", ",", ".", '0', "\u00a4", "XXX", false, true, false
+    }, { "en", ",", ".", '0', "\u00a4", "XXX", false, true, false }, { "en-US", ",", ".", '0', "$", "USD", false, true, false }, { "en-GB", ",", ".", '0', "\u00a3", "GBP", false, true, false }, { "en-CA", ",", ".", '0', "$", "CAD", false, true, false }, { "de", ".", ",", '0', "\u00a4", "XXX", true, false, true }, { "de-DE", ".", ",", '0', "\u20ac", "EUR", true, false, true }, { "fr", "\u202f", ",", '0', "\u00a4", "XXX", true, false, true }, { "fr-FR", "\u202f", ",", '0', "\u20ac", "EUR", true, false, true }, { "ja", ",", ".", '0', "\u00a4", "XXX", false, true, false }, { "ja-JP", ",", ".", '0', "\uffe5", "JPY", false, true, false }, { "zh", ",", ".", '0', "\u00a4", "XXX", false, true, false }, { "zh-TW", ",", ".", '0', "$", "TWD", false, true, false }, { "zh-CN", ",", ".", '0', "\u00a5", "CNY", false, true, false }, { "es", ".", ",", '0', "\u00a4", "XXX", true, false, true }, { "es-ES", ".", ",", '0', "\u20ac", "EUR", true, false, true }, { "it", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "pt", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "pt-BR", ".", ",", '0', "R$", "BRL", false, true, false }, { "ru", "\u00a0", ",", '0', "\u00a4", "XXX", true, false, true }, { "ru-RU", "\u00a0", ",", '0', "\u20bd", "RUB", true, false, true }, { "ko", ",", ".", '0', "\u00a4", "XXX", false, true, false }, { "ko-KR", ",", ".", '0', "\u20a9", "KRW", false, true, false }, { "ar", "\u066c", "\u066b", '\u0660', "\u00a4", "XXX", true, false, false }, { "nl", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "pl", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "sv", "\u00a0", ",", '0', "\u00a4", "XXX", true, false, true }, { "tr", ".", ",", '0', "\u00a4", "XXX", false, true, false }, { "uk", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "cs", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "el", ".", ",", '0', "\u00a4", "XXX", true, false, true }, { "he", ",", ".", '0', "\u00a4", "XXX", false, true, false }, { "th", ",", ".", '0', "\u00a4", "XXX", false, true, false }, { "vi", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "id", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "fi", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "da", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "no", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "hu", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "ro", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "bg", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "hr", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "sk", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "sl", ".", ",", '0', "\u00a4", "XXX", false, false, false }, { "et", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "lv", "\u00a0", ",", '0', "\u00a4", "XXX", false, false, false }, { "ca", ".", ",", '0', "\u00a4", "XXX", false, false, false }
+  }
+
+  /* The row for this locale, or the language's row, or ROOT's. A region whose
+     row is not in the table falls back to its language, which is what makes
+     "de-AT" format like "de". */
+  public Object[] numberData() {
+    if (language.length() > 0) {
+      Object[] exact = findRow(toLanguageTag())
+      if (exact != null) {
+        return exact
+      }
+      Object[] lang = findRow(language)
+      if (lang != null) {
+        return lang
+      }
+    }
+    return findRow("")
+  }
+
+  private static Object[] findRow(String tag) {
+    for (int i = 0 : i < NUMBER_DATA.length : i++) {
+      if (NUMBER_DATA[i][0].equals(tag)) {
+        return NUMBER_DATA[i]
+      }
+    }
+    return null
+  }
+
+  /* The locale whose date names are carried, or ROOT: the month names are per
+     language, and the regions that differ (the Chinese ones) use the numeric
+     form the JDK does. */
+  public Locale dateLocale() {
+    if (language.length() == 0) {
+      return this
+    }
+    return new Locale(language, "", "")
+  }
+
+  /* The display name, in the language of `inLocale` -- but only for the locales
+     this file carries, and only in English, which is the one translation table
+     it has. An unknown locale answers its own tag, which is more useful than an
+     empty string and is what the JDK's CLDR does for an unknown code too. */
+  public String getDisplayName(Locale inLocale) {
+    String lang = displayLanguage()
+    if (lang.length() == 0) {
+      return country.length() > 0 ? displayCountry() : "Unknown"
+    }
+    String c = displayCountry()
+    if (c.length() == 0) {
+      return lang
+    }
+    return lang + " (" + c + ")"
+  }
+
+  private String displayLanguage() {
+    if (language.length() == 0) {
+      return ""
+    }
+    String[] names = {
+      "en", "English", "de", "German", "fr", "French", "ja", "Japanese",
+      "zh", "Chinese", "es", "Spanish", "it", "Italian", "pt", "Portuguese",
+      "ru", "Russian", "ko", "Korean", "ar", "Arabic", "nl", "Dutch",
+      "pl", "Polish", "sv", "Swedish", "tr", "Turkish", "az", "Azerbaijani",
+      "lt", "Lithuanian", "uk", "Ukrainian", "cs", "Czech", "el", "Greek",
+      "he", "Hebrew", "th", "Thai", "vi", "Vietnamese", "id", "Indonesian",
+      "fi", "Finnish", "da", "Danish", "no", "Norwegian", "hu", "Hungarian",
+      "ro", "Romanian", "bg", "Bulgarian", "hr", "Croatian", "sk", "Slovak",
+      "sl", "Slovenian", "et", "Estonian", "lv", "Latvian", "ca", "Catalan"
+    }
+    for (int i = 0 : i < names.length : i += 2) {
+      if (names[i].equals(language)) {
+        return names[i + 1]
+      }
+    }
+    return language
+  }
+
+  private String displayCountry() {
+    if (country.length() == 0) {
+      return ""
+    }
+    String[] names = {
+      "US", "United States", "GB", "United Kingdom", "CA", "Canada",
+      "DE", "Germany", "FR", "France", "JP", "Japan", "IT", "Italy",
+      "KR", "South Korea", "CN", "China", "TW", "Taiwan", "BR", "Brazil",
+      "MX", "Mexico", "ES", "Spain", "RU", "Russia", "NL", "Netherlands",
+      "PL", "Poland", "SE", "Sweden", "TR", "Türkiye", "AZ", "Azerbaijan",
+      "LT", "Lithuania", "UA", "Ukraine", "CZ", "Czechia", "GR", "Greece",
+      "IL", "Israel", "TH", "Thailand", "VN", "Vietnam", "ID", "Indonesia",
+      "FI", "Finland", "DK", "Denmark", "NO", "Norway", "HU", "Hungary",
+      "RO", "Romania", "BG", "Bulgaria", "HR", "Croatia", "SK", "Slovakia",
+      "SI", "Slovenia", "EE", "Estonia", "LV", "Latvia"
+    }
+    for (int i = 0 : i < names.length : i += 2) {
+      if (names[i].equals(country)) {
+        return names[i + 1]
+      }
+    }
+    return country
+  }
+
+  /* ---------------------------------------------------------------- case */
+
+  /* The three locales whose case mapping is not the language's default, and the
+     rules that make them different. Turkish and Azerbaijani have four: I maps to
+     dotless ı in lower case and i to dotted İ in upper case, both of which the
+     ordinary Character.toUpperCase/LowerCase get wrong. Lithuanian keeps the
+     dot above a lower-case i when an accent follows it, which needs the
+     surrounding text, so the String methods handle that one. */
+  public boolean isTurkishLike() {
+    return language.equals("tr") || language.equals("az")
+  }
+
+  /* The lowercase of one code point under this locale. */
+  public int toLowerCase(int cp) {
+    if (isTurkishLike()) {
+      if (cp == 'I') {
+        return 0x131 /* ı */
+      }
+      if (cp == 0x130) {
+        /* İ: in Turkish it lowercases to a plain i, not to i + combining dot. */
+        return 'i'
+      }
+    }
+    return Character.toLowerCase(cp)
+  }
+
+  public int toUpperCase(int cp) {
+    if (isTurkishLike()) {
+      if (cp == 'i') {
+        return 0x130 /* İ */
+      }
+      if (cp == 0x131) {
+        return 'I'
+      }
+    }
+    return Character.toUpperCase(cp)
+  }
+
+  public char toLowerCase(char c) {
+    return (char) toLowerCase((int) c)
+  }
+
+  public char toUpperCase(char c) {
+    return (char) toUpperCase((int) c)
+  }
+}

@@ -72,6 +72,71 @@ class String extends Object implements Comparable<String>, CharSequence {
   public native String trim()
   public native String toUpperCase()
   public native String toLowerCase()
+
+  /* The locale-aware pair, as plain Teyru over the code points: the Turkish and
+     Azerbaijani dotless/dotted I is the case the native mapping gets wrong, and
+     Lithuanian's accent rule needs the character after the one being lowered.
+     Both are here rather than in the runtime because they are decisions about a
+     locale, and a C table would be a second place to keep them.
+
+     Everything else delegates to Character.toUpperCase/LowerCase, which is the
+     Unicode 15 table the runtime carries -- so this is not a slower path than
+     the native one, only a longer one. */
+  public String toUpperCase(Locale locale) {
+    if (!locale.isTurkishLike()) {
+      return toUpperCase()
+    }
+    StringBuilder b = new StringBuilder()
+    int i = 0
+    while (i < length()) {
+      int cp = codePointAt(i)
+      b.append((char) locale.toUpperCase(cp))
+      i += Character.charCount(cp)
+    }
+    return b.toString()
+  }
+
+  public String toLowerCase(Locale locale) {
+    if (locale.isTurkishLike() &&!locale.getLanguage().equals("lt")) {
+      StringBuilder b = new StringBuilder()
+      int i = 0
+      while (i < length()) {
+        int cp = codePointAt(i)
+        b.append((char) locale.toLowerCase(cp))
+        i += Character.charCount(cp)
+      }
+      return b.toString()
+    }
+    if (!locale.getLanguage().equals("lt")) {
+      return toLowerCase()
+    }
+    /* Lithuanian: a lower-case i or j keeps its dot when an accent follows it,
+       which is the one rule that needs the next character. Java's answer is
+       "i" plus U+0307, and the accent is whatever combining mark comes next. */
+    StringBuilder b = new StringBuilder()
+    int i = 0
+    while (i < length()) {
+      int cp = codePointAt(i)
+      int next = i + Character.charCount(cp)
+      boolean accented = false
+      if (next < length()) {
+        int ncp = codePointAt(next)
+        accented = ncp == 0x0300 || ncp == 0x0301 || ncp == 0x0303
+      }
+      int low = locale.toLowerCase(cp)
+      if ((cp == 'I' || cp == 0x00cc || cp == 0x00cd || cp == 0x0128) && accented) {
+        /* The capital I with and without an accent lowers to i + the dot when
+           something combining follows, which is the rule the JDK's
+           toLowerCase(LT) applies. */
+        b.append('i')
+        b.append('\u0307')
+      } else {
+        b.append((char) low)
+      }
+      i += Character.charCount(cp)
+    }
+    return b.toString()
+  }
   public native char[] toCharArray()
   public native byte[] getBytes()
   public native String intern()
@@ -197,7 +262,7 @@ class String extends Object implements Comparable<String>, CharSequence {
      and the C helper could not see the count. The wrapper below is therefore a
      normal method -- whose body does see the packed array -- delegating to a
      private native that takes the array. */
-  public static String format(String fmt, Object... args) {
+  public static String format(String fmt, Object...args) {
     if (fmt == null) {
       throw new NullPointerException()
     }
@@ -207,7 +272,7 @@ class String extends Object implements Comparable<String>, CharSequence {
 
   /* join is pure Teyru: it is a loop over an array, and the loop is clearer
      here than as a C helper. The null argument checks are Java's. */
-  public static String join(String delim, String... elements) {
+  public static String join(String delim, String...elements) {
     if (delim == null) {
       throw new NullPointerException()
     }
@@ -274,8 +339,7 @@ class StringBuilder extends Object {
      either way, so an object built by either path behaves identically. */
   /* the no-argument form is what specialNew allocates, so this body is empty:
      declaring it only keeps the class constructible now that it has others. */
-  public StringBuilder() {
-  }
+  public StringBuilder() {}
   public StringBuilder(int capacity) {
     init(capacity)
   }
@@ -367,8 +431,7 @@ class StringBuffer extends Object {
   private long cap
   private long buf
   /* the same three constructors as StringBuilder, for the same reason */
-  public StringBuffer() {
-  }
+  public StringBuffer() {}
   public StringBuffer(int capacity) {
     init(capacity)
   }
