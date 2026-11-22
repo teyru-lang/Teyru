@@ -1596,7 +1596,11 @@ class PatternParser {
           throw new PatternSyntaxException("POSIX bracket classes are not supported", src, pos)
         }
         pos++
+        /* The nested parse moves pendingClass onto its own set; a \d written
+           after it belongs to this class, so the cursor is restored. */
+        CharSet outer = pendingClass
         set.ors.add(classUnion())
+        pendingClass = outer
         continue
       }
       int lo = classChar()
@@ -1624,7 +1628,9 @@ class PatternParser {
       }
       if (src.charAt(pos) == '[') {
         pos++
+        CharSet outer = pendingClass
         set.andChain.add(classUnion())
+        pendingClass = outer
         continue
       }
       CharSet rhs = new CharSet()
