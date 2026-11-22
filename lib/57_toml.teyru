@@ -489,10 +489,16 @@ class TomlParser {
   private int col = 1
   private final TomlTable root = new TomlTable()
   private TomlTable current = root
-  /* The tables a [header] created, so that a second header on the same path is
-     a redefinition rather than a merge. */
-  private final Map<String, TomlTable> headers = new LinkedHashMap<String, TomlTable>()
-  private final Map<String, Boolean> defined = new LinkedHashMap<String, Boolean>()
+  /* How each path came into existence, which is what TOML's redefinition rules
+     turn on: a table written by a [header] or by a dotted key cannot be declared
+     again, an inline table cannot be extended at all, and a table that exists
+     only because a deeper header named it (implicit) may still be declared. */
+  private static final String EXPLICIT = "explicit"
+  private static final String DOTTED = "dotted"
+  private static final String INLINE = "inline"
+  private static final String IMPLICIT = "implicit"
+  private static final String ARRAY = "array"
+  private final Map<String, String> state = new LinkedHashMap<String, String>()
 
   public TomlParser(String src) {
     this.src = src
@@ -584,6 +590,10 @@ class TomlParser {
 
   /* [a.b] and [[a]]: navigate or create the table, and make it the current one. */
   private void header() {
+    /* Every diagnostic about this header names the line it starts on, not the
+       line after it: expectNewlineOrEnd() advances past the newline. */
+    int startLine = line
+    int startCol = col
     advance() /* '[' */
     boolean array = false
     if (at < src.length() && peek() == '[') {
@@ -592,6 +602,7 @@ class TomlParser {
     }
     skipSpaces()
     String path = dottedKey()
+    rejectSealedPrefix(path, startLine, startCol)
     skipSpaces()
     if (at >= src.length() || peek() != ']') {
       fail("expected ']'")
@@ -603,23 +614,63 @@ class TomlParser {
       }
       advance()
     }
-    expectNewlineOrEnd()
     if (array) {
-      current = arrayTable(path)
-    } else {
-      if (defined.get(path) != null) {
-        fail("table [" + path + "] is defined twice")
+      String prior = state.get(path)
+      if (prior != null &&!prior.equals(ARRAY)) {
+        throw new TomlParseException("[[ " + path + " ]] conflicts with a table already defined", startLine, startCol)
       }
-      defined.put(path, true)
-      current = tableAt(path)
-      headers.put(path, current)
+      state.put(path, ARRAY)
+      markPrefixesImplicit(path)
+      current = arrayTable(path, startLine, startCol)
+    } else {
+      String prior = state.get(path)
+      if (prior != null &&!prior.equals(IMPLICIT)) {
+        throw new TomlParseException("table [" + path + "] is declared twice", startLine, startCol)
+      }
+      state.put(path, EXPLICIT)
+      markPrefixesImplicit(path)
+      current = tableAt(path, startLine, startCol)
+    }
+    expectNewlineOrEnd()
+  }
+
+  /* A header may not reach into an inline table to define a sub-table of it:
+     "a = {b = 1}" followed by "[a.c]" is an error, not a merge. */
+  private void rejectSealedPrefix(String path, int startLine, int startCol) {
+    String[] parts = split(path)
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < parts.length : i++) {
+      if (i > 0) {
+        b.append('.')
+      }
+      b.append(parts[i])
+      if (INLINE.equals(state.get(b.toString()))) {
+        throw new TomlParseException("[" + path + "] reaches into the inline table " + b, startLine, startCol)
+      }
+    }
+  }
+
+  /* The prefixes of a header path are tables that exist because something deeper
+     named them; TOML lets a later header declare one of them. */
+  private void markPrefixesImplicit(String path) {
+    String[] parts = split(path)
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < parts.length - 1 : i++) {
+      if (i > 0) {
+        b.append('.')
+      }
+      b.append(parts[i])
+      String p = b.toString()
+      if (state.get(p) == null) {
+        state.put(p, IMPLICIT)
+      }
     }
   }
 
   /* The table at a dotted path, creating intermediate tables. A segment that is
      an array of tables resolves to its last element, which is the rule TOML
      states for a header written under a [[...]] parent. */
-  private TomlTable tableAt(String path) {
+  private TomlTable tableAt(String path, int startLine, int startCol) {
     String[] parts = split(path)
     TomlTable t = root
     for (int i = 0 : i < parts.length : i++) {
@@ -631,6 +682,11 @@ class TomlParser {
       } else if (n instanceof TomlTable) {
         t = (TomlTable) n
       } else if (n instanceof TomlArray) {
+        /* [a] after [[a]] is a redefinition, not a way to reach the last
+           element: only a dotted path under an array of tables goes there. */
+        if (i == parts.length - 1) {
+          throw new TomlParseException("[" + path + "] names an array of tables", startLine, startCol)
+        }
         TomlArray a = (TomlArray) n
         if (a.size() == 0 ||!(a.get(a.size() - 1) instanceof TomlTable)) {
           fail("[" + path + "] names an array of values")
@@ -643,7 +699,7 @@ class TomlParser {
     return t
   }
 
-  private TomlTable arrayTable(String path) {
+  private TomlTable arrayTable(String path, int startLine, int startCol) {
     String[] parts = split(path)
     TomlTable t = root
     for (int i = 0 : i < parts.length - 1 : i++) {
@@ -756,16 +812,23 @@ class TomlParser {
         advance()
         skipSpaces()
         String sub = oneKey()
+        String childPath = prefix.length() == 0 ? key : prefix + "." + key
+        /* An inline table is immutable: a dotted key cannot extend one. */
+        if (INLINE.equals(state.get(childPath))) {
+          fail("key '" + childPath + "' is an inline table and cannot be extended")
+        }
         TomlNode n = t.get(key)
         if (n == null) {
           TomlTable made = new TomlTable()
           t.put(key, made)
+          state.put(childPath, DOTTED)
           t = made
         } else if (n instanceof TomlTable) {
           t = (TomlTable) n
         } else {
           fail("key '" + key + "' is not a table")
         }
+        prefix = childPath
         key = sub
         continue
       }
@@ -781,6 +844,11 @@ class TomlParser {
       fail("duplicate key '" + key + "'")
     }
     t.put(key, v)
+    String full = prefix.length() == 0 ? key : prefix + "." + key
+    if (v instanceof TomlTable) {
+      /* An inline table value is sealed: nothing may be added to it later. */
+      state.put(full, INLINE)
+    }
     expectNewlineOrEnd()
   }
 
