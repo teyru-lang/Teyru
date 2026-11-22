@@ -632,7 +632,11 @@ class YamlParser {
         continue
       }
       cur++
-      seq.add(inlineValue(rest))
+      YamlNode item = inlineValue(rest)
+      if (isPlainStart(rest)) {
+        item = plainContinuation(item, indent, numbers[cur - 1])
+      }
+      seq.add(item)
     }
     return seq
   }
@@ -707,9 +711,55 @@ class YamlParser {
         m.put(key, parseBlock(childIndent))
         continue
       }
-      m.put(key, inlineValue(rest, numbers[cur - 1]))
+      int valueLine = numbers[cur - 1]
+      YamlNode v = inlineValue(rest, valueLine)
+      if (isPlainStart(rest)) {
+        v = plainContinuation(v, indent, valueLine)
+      }
+      m.put(key, v)
     }
     return m
+  }
+
+  /* A plain scalar may run on over following lines that are indented deeper
+     than its key ("a: hello\n  world" is "hello world"). This is YAML's folding
+     for plain scalars; a blank line would fold to a newline, and this reader
+     joins every continuation with a space, which is the shape a config file
+     uses. A deeper line can only be a continuation, because a nested mapping or
+     sequence may not be indented past its key. */
+  private YamlNode plainContinuation(YamlNode v, int indent, int valueLine) {
+    if (!(v instanceof YamlScalar) || ((YamlScalar) v).isNull) {
+      return v
+    }
+    StringBuilder b = new StringBuilder(((YamlScalar) v).value)
+    while (cur < lines.length) {
+      String line = lines[cur]
+      int li = indentOf(line)
+      if (li <= indent) {
+        break
+      }
+      if (isMarker(line, "---") || isMarker(line, "...")) {
+        break
+      }
+      String inner = body(line)
+      /* A continuation is more of the same scalar; a line that starts its own
+         key or a sequence item is not, and swallowing it would turn
+         "a: 1\n  b: 2" into the string "1 b: 2" instead of the error it is. */
+      if (findKeyColon(inner) >= 0 || inner.startsWith("- ") || inner.equals("-")) {
+        break
+      }
+      b.append(' ').append(inner.trim())
+      cur++
+    }
+    return new YamlScalar(b.toString(), false)
+  }
+
+  private boolean isPlainStart(String rest) {
+    if (rest.length() == 0) {
+      return false
+    }
+    char c = rest.charAt(0)
+    return c != '"' && c != '\'' && c != '[' && c != '{' && c != '|' && c != '>';
   }
 
   /* Where the key's colon is: the first ':' that is followed by a space or the
