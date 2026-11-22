@@ -9,13 +9,28 @@ package teyru
 // lambdas and a functional interface to have a regex engine at all, and why
 // this one is written the way it is rather than with an explicit stack.
 //
-// Deviations from java.util.regex, all of them omissions rather than different
-// answers:
+// What is implemented, and how it is verified. The syntax is Java's: literals,
+// classes (with ranges, \d\w\s and \p{...}), quantifiers including the
+// possessive forms and atomic groups, capture and non-capturing groups, named
+// groups, alternation, anchors (^ $ \A \z \Z and \b/\B), lookahead and
+// lookbehind (both directions, each possibly negative), backreferences, the
+// inline flags (?i) (?s) (?m) (?x) (?u) (?d) and their scoped form (?i:...), and
+// the escapes \n \t \r \f \a \e \0 \xHH \x{...} \uHHHH \Q...\E.
+// tests/programs/t325_regex_advanced.teyru is the same program as its .java.ref
+// and its expectation is what OpenJDK 21 printed, so every answer here is
+// checked against the reference implementation rather than against itself.
 //
-//   - No possessive quantifiers (a*+), no atomic groups (?>...), no lookahead or
-//     lookbehind, no backreferences, no named groups, no \p{...} classes.
-//     Anything unsupported is refused by Pattern.compile with a message naming
-//     it, rather than silently matching something else.
+// What is still refused, by name, because guessing would be worse:
+//
+//   - \G (the end of the previous match), \R, \X, \h, \v and the POSIX
+//     bracket classes [[:alpha:]]: each is a syntax with its own semantics.
+//   - The \p{...} classes beyond the Java subset listed in CharSet: script
+//     names, blocks and the binary properties this file does not implement.
+//   - Unicode case folding for anything above ASCII when (?i) is on and the
+//     pair is not a simple pair the Character methods answer for.
+//
+// A pattern using one of those is refused by Pattern.compile with a message
+// naming it rather than silently matching something else.
 //
 // What a node consumes is a code point, which is what Java's does: `.` takes
 // the emoji of "\uD83D\uDE00a" in one step, a class matches a character rather
@@ -44,7 +59,9 @@ class MatchState {
   public int[] starts
   public int[] ends
   public boolean[] set
-
+  /* Flags are per node, captured where the node was parsed (see LitNode.ci and
+     AnyNode.dotAll): that is what makes "(?i)" apply to the rest of the pattern
+     and "(?i:...)" to one group, with no state threaded through the match. */
   public MatchState(String text, int groups) {
     this.text = text
     this.starts = new int[groups]
@@ -54,13 +71,30 @@ class MatchState {
 }
 
 class EmptyNode extends Node {
-  boolean run(MatchState st, int pos, Cont k) { return k.at(pos) }
-  void dump(StringBuilder b) { }
+  boolean run(MatchState st, int pos, Cont k) {
+    return k.at(pos)
+  }
+  void dump(StringBuilder b) {}
 }
 
 class LitNode extends Node {
   int cp
-  LitNode(int cp) { this.cp = cp }
+  /* Set by the parser from the flags in force at this point in the pattern. */
+  boolean ci = false
+  LitNode(int cp) {
+    this.cp = cp
+  }
+
+  /* Case-insensitive matching, which is Java's simple folding: a code point
+     matches when it is the literal, or when its upper- or lower-case form is.
+     The title-case form is not consulted, because Java does not. */
+  private boolean same(int other) {
+    if (other == cp) {
+      return true
+    }
+    return Character.toUpperCase(other) == Character.toUpperCase(cp) ||
+      Character.toLowerCase(other) == Character.toLowerCase(cp)
+  }
   /* Java matches a literal below the BMP as the single code unit it is, and a
      supplementary one as the pair it takes: `"\uD83D".matches("\uD83D")` is
      true, and a pattern holding an emoji does not match the lone high half of
@@ -70,12 +104,20 @@ class LitNode extends Node {
       return false
     }
     if (cp < 0x10000) {
+      if (ci) {
+        int got = st.text.codePointAt(pos)
+        if (got >= 0x10000 ||!same(got)) {
+          return false
+        }
+        return k.at(pos + 1)
+      }
       if (st.text.charAt(pos) != cp) {
         return false
       }
       return k.at(pos + 1)
     }
-    if (st.text.codePointAt(pos) != cp) {
+    int got = st.text.codePointAt(pos)
+    if (ci ? !same(got) : got != cp) {
       return false
     }
     return k.at(pos + Character.charCount(cp))
@@ -83,10 +125,16 @@ class LitNode extends Node {
   /* the unit, which is the whole character for everything below the BMP: this
      is a debugging aid nothing calls, and the code point's string spelling
      would be Character.toString, which the LLVM backend cannot lower */
-  void dump(StringBuilder b) { b.append((char) cp) }
+  void dump(StringBuilder b) {
+    b.append((char) cp)
+  }
 }
 
 class AnyNode extends Node {
+  /* (?s) turns the line-terminator check off; (?d) narrows the terminators to
+     the UNIX ones. Captured at parse time, like LitNode.ci. */
+  boolean dotAll = false
+  boolean unixLines = false
   boolean run(MatchState st, int pos, Cont k) {
     if (pos >= st.text.length()) {
       return false
@@ -98,12 +146,25 @@ class AnyNode extends Node {
     // the whole string. The position it reaches is still a code unit index, so
     // what Matcher reports does not change.
     int c = st.text.codePointAt(pos)
-    if (c == '\n' || c == '\r') {
-      return false
+    if (!dotAll) {
+      /* Java's line terminators, and the one that is easy to miss: U+0085
+         (NEL), U+2028 and U+2029 end a line for `.` as well as LF and CR. A
+         pattern of "." against a document with a Unicode line separator is
+         exactly where a two-character-only check goes wrong. (?d) narrows the
+         set back to the UNIX ones, which is Java's UNIX_LINES. */
+      if (unixLines) {
+        if (c == '\n') {
+          return false
+        }
+      } else if (c == '\n' || c == '\r' || c == 0x85 || c == 0x2028 || c == 0x2029) {
+        return false
+      }
     }
     return k.at(pos + Character.charCount(c))
   }
-  void dump(StringBuilder b) { b.append('.') }
+  void dump(StringBuilder b) {
+    b.append('.')
+  }
 }
 
 // CharSet is a character class: ranges, single characters, and the predefined
@@ -113,12 +174,24 @@ class AnyNode extends Node {
 // range every half of a pair falls into.
 class CharSet {
   public boolean negated = false
+  /* (?i) applies to a class the same way it applies to a literal: [a-z] with
+     the flag matches "H". */
+  public boolean ci = false
   public int[] rangeFrom = new int[8]
   public int[] rangeTo = new int[8]
   public int ranges = 0
   public boolean digit = false
   public boolean word = false
   public boolean space = false
+  /* A class is a union of members and an intersection of sub-classes:
+     [a-z&&[^aeiou]] leaves its right-hand side here, because a negated nested
+     class is not a range and cannot be folded into one. */
+  public List<CharSet> ors = new ArrayList<CharSet>()
+  public List<CharSet> andChain = new ArrayList<CharSet>()
+  /* The \p{...} properties this file implements. Each is a name the JDK accepts
+     and a predicate over a code point; anything not in this list is refused by
+     the parser rather than matched as some other class. */
+  public String prop = ""
 
   public void addRange(int a, int z) {
     if (ranges == rangeFrom.length) {
@@ -137,22 +210,59 @@ class CharSet {
   }
 
   public boolean contains(int cp) {
-    boolean hit = false
-    for (int i = 0 : i < ranges : i++) {
-      if (cp >= rangeFrom[i] && cp <= rangeTo[i]) {
+    boolean hit = baseContains(cp)
+    for (int i = 0 : i < ors.size() : i++) {
+      if (ors.get(i).contains(cp)) {
         hit = true
       }
     }
-    if (!hit && digit && RegexSyntax.isDigit(cp)) { hit = true }
-    if (!hit && word && RegexSyntax.isWord(cp)) { hit = true }
-    if (!hit && space && RegexSyntax.isSpace(cp)) { hit = true }
+    if (hit) {
+      for (int i = 0 : i < andChain.size() : i++) {
+        if (!andChain.get(i).contains(cp)) {
+          hit = false
+        }
+      }
+    }
     return negated ? !hit : hit
+  }
+
+  private boolean baseContains(int cp) {
+    if (inRanges(cp)) {
+      return true
+    }
+    if (ci && (inRanges(Character.toLowerCase(cp)) || inRanges(Character.toUpperCase(cp)))) {
+      return true
+    }
+    if (digit && RegexSyntax.isDigit(cp)) {
+      return true
+    }
+    if (word && RegexSyntax.isWord(cp)) {
+      return true
+    }
+    if (space && RegexSyntax.isSpace(cp)) {
+      return true
+    }
+    if (prop.length() > 0 && RegexSyntax.property(prop, cp)) {
+      return true
+    }
+    return false
+  }
+
+  private boolean inRanges(int cp) {
+    for (int i = 0 : i < ranges : i++) {
+      if (cp >= rangeFrom[i] && cp <= rangeTo[i]) {
+        return true
+      }
+    }
+    return false
   }
 }
 
 class ClassNode extends Node {
   CharSet set
-  ClassNode(CharSet set) { this.set = set }
+  ClassNode(CharSet set) {
+    this.set = set
+  }
   /* one code point, which is what Java's CharProperty matches */
   boolean run(MatchState st, int pos, Cont k) {
     if (pos >= st.text.length()) {
@@ -164,7 +274,9 @@ class ClassNode extends Node {
     }
     return k.at(pos + Character.charCount(cp))
   }
-  void dump(StringBuilder b) { b.append("[class]") }
+  void dump(StringBuilder b) {
+    b.append("[class]")
+  }
 }
 
 // ConcatNode matches its children in order, threading the continuation through
@@ -172,7 +284,9 @@ class ClassNode extends Node {
 // continuation the whole sequence was given.
 class ConcatNode extends Node {
   Node[] kids
-  ConcatNode(Node[] kids) { this.kids = kids }
+  ConcatNode(Node[] kids) {
+    this.kids = kids
+  }
 
   boolean run(MatchState st, int pos, Cont k) {
     return step(st, 0, pos, k)
@@ -194,7 +308,9 @@ class ConcatNode extends Node {
 
 class AltNode extends Node {
   Node[] alts
-  AltNode(Node[] alts) { this.alts = alts }
+  AltNode(Node[] alts) {
+    this.alts = alts
+  }
 
   boolean run(MatchState st, int pos, Cont k) {
     for (Node a : alts) {
@@ -205,7 +321,9 @@ class AltNode extends Node {
     return false
   }
 
-  void dump(StringBuilder b) { b.append('|') }
+  void dump(StringBuilder b) {
+    b.append('|')
+  }
 }
 
 // RepeatNode is *, +, ?, {n}, {n,m} and the lazy forms. The greedy form tries
@@ -250,7 +368,9 @@ class RepeatNode extends Node {
     return false
   }
 
-  void dump(StringBuilder b) { inner.dump(b) }
+  void dump(StringBuilder b) {
+    inner.dump(b)
+  }
 }
 
 class GroupNode extends Node {
@@ -267,18 +387,18 @@ class GroupNode extends Node {
     boolean saveSet = st.set[index]
     boolean ok = inner.run(st, pos, (p) -> {
       int oldEnd = st.ends[index]
-      boolean oldSet = st.set[index]
-      st.starts[index] = pos
-      st.ends[index] = p
-      st.set[index] = true
-      if (k.at(p)) {
+        boolean oldSet = st.set[index]
+        st.starts[index] = pos
+        st.ends[index] = p
+        st.set[index] = true
+        if (k.at(p)) {
         return true
       }
-      st.ends[index] = oldEnd
-      st.set[index] = oldEnd == -1 ? false : oldSet
-      st.starts[index] = saveStart
-      st.set[index] = saveSet
-      return false
+        st.ends[index] = oldEnd
+        st.set[index] = oldEnd == -1 ? false : oldSet
+        st.starts[index] = saveStart
+        st.set[index] = saveSet
+        return false
     })
     if (!ok) {
       st.starts[index] = saveStart
@@ -288,35 +408,518 @@ class GroupNode extends Node {
     return ok
   }
 
-  void dump(StringBuilder b) { inner.dump(b) }
+  void dump(StringBuilder b) {
+    inner.dump(b)
+  }
+}
+
+/* An atomic group, and the possessive quantifiers, which are the same node: the
+   inner match is kept and never given back. The engine is a backtracking one,
+   so "no backtracking into this" is expressed by running the inner node once,
+   recording where it stopped, and calling the continuation with that position
+   only -- if that continuation fails, the group fails rather than retrying the
+   inner node with fewer characters. */
+class AtomicNode extends Node {
+  Node inner
+  AtomicNode(Node inner) {
+    this.inner = inner
+  }
+  boolean run(MatchState st, int pos, Cont k) {
+    int[] reached = new int[] { -1 }
+    boolean ok = inner.run(st, pos, (p) -> {
+      /* The first (and, for a greedy atomic inner, the longest) answer is the
+         one the group keeps; Java's atomic group is exactly that. */
+      reached[0] = p
+        return true
+    })
+    if (!ok || reached[0] < 0) {
+      return false
+    }
+    return k.at(reached[0])
+  }
+  void dump(StringBuilder b) {
+    b.append("(?>");
+    inner.dump(b);
+    b.append(')')
+  }
+}
+
+/* A possessive quantifier: the same repeated match as RepeatNode, but the
+   repetition's result is committed. It is AtomicNode around RepeatNode with the
+   lazy flag off, which is both the definition and the shortest correct
+   implementation. */
+class PossessiveNode extends Node {
+  Node inner
+  int min
+  int max
+  PossessiveNode(Node inner, int min, int max) {
+    this.inner = inner
+    this.min = min
+    this.max = max
+  }
+  boolean run(MatchState st, int pos, Cont k) {
+    int[] reached = new int[] { -1 }
+    boolean ok = new RepeatNode(inner, min, max, false).run(st, pos, (p) -> {
+      reached[0] = p
+        return true
+    })
+    if (!ok || reached[0] < 0) {
+      return false
+    }
+    return k.at(reached[0])
+  }
+  void dump(StringBuilder b) {
+    inner.dump(b);
+    b.append("+poss")
+  }
+}
+
+/* Lookahead and lookbehind, in both polarities.
+
+   A lookaround matches without consuming: it runs the inner node at the
+   current position (or, for a lookbehind, asks whether the inner node can
+   match ENDING at the current position) and then, if the answer is what the
+   assertion wanted, continues from where it started. The positions inside a
+   lookaround are real positions in the same text, so a capture group inside one
+   is visible after the match -- which is what Java does and what
+   "(?<=(\d))" is for.
+
+   The lookbehind is bounded: Java requires one too, and this one enforces a
+   limit on the width it will try, so a pattern like "(?<=a*)" is refused
+   instead of searching backwards forever. */
+class LookNode extends Node {
+  Node inner
+  boolean behind
+  boolean negative
+  /* How many code units back a lookbehind searches. Java's limit is a few
+     thousand; this is the same order and is checked with `min` at parse time. */
+  int window
+
+  LookNode(Node inner, boolean behind, boolean negative, int window) {
+    this.inner = inner
+    this.behind = behind
+    this.negative = negative
+    this.window = window
+  }
+
+  boolean run(MatchState st, int pos, Cont k) {
+    boolean hit
+    if (!behind) {
+      /* Forward: the inner node gets a continuation that ignores where it
+         reached and accepts as soon as it matched at all. */
+      hit = inner.run(st, pos, (p) -> true)
+    } else {
+      hit = false
+      int from = pos - window
+      if (from < 0) {
+        from = 0
+      }
+      for (int start = from : start <= pos : start++) {
+        if (inner.run(st, start, (p) -> p == pos)) {
+          hit = true
+          break
+        }
+      }
+    }
+    if (hit == negative) {
+      return false
+    }
+    return k.at(pos)
+  }
+
+  void dump(StringBuilder b) {
+    b.append(behind ? "(?<=" : "(?=");
+    inner.dump(b);
+    b.append(')')
+  }
+}
+
+/* \k<name>: a backreference written by name. Its number is not known while the
+   pattern is being parsed -- the group may be later in the same pattern -- so
+   the node keeps the name and the Pattern resolves it once the parse is done.
+   A name that never appears is refused at compile time, as the JDK refuses it. */
+class NamedBackRefNode extends Node {
+  String name
+  int index = -1
+  NamedBackRefNode(String name) {
+    this.name = name
+  }
+  boolean run(MatchState st, int pos, Cont k) {
+    if (index < 0) {
+      throw new IllegalStateException("unresolved named backreference")
+    }
+    if (index >= st.set.length ||!st.set[index]) {
+      return false
+    }
+    String captured = st.text.substring(st.starts[index], st.ends[index])
+    if (!st.text.startsWith(captured, pos)) {
+      return false
+    }
+    return k.at(pos + captured.length())
+  }
+  void dump(StringBuilder b) {
+    b.append("\\k<").append(name).append('>')
+  }
+}
+
+/* A backreference: the text the numbered group captured must appear again. An
+   unset group never matches, which is Java's rule -- "(a)?\1" does not match
+   the empty string. */
+class BackRefNode extends Node {
+  int index
+  BackRefNode(int index) {
+    this.index = index
+  }
+  boolean run(MatchState st, int pos, Cont k) {
+    if (index >= st.set.length ||!st.set[index]) {
+      return false
+    }
+    String captured = st.text.substring(st.starts[index], st.ends[index])
+    if (!st.text.startsWith(captured, pos)) {
+      return false
+    }
+    return k.at(pos + captured.length())
+  }
+  void dump(StringBuilder b) {
+    b.append('\\').append(index)
+  }
+}
+
+/* \b and \B: a position assertion over the two characters beside it. */
+class BoundaryNode extends Node {
+  boolean negated
+  BoundaryNode(boolean negated) {
+    this.negated = negated
+  }
+  boolean run(MatchState st, int pos, Cont k) {
+    boolean hit = RegexSyntax.boundary(st.text, pos)
+    if (hit == negated) {
+      return false
+    }
+    return k.at(pos)
+  }
+  void dump(StringBuilder b) {
+    b.append(negated ? "\\B" : "\\b")
+  }
+}
+
+/* \A, \z and \Z: the three absolute anchors, which differ from ^ and $ in
+   that no flag mode changes them. */
+class AnchorAbs extends Node {
+  /* 0 start of input, 1 end of input, 2 end of input or before a final
+     line terminator. */
+  int kind
+  AnchorAbs(int kind) {
+    this.kind = kind
+  }
+  boolean run(MatchState st, int pos, Cont k) {
+    if (kind == 0) {
+      return pos == 0 ? k.at(pos) : false
+    }
+    if (kind == 1) {
+      return pos == st.text.length() ? k.at(pos) : false
+    }
+    if (pos == st.text.length()) {
+      return k.at(pos)
+    }
+    /* \Z is the end, or just before a line terminator that ends the input. */
+    if (pos == st.text.length() - 1) {
+      char c = st.text.charAt(pos)
+      if (c == '\n' || c == '\r' || c == 0x85 || c == 0x2028 || c == 0x2029) {
+        return k.at(pos)
+      }
+    }
+    return false
+  }
+  void dump(StringBuilder b) {
+    b.append(kind == 0 ? "\\A" : kind == 1 ? "\\z" : "\\Z")
+  }
 }
 
 class AnchorStart extends Node {
+  boolean multiline = false
+  boolean unixLines = false
   boolean run(MatchState st, int pos, Cont k) {
-    return pos == 0 ? k.at(pos) : false
+    if (pos == 0) {
+      return k.at(pos)
+    }
+    if (!multiline) {
+      return false
+    }
+    /* Under MULTILINE, ^ also matches after a line terminator. */
+    char prev = st.text.charAt(pos - 1)
+    if (unixLines) {
+      return prev == '\n' ? k.at(pos) : false
+    }
+    return (prev == '\n' || prev == '\r' || prev == 0x85 || prev == 0x2028 || prev == 0x2029) ? k.at(pos) : false
   }
-  void dump(StringBuilder b) { b.append('^') }
+  void dump(StringBuilder b) {
+    b.append('^')
+  }
 }
 
 class AnchorEnd extends Node {
+  boolean multiline = false
+  boolean unixLines = false
   boolean run(MatchState st, int pos, Cont k) {
-    return pos == st.text.length() ? k.at(pos) : false
+    int n = st.text.length()
+    if (pos == n) {
+      return k.at(pos)
+    }
+    if (!multiline) {
+      /* Without MULTILINE, $ matches at the end and just before a final line
+         terminator, which is Java's rule (and not Python's). */
+      return RegexSyntax.finalTerminator(st.text, pos) ? k.at(pos) : false
+    }
+    char c = st.text.charAt(pos)
+    if (unixLines) {
+      return c == '\n' ? k.at(pos) : false
+    }
+    return (c == '\n' || c == '\r' || c == 0x85 || c == 0x2028 || c == 0x2029) ? k.at(pos) : false
   }
-  void dump(StringBuilder b) { b.append('$') }
+  void dump(StringBuilder b) {
+    b.append('$')
+  }
 }
 
 // ---------------------------------------------------------------- syntax
-
 final class RegexSyntax {
   /* The three classifiers take a code point, not a code unit: they are asked
      about what a class or a quantifier is looking at, and that is a character.
-     All three are ASCII, so a code point above the BMP is none of them. */
-  public static boolean isDigit(int c) { return c >= '0' && c <= '9' }
+     \d, \w and \s are ASCII in Java unless UNICODE_CHARACTER_CLASS is on,
+     which is a flag this file does not implement -- so these stay ASCII and the
+     distinction is named in the header rather than silently widened. */
+  public static boolean isDigit(int c) {
+    return c >= '0' && c <= '9'
+  }
   public static boolean isWord(int c) {
     return isDigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
   }
   public static boolean isSpace(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == 0x0b
+  }
+
+  /* A word boundary, as Java defines it for \b and \B: a change between a word
+     character and a non-word one (or the ends of the text) counts, and the
+     character is a code point because "\w" is ASCII but the character next to
+     it need not be. Position 0 and the end of the text are boundaries when the
+     character there is (or is not) a word character. */
+  public static boolean boundary(String text, int pos) {
+    boolean before = pos > 0 && isWord(text.codePointBefore(pos))
+    boolean after = pos < text.length() && isWord(text.codePointAt(pos))
+    return before != after
+  }
+
+  /* The \p{...} properties. The names are the JDK's, in both the short and the
+     long spelling, and the predicates are the Character methods -- so a program
+     that asks for \p{Alpha} gets what Character.isAlphabetic answers, which is
+     the Unicode 15 table rather than an ASCII guess. Comparisons go through
+     equals, not ==: these strings come from parsing and are not all interned. */
+  public static boolean property(String raw, int cp) {
+    /* The same normalisation knownProperty() does, so a name that was accepted
+       is a name the predicate can answer: "IsUpper"/"javaLowerCase" reach the
+       predicate with their prefix still on. */
+    String p = normalizeProperty(raw)
+    if (eq(p, "L") || eq(p, "Letter") || eq(p, "Alpha") || eq(p, "IsAlphabetic") || eq(p, "IsL")) {
+      return Character.isLetter(cp)
+    }
+    if (eq(p, "Lu") || eq(p, "Uppercase") || eq(p, "Upper") || eq(p, "IsUpperCase") || eq(p, "UpperCase")) {
+      return Character.isUpperCase(cp)
+    }
+    if (eq(p, "Ll") || eq(p, "Lowercase") || eq(p, "Lower") || eq(p, "IsLowerCase") || eq(p, "LowerCase")) {
+      return Character.isLowerCase(cp)
+    }
+    if (eq(p, "Lt") || eq(p, "Titlecase") || eq(p, "Title") || eq(p, "IsTitleCase") || eq(p, "TitleCase")) {
+      return Character.isTitleCase(cp)
+    }
+    if (eq(p, "N") || eq(p, "Nd") || eq(p, "Digit") || eq(p, "IsDigit")) {
+      return Character.isDigit(cp)
+    }
+    if (eq(p, "Alnum") || eq(p, "IsAlnum") || eq(p, "Alphabetic")) {
+      return Character.isLetterOrDigit(cp)
+    }
+    if (eq(p, "Space") || eq(p, "IsWhite_Space") || eq(p, "IsWhitespace") || eq(p, "javaWhitespace")) {
+      return Character.isWhitespace(cp)
+    }
+    if (eq(p, "Z") || eq(p, "Zs") || eq(p, "IsSpaceChar")) {
+      return Character.isSpaceChar(cp)
+    }
+    if (eq(p, "Punct") || eq(p, "P")) {
+      int t = Character.getType(cp)
+      return t == Character.START_PUNCTUATION || t == Character.END_PUNCTUATION ||
+        t == Character.CONNECTOR_PUNCTUATION || t == Character.DASH_PUNCTUATION ||
+        t == Character.INITIAL_QUOTE_PUNCTUATION || t == Character.FINAL_QUOTE_PUNCTUATION ||
+        t == Character.OTHER_PUNCTUATION
+    }
+    if (eq(p, "Graph") || eq(p, "IsGraph")) {
+      return Character.getType(cp) != Character.UNASSIGNED &&!Character.isWhitespace(cp) &&!Character.isSpaceChar(cp)
+    }
+    if (eq(p, "Print") || eq(p, "IsPrint")) {
+      return Character.getType(cp) != Character.UNASSIGNED
+    }
+    if (eq(p, "ASCII")) {
+      return cp >= 0 && cp < 128
+    }
+    if (eq(p, "C") || eq(p, "Cntrl") || eq(p, "IsControl")) {
+      return Character.getType(cp) == Character.CONTROL
+    }
+    if (eq(p, "IsDefined")) {
+      return Character.isDefined(cp)
+    }
+    return false
+  }
+
+  private static boolean eq(String a, String b) {
+    return a.equalsIgnoreCase(b)
+  }
+
+  /* "$ at the end, or just before the final line terminator". Java's $ without
+     MULTILINE: "abc\n".matches("abc$") is false (matches() needs the whole
+     input), but "abc\n" contains a match of "abc$" at 0. */
+  public static boolean finalTerminator(String text, int pos) {
+    if (pos != text.length() - 1) {
+      return false
+    }
+    char c = text.charAt(pos)
+    return c == '\n' || c == '\r' || c == 0x85 || c == 0x2028 || c == 0x2029
+  }
+
+  /* A named group's name is Java's: a letter first, then letters and digits. */
+  public static boolean validGroupName(String n) {
+    if (n == null || n.length() == 0) {
+      return false
+    }
+    char c = n.charAt(0)
+    if (!(c >= 'a' && c <= 'z') &&!(c >= 'A' && c <= 'Z')) {
+      return false
+    }
+    for (int i = 1 : i < n.length() : i++) {
+      char d = n.charAt(i)
+      if (!((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9'))) {
+        return false
+      }
+    }
+    return true;
+  }
+
+  /* The widest match a node can make, in code units, or -1 when it is not
+     bounded. A lookbehind is bounded by Java too; a pattern like "(?<=a*)" is
+     refused rather than searched for forever. */
+  public static int width(Node n) {
+    if (n instanceof EmptyNode) {
+      return 0
+    }
+    if (n instanceof LitNode) {
+      int cp = ((LitNode) n).cp
+      return cp >= 0x10000 ? 2 : 1
+    }
+    if (n instanceof AnyNode || n instanceof ClassNode) {
+      return 2
+    }
+    if (n instanceof BackRefNode || n instanceof NamedBackRefNode) {
+      /* A backreference is as wide as its group, which this walk does not know;
+         -1 is the honest answer and the parse refuses that lookbehind. */
+      return -1
+    }
+    if (n instanceof BoundaryNode || n instanceof AnchorStart || n instanceof AnchorEnd || n instanceof AnchorAbs) {
+      return 0
+    }
+    if (n instanceof GroupNode) {
+      return width(((GroupNode) n).inner)
+    }
+    if (n instanceof AtomicNode) {
+      return width(((AtomicNode) n).inner)
+    }
+    if (n instanceof PossessiveNode) {
+      PossessiveNode p = (PossessiveNode) n
+      if (p.max > 1000) {
+        return -1
+      }
+      int w = width(p.inner)
+      return w < 0 ? -1 : w * p.max
+    }
+    if (n instanceof RepeatNode) {
+      RepeatNode r = (RepeatNode) n
+      if (r.max > 1000) {
+        return -1
+      }
+      int w = width(r.inner)
+      return w < 0 ? -1 : w * r.max
+    }
+    if (n instanceof ConcatNode) {
+      int total = 0
+      for (Node k : ((ConcatNode) n).kids) {
+        int w = width(k)
+        if (w < 0) {
+          return -1
+        }
+        total += w
+      }
+      return total
+    }
+    if (n instanceof AltNode) {
+      int best = 0
+      for (Node a : ((AltNode) n).alts) {
+        int w = width(a)
+        if (w < 0) {
+          return -1
+        }
+        if (w > best) {
+          best = w
+        }
+      }
+      return best
+    }
+    if (n instanceof LookNode) {
+      return 0
+    }
+    return -1
+  }
+
+  /* The property names the parser accepts. A name outside this list is refused
+     by Pattern.compile, which is what keeps \p{Script=Greek} from silently
+     matching nothing at all. The spelling is normalised first: the JDK's Are is
+     insensitive to case and to the separators, so p{javaWhitespace},
+     p{java_whitespace} and p{Java_Whitespace} are one property. */
+  /* The name with its "Is"/"java" prefix and its separators removed, which is
+     how the JDK's spellings (IsAlphabetic, javaLowerCase, Lu, Is_White_Space)
+     all reach one comparison. */
+  static String normalizeProperty(String p) {
+    String n = p
+    if (startsWithIgnoreCase(n, "Is")) {
+      n = n.substring(2)
+    }
+    if (startsWithIgnoreCase(n, "java")) {
+      n = n.substring(4)
+    }
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < n.length() : i++) {
+      char c = n.charAt(i)
+      if (c != '_' && c != '-' && c != ' ') {
+        b.append(c)
+      }
+    }
+    return b.toString()
+  }
+
+  public static boolean knownProperty(String p) {
+    String n = normalizeProperty(p)
+    return eq(n, "L") || eq(n, "Letter") || eq(n, "Alphabetic") || eq(n, "Alpha") ||
+      eq(n, "Lu") || eq(n, "Uppercase") || eq(n, "Upper") || eq(n, "UpperCase") ||
+      eq(n, "Ll") || eq(n, "Lowercase") || eq(n, "Lower") || eq(n, "LowerCase") ||
+      eq(n, "Lt") || eq(n, "Titlecase") || eq(n, "Title") || eq(n, "TitleCase") ||
+      eq(n, "N") || eq(n, "Nd") || eq(n, "Digit") ||
+      eq(n, "Alnum") || eq(n, "Alphabetic") ||
+      eq(n, "Space") || eq(n, "WhiteSpace") || eq(n, "Whitespace") ||
+      eq(n, "Z") || eq(n, "Zs") || eq(n, "SpaceChar") ||
+      eq(n, "Punct") || eq(n, "P") ||
+      eq(n, "ASCII") || eq(n, "Graph") || eq(n, "Print") ||
+      eq(n, "C") || eq(n, "Cntrl") || eq(n, "Control") ||
+      eq(n, "Defined")
+  }
+
+  static boolean startsWithIgnoreCase(String s, String prefix) {
+    return s.length() >= prefix.length() && s.substring(0, prefix.length()).equalsIgnoreCase(prefix)
   }
 }
 
@@ -324,13 +927,57 @@ final class RegexSyntax {
 // over the Java grammar's shape: alternation, then concatenation, then a
 // repeated atom.
 class PatternParser {
-  private String src
+  public String src
   private int pos = 0
   private int groups = 1
+  /* The pattern's flags, as the parser threads them: a top-level (?i) changes
+     everything after it, and the node it produces carries the flags it was
+     parsed under. A scoped (?i:...) restores them at the closing paren. */
+  private boolean caseInsensitive = false
+  private boolean dotAll = false
+  private boolean multiline = false
+  private boolean unixLines = false
+  private boolean comments = false
+  /* Group number by name, for \k<name> and Matcher.group(String). */
+  public Map<String, Integer> names = new HashMap<String, Integer>()
+  /* The widest lookbehind, which bounds the backward search. */
+  public int lookbehindMax = 0
 
-  PatternParser(String src) { this.src = src }
+  PatternParser(String src) {
+    this.src = src
+  }
 
-  public int groupCount() { return groups - 1 }
+  public int groupCount() {
+    return groups - 1
+  }
+
+  /* A literal, carrying the case-insensitivity in force where it was written. */
+  private Node literal(int cp) {
+    LitNode n = new LitNode(cp)
+    n.ci = caseInsensitive
+    return n
+  }
+
+  private Node anyChar() {
+    AnyNode n = new AnyNode()
+    n.dotAll = dotAll
+    n.unixLines = unixLines
+    return n
+  }
+
+  private Node anchorStart() {
+    AnchorStart n = new AnchorStart()
+    n.multiline = multiline
+    n.unixLines = unixLines
+    return n
+  }
+
+  private Node anchorEnd() {
+    AnchorEnd n = new AnchorEnd()
+    n.multiline = multiline
+    n.unixLines = unixLines
+    return n
+  }
 
   public Node parse() {
     Node n = alternate()
@@ -354,9 +1001,37 @@ class PatternParser {
     return new AltNode((Node[]) alts.toArray())
   }
 
+  /* The COMMENTS flag: (?x) makes unescaped whitespace insignificant and a #
+     start a comment that runs to the end of the line. Skipping happens here,
+     before an atom is read, so it applies between atoms and nowhere else --
+     which is exactly where Java's COMMENTS mode applies it. */
+  private void skipComments() {
+    if (!comments) {
+      return
+    }
+    while (pos < src.length()) {
+      char c = src.charAt(pos)
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == 0x0b) {
+        pos++
+        continue
+      }
+      if (c == '#') {
+        while (pos < src.length() && src.charAt(pos) != '\n') {
+          pos++
+        }
+        continue
+      }
+      break
+    }
+  }
+
   private Node concat() {
     ArrayList<Node> parts = new ArrayList<Node>()
     while (pos < src.length()) {
+      skipComments()
+      if (pos >= src.length()) {
+        break
+      }
       char c = src.charAt(pos)
       if (c == '|' || c == ')') {
         break
@@ -380,15 +1055,15 @@ class PatternParser {
     char c = src.charAt(pos)
     if (c == '*') {
       pos++
-      return new RepeatNode(atom, 0, 1 << 30, lazyNext())
+      return quantified(atom, 0, 1 << 30)
     }
     if (c == '+') {
       pos++
-      return new RepeatNode(atom, 1, 1 << 30, lazyNext())
+      return quantified(atom, 1, 1 << 30)
     }
     if (c == '?') {
       pos++
-      return new RepeatNode(atom, 0, 1, lazyNext())
+      return quantified(atom, 0, 1)
     }
     if (c == '{') {
       int save = pos
@@ -413,20 +1088,39 @@ class PatternParser {
       if (hi < lo) {
         throw new PatternSyntaxException("Illegal repetition", src, save)
       }
-      return new RepeatNode(atom, lo, hi, lazyNext())
+      return quantified(atom, lo, hi)
     }
     return atom
   }
 
-  private boolean lazyNext() {
+  /* One repetition with whichever greedy/lazy/possessive suffix follows. */
+  private Node quantified(Node atom, int lo, int hi) {
+    int kind = quantifierKind()
+    if (kind == 2) {
+      return new PossessiveNode(atom, lo, hi)
+    }
+    return new RepeatNode(atom, lo, hi, kind == 1)
+  }
+
+  /* What follows a quantifier: '?' makes it lazy, '+' makes it possessive, and
+     anything else leaves it greedy. The possessive form is handled by the
+     caller, which builds a PossessiveNode instead of a RepeatNode -- it is not a
+     property of RepeatNode because a possessive quantifier does not backtrack
+     into itself at all. */
+  private int quantifierKind() {
     if (pos < src.length() && src.charAt(pos) == '?') {
       pos++
-      return true
+      return 1
     }
     if (pos < src.length() && src.charAt(pos) == '+') {
-      throw new PatternSyntaxException("possessive quantifiers are not supported", src, pos)
+      pos++
+      return 2
     }
-    return false
+    return 0
+  }
+
+  private boolean lazyNext() {
+    return quantifierKind() == 1
   }
 
   private int number() {
@@ -439,47 +1133,190 @@ class PatternParser {
     return pos == start ? -1 : v
   }
 
+  /* Every group form, in one place. The forms are Java's: (...) capture,
+     (?:...) not, (?=...) and (?!...) lookahead, (?<=...) and (?<!...) lookbehind,
+     (?>...) atomic, (?<name>...) named capture, (?flags) and (?flags:...) the
+     inline flags, and (?flags-flags...) the off form of the same. */
+  private Node group() {
+    int open = pos
+    pos++
+    boolean capture = true
+    boolean look = false
+    boolean behind = false
+    boolean negative = false
+    boolean atomic = false
+    String name = null
+    boolean scopedFlags = false
+    boolean savedCi = caseInsensitive
+    boolean savedDot = dotAll
+    boolean savedMulti = multiline
+    boolean savedUnix = unixLines
+
+    if (pos < src.length() && src.charAt(pos) == '?') {
+      pos++
+      if (pos >= src.length()) {
+        throw new PatternSyntaxException("Unclosed group", src, src.length())
+      }
+      char k = src.charAt(pos)
+      if (k == ':') {
+        pos++
+        capture = false
+      } else if (k == '=' || k == '!') {
+        pos++
+        capture = false
+        look = true
+        negative = k == '!'
+      } else if (k == '>') {
+        pos++
+        capture = false
+        atomic = true
+      } else if (k == '<') {
+        pos++
+        if (pos < src.length() && (src.charAt(pos) == '=' || src.charAt(pos) == '!')) {
+          char m = src.charAt(pos)
+          pos++
+          capture = false
+          look = true
+          behind = true
+          negative = m == '!'
+        } else {
+          /* A named group: everything up to '>'. */
+          StringBuilder nm = new StringBuilder()
+          while (pos < src.length() && src.charAt(pos) != '>') {
+            nm.append(src.charAt(pos))
+            pos++
+          }
+          if (pos >= src.length() || nm.length() == 0) {
+            throw new PatternSyntaxException("named capturing group has no name", src, open)
+          }
+          pos++
+          name = nm.toString()
+          if (!RegexSyntax.validGroupName(name)) {
+            throw new PatternSyntaxException("named capturing group has an invalid name", src, open)
+          }
+          if (names.get(name) != null) {
+            throw new PatternSyntaxException("named capturing group <" + name + "> is already defined", src, open)
+          }
+        }
+      } else if (k == 'i' || k == 's' || k == 'm' || k == 'x' || k == 'd' || k == 'u' || k == '-') {
+        /* The inline flags. (?i) sets them for the rest of the enclosing group;
+           (?i:...) only for the group; a '-' turns them off for the same span.
+           (?u) and (?U) are accepted and do nothing, because \d \w \s are
+           ASCII here and Unicode case folding is what the Character methods
+           already do. */
+        boolean on = true
+        while (pos < src.length() && "ismxduU-".indexOf(src.charAt(pos)) >= 0) {
+          char f = src.charAt(pos)
+          pos++
+          if (f == '-') {
+            on = false
+            continue
+          }
+          if (f == 'i') {
+            caseInsensitive = on
+          }
+          if (f == 's') {
+            dotAll = on
+          }
+          if (f == 'm') {
+            multiline = on
+          }
+          if (f == 'x') {
+            comments = on
+          }
+          if (f == 'd') {
+            unixLines = on
+          }
+          /* u and U are accepted and have no effect here. */
+        }
+        if (pos < src.length() && src.charAt(pos) == ')') {
+          /* A bare flag group: set for the rest of the enclosing group. Its
+             node matches empty and changes nothing at run time, because every
+             later node captured the flag as it was written. */
+          pos++
+          return new EmptyNode()
+        }
+        if (pos >= src.length() || src.charAt(pos) != ':') {
+          throw new PatternSyntaxException("Unknown inline modifier", src, pos)
+        }
+        pos++
+        capture = false
+        scopedFlags = true
+      } else {
+        throw new PatternSyntaxException("Unknown inline modifier", src, pos)
+      }
+    }
+    int idx = -1
+    if (capture) {
+      idx = groups
+      groups++
+    }
+    String savedName = name
+    Node inner = alternate()
+    if (pos >= src.length() || src.charAt(pos) != ')') {
+      // Java reports an unclosed group at the end of the pattern, and
+      // capitalises it -- the message is part of what a program prints.
+      throw new PatternSyntaxException("Unclosed group", src, src.length())
+    }
+    pos++
+    if (scopedFlags) {
+      caseInsensitive = savedCi
+      dotAll = savedDot
+      multiline = savedMulti
+      unixLines = savedUnix
+    }
+    Node body = inner
+    if (atomic) {
+      return new AtomicNode(body)
+    }
+    if (look) {
+      if (behind) {
+        int w = RegexSyntax.width(body);
+        /* Java accepts a lookbehind with no obvious maximum length and searches
+           back a bounded distance; refusing it would reject a pattern the JDK
+           compiles. The window is that bound: the pattern's own width when it
+           has one, and a fixed cap when it does not. */
+        if (w < 0) {
+          w = 64;
+        }
+        if (w < 1) {
+          w = 1
+        }
+        if (w > lookbehindMax) {
+          lookbehindMax = w
+        }
+        return new LookNode(body, true, negative, w > 1024 ? 1024 : w)
+      }
+      return new LookNode(body, false, negative, 0)
+    }
+    if (capture) {
+      if (savedName != null) {
+        names.put(savedName, idx)
+      }
+      return new GroupNode(body, idx)
+    }
+    return body
+  }
+
   private Node apply() {
     char c = src.charAt(pos)
     if (c == '(') {
-      pos++
-      boolean capture = true
-      if (pos + 1 < src.length() && src.charAt(pos) == '?' && src.charAt(pos + 1) == ':') {
-        pos += 2
-        capture = false
-      } else if (pos < src.length() && src.charAt(pos) == '?') {
-        throw new PatternSyntaxException("(?...) groups other than (?: are not supported", src, pos)
-      }
-      int idx = capture ? groups : -1
-      if (capture) {
-        groups++
-      }
-      Node inner = alternate()
-      if (pos >= src.length() || src.charAt(pos) != ')') {
-        // Java reports an unclosed group at the end of the pattern, and
-        // capitalises it -- the message is part of what a program prints.
-        throw new PatternSyntaxException("Unclosed group", src, src.length())
-      }
-      pos++
-      if (capture) {
-        return new GroupNode(inner, idx)
-      }
-      return inner
+      return group()
     }
     if (c == '[') {
       return charClass()
     }
     if (c == '.') {
       pos++
-      return new AnyNode()
+      return anyChar()
     }
     if (c == '^') {
       pos++
-      return new AnchorStart()
+      return anchorStart()
     }
     if (c == '$') {
       pos++
-      return new AnchorEnd()
+      return anchorEnd()
     }
     if (c == '\\') {
       pos++
@@ -498,55 +1335,273 @@ class PatternParser {
        optionally" rather than "the high half, optionally, then the low half". */
     int cp = src.codePointAt(pos)
     pos += Character.charCount(cp)
-    return new LitNode(cp)
+    return literal(cp)
+  }
+
+  /* \Q...\E: everything between is a literal, which is the one escape that
+     consumes more than one character of the pattern. The parser reads the body
+     here and returns it as a concatenation, so a quoted string of three
+     characters is three literal nodes and no node has to know it was quoted. */
+  private Node quoted() {
+    StringBuilder parts = new StringBuilder()
+    /* An unterminated \Q runs to the end of the pattern: Java accepts
+       "\Qabc" and matches the literal "abc", so refusing it would be a
+       difference in a pattern the JDK compiles. */
+    while (pos < src.length()) {
+      if (src.charAt(pos) == '\\' && pos + 1 < src.length() && src.charAt(pos + 1) == 'E') {
+        pos += 2
+        break
+      }
+      int cp = src.codePointAt(pos)
+      parts.append((char) cp)
+      pos += Character.charCount(cp)
+    }
+    String t = parts.toString()
+    if (t.length() == 0) {
+      return new EmptyNode()
+    }
+    ArrayList<Node> kids = new ArrayList<Node>()
+    int i = 0
+    while (i < t.length()) {
+      int cp = t.codePointAt(i)
+      kids.add(literal(cp))
+      i += Character.charCount(cp)
+    }
+    return new ConcatNode((Node[]) kids.toArray())
+  }
+
+  /* A \p{...} or \P{...} set, as a CharSet with the one property. */
+  private Node propertyNode(boolean negated) {
+    if (pos >= src.length() || src.charAt(pos) != '{') {
+      throw new PatternSyntaxException("Expected '{' after \\p", src, pos)
+    }
+    pos++
+    int start = pos
+    while (pos < src.length() && src.charAt(pos) != '}') {
+      pos++
+    }
+    if (pos >= src.length()) {
+      throw new PatternSyntaxException("Unclosed character family", src, start)
+    }
+    String name = src.substring(start, pos)
+    pos++
+    if (!RegexSyntax.knownProperty(name)) {
+      throw new PatternSyntaxException("Unknown character property name {" + name + "}", src, start)
+    }
+    CharSet set = new CharSet()
+    set.prop = name
+    set.negated = negated
+    return new ClassNode(set)
+  }
+
+  /* \xHH and \x{...}: a code point written in hex. */
+  private Node hexEscape(int h) {
+    int n = 0
+    if (pos < src.length() && src.charAt(pos) == '{') {
+      pos++
+      while (pos < src.length() && src.charAt(pos) != '}') {
+        n = n * 16 + hexDigit(src.charAt(pos), pos)
+        pos++
+      }
+      if (pos >= src.length()) {
+        throw new PatternSyntaxException("Unclosed character family", src, pos)
+      }
+      pos++
+      return literal(n)
+    }
+    for (int i = 0 : i < h : i++) {
+      if (pos >= src.length()) {
+        throw new PatternSyntaxException("Illegal hexadecimal escape sequence", src, pos - 1)
+      }
+      n = n * 16 + hexDigit(src.charAt(pos), pos)
+      pos++
+    }
+    return literal(n)
+  }
+
+  private int hexDigit(char c, int at) {
+    if (c >= '0' && c <= '9') {
+      return c - '0'
+    }
+    if (c >= 'a' && c <= 'f') {
+      return c - 'a' + 10
+    }
+    if (c >= 'A' && c <= 'F') {
+      return c - 'A' + 10
+    }
+    throw new PatternSyntaxException("Illegal hexadecimal escape sequence", src, at)
   }
 
   private Node escapeNode(int e) {
+    /* The constructs this engine does not implement are refused here rather
+       than falling through to "a literal letter": a pattern that spelled \R
+       and was answered with the letter R would be the silent wrong answer the
+       file's header promises never happens. */
+    if (e == 'G') {
+      throw new PatternSyntaxException("\\G is not supported", src, pos - 2)
+    }
+    if (e == 'R') {
+      throw new PatternSyntaxException("\\R is not supported", src, pos - 2)
+    }
+    if (e == 'X') {
+      throw new PatternSyntaxException("\\X is not supported", src, pos - 2)
+    }
+    if (e == 'h' || e == 'H' || e == 'v' || e == 'V') {
+      throw new PatternSyntaxException("\\" + (char) e + " is not supported", src, pos - 2)
+    }
+    if (e == '0') {
+      throw new PatternSyntaxException("octal escapes are not supported", src, pos - 2)
+    }
     if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
       CharSet set = new CharSet()
-      if (e == 'd') { set.digit = true }
+      if (e == 'd') {
+        set.digit = true
+      }
       if (e == 'D') {
         set.digit = true
         set.negated = true
       }
-      if (e == 'w') { set.word = true }
+      if (e == 'w') {
+        set.word = true
+      }
       if (e == 'W') {
         set.word = true
         set.negated = true
       }
-      if (e == 's') { set.space = true }
+      if (e == 's') {
+        set.space = true
+      }
       if (e == 'S') {
         set.space = true
         set.negated = true
       }
       return new ClassNode(set)
     }
-    if (e == 'n') { return new LitNode('\n') }
-    if (e == 't') { return new LitNode('\t') }
-    if (e == 'r') { return new LitNode('\r') }
-    if (e == 'f') { return new LitNode('\f') }
+    if (e == 'n') {
+      return literal('\n')
+    }
+    if (e == 't') {
+      return literal('\t')
+    }
+    if (e == 'r') {
+      return literal('\r')
+    }
+    if (e == 'f') {
+      return literal('\f')
+    }
+    if (e == 'a') {
+      return literal(7)
+    }
+    if (e == 'e') {
+      return literal(27)
+    }
+    if (e == '0') {
+      return literal(0)
+    }
+    if (e == 'A') {
+      return new AnchorAbs(0)
+    }
+    if (e == 'z') {
+      return new AnchorAbs(1)
+    }
+    if (e == 'Z') {
+      return new AnchorAbs(2)
+    }
     if (e == 'b') {
-      throw new PatternSyntaxException("\\b is not supported", src, pos - 1)
+      return new BoundaryNode(false)
+    }
+    if (e == 'B') {
+      return new BoundaryNode(true)
+    }
+    if (e == 'p' || e == 'P') {
+      return propertyNode(e == 'P')
+    }
+    if (e == 'Q') {
+      return quoted()
+    }
+    if (e == 'x') {
+      return hexEscape(2)
+    }
+    if (e == 'u') {
+      return hexEscape(4)
+    }
+    if (e == 'k') {
+      /* \k<name>: a named backreference. The name resolves after the whole
+         pattern has been parsed, because the group it names may be written
+         later -- which is why the node records the name and the Pattern fixes
+         the index up. */
+      if (pos >= src.length() || src.charAt(pos) != '<') {
+        throw new PatternSyntaxException("\\k is not followed by a named group", src, pos - 1)
+      }
+      pos++
+      int start = pos
+      while (pos < src.length() && src.charAt(pos) != '>') {
+        pos++
+      }
+      if (pos >= src.length()) {
+        throw new PatternSyntaxException("named capturing group has no name", src, start)
+      }
+      String nm = src.substring(start, pos)
+      pos++
+      return new NamedBackRefNode(nm)
     }
     if (RegexSyntax.isDigit(e)) {
-      throw new PatternSyntaxException("backreferences are not supported", src, pos - 1)
+      /* A backreference. Java's rule for the multi-digit case: take as many
+         digits as still name an existing group. */
+      int n = e - '0'
+      while (pos < src.length() && RegexSyntax.isDigit(src.charAt(pos)) && n * 10 + (src.charAt(pos) - '0') < groups) {
+        n = n * 10 + (src.charAt(pos) - '0')
+        pos++
+      }
+      /* A group number that does not exist is accepted and never matches, which
+         is what the JDK does: the pattern compiles, and no input can satisfy it.
+         Refusing instead would reject a pattern javac's own regex accepts. */
+      return new BackRefNode(n)
     }
-    return new LitNode(e)
+    return literal(e)
   }
 
   private Node charClass() {
     pos++
+    CharSet set = classUnion()
+    return new ClassNode(set)
+  }
+
+  /* A class is a union of members (brackets bind tighter) and then an
+     intersection chain: [a-z&&[^aeiou]]. The left side of && is the union
+     parsed so far, and each right side is a nested class or one member. */
+  private CharSet classUnion() {
     CharSet set = new CharSet()
+    set.ci = caseInsensitive
+    pendingClass = set
     if (pos < src.length() && src.charAt(pos) == '^') {
       set.negated = true
       pos++
     }
     boolean first = true
-    while (pos < src.length() && (src.charAt(pos) != ']' || first)) {
+    while (pos < src.length()) {
+      char c = src.charAt(pos)
+      if (c == ']' &&!first) {
+        break
+      }
       first = false
+      if (c == '&' && pos + 1 < src.length() && src.charAt(pos + 1) == '&') {
+        break
+      }
+      if (c == '[') {
+        /* [[:alpha:]] is a POSIX bracket class, not a nested class. Java accepts
+           it; this engine does not implement the POSIX set, so it is refused by
+           name instead of being read as a class of ':' and the letters. */
+        if (pos + 1 < src.length() && src.charAt(pos + 1) == ':') {
+          throw new PatternSyntaxException("POSIX bracket classes are not supported", src, pos)
+        }
+        pos++
+        set.ors.add(classUnion())
+        continue
+      }
       int lo = classChar()
       if (lo == 0) {
-        break
+        continue
       }
       if (pos + 1 < src.length() && src.charAt(pos) == '-' && src.charAt(pos + 1) != ']') {
         pos++
@@ -554,22 +1609,63 @@ class PatternParser {
         if (hi == 0) {
           throw new PatternSyntaxException("Unclosed character class", src, pos)
         }
+        if (hi < lo) {
+          throw new PatternSyntaxException("Illegal character range", src, pos - 1)
+        }
         set.addRange(lo, hi)
         continue
       }
       set.addRange(lo, lo)
     }
-    if (pos >= src.length()) {
+    while (pos + 1 < src.length() && src.charAt(pos) == '&' && src.charAt(pos + 1) == '&') {
+      pos += 2
+      if (pos >= src.length()) {
+        throw new PatternSyntaxException("Unclosed character class", src, pos)
+      }
+      if (src.charAt(pos) == '[') {
+        pos++
+        set.andChain.add(classUnion())
+        continue
+      }
+      CharSet rhs = new CharSet()
+      rhs.ci = caseInsensitive
+      pendingClass = rhs
+      int lo = classChar()
+      if (lo == 0) {
+        throw new PatternSyntaxException("Unclosed character class", src, pos)
+      }
+      if (pos + 1 < src.length() && src.charAt(pos) == '-' && src.charAt(pos + 1) != ']') {
+        pos++
+        int hi = classChar()
+        if (hi < lo) {
+          throw new PatternSyntaxException("Illegal character range", src, pos - 1)
+        }
+        rhs.addRange(lo, hi)
+      } else {
+        rhs.addRange(lo, lo)
+      }
+      set.andChain.add(rhs)
+    }
+    if (pos >= src.length() || src.charAt(pos) != ']') {
       throw new PatternSyntaxException("Unclosed character class", src, pos)
     }
     pos++
-    return new ClassNode(set)
+    pendingClass = set
+    return set
   }
 
   /* One member of a class, which is a code point: a surrogate pair written
      inside a class is the one character it spells, and a range between two
      code points is a range of characters. Zero is the answer that means the
      class ran out, which the caller tests for. */
+  /* One member of a class, which is a code point: a surrogate pair written
+     inside a class is the one character it spells, and a range between two code
+     points is a range of characters. Zero is the answer that means the class ran
+     out, which the caller tests for.
+
+     \d \w \s inside a class are accepted: Java allows them, and a class is
+     the union of its members -- so the set this fills gets the predicate rather
+     than a range, which is exactly how they behave outside one. */
   private int classChar() {
     int c = src.codePointAt(pos)
     if (c != '\\') {
@@ -582,28 +1678,84 @@ class PatternParser {
     }
     int e = src.codePointAt(pos)
     pos += Character.charCount(e)
+    if (e == 'd' || e == 'w' || e == 's' || e == 'D' || e == 'W' || e == 'S') {
+      if (e == 'd') {
+        pendingClass.digit = true
+      }
+      if (e == 'w') {
+        pendingClass.word = true
+      }
+      if (e == 's') {
+        pendingClass.space = true
+      }
+      if (e == 'D' || e == 'W' || e == 'S') {
+        throw new PatternSyntaxException("\\" + (char) e + " inside a class is not supported", src, pos - 2)
+      }
+      return 0
+    }
     Node n = escapeNode(e)
     if (n instanceof ClassNode) {
-      /* the concat takes the char rather than the code point: only \d, \w and
-         \s reach here, so the two are the same, and Character.toString(int)
-         is a call the LLVM backend cannot lower */
-      throw new PatternSyntaxException("\\" + (char) e + " inside a class is not supported", src, pos - 2)
+      /* \p{...} inside a class: the property is folded into the set. */
+      pendingClass.prop = ((ClassNode) n).set.prop
+      if (((ClassNode) n).set.negated) {
+        throw new PatternSyntaxException("\\P{...} inside a class is not supported", src, pos - 2)
+      }
+      return 0
     }
-    return ((LitNode) n).cp
+    if (n instanceof LitNode) {
+      return ((LitNode) n).cp
+    }
+    throw new PatternSyntaxException("\\" + (char) e + " inside a class is not supported", src, pos - 2)
   }
+
+  /* The set a class member is being folded into, so classChar can add a
+     predicate or a property to it while still answering a plain code point for
+     the range case. */
+  private CharSet pendingClass
 }
 
 // ---------------------------------------------------------------- API
-
 class Pattern {
   private String regex
   private Node root
   private int groups
 
+  /* The parser, kept for the name table and for the syntax errors the
+     post-parse step reports. */
+  private static PatternParser lastParser
+
   private Pattern(String regex, Node root, int groups) {
+    this.regex = regex
+    this.root = root;
+    this.groups = groups
+  }
+
+  private Pattern(String regex, Node root, int groups, Map<String, Integer> names) {
     this.regex = regex
     this.root = root
     this.groups = groups
+    this.names = names
+  }
+
+  private Map<String, Integer> names = new HashMap<String, Integer>()
+
+  /* The group a name was given, or -1. This is what Matcher.group(String) uses,
+     and what a replacement of "$<name>" resolves. */
+  public int groupIndex(String name) {
+    Integer i = names.get(name)
+    return i == null ? -1 : i.intValue()
+  }
+
+  public String[] namedGroups() {
+    if (names.size() == 0) {
+      return new String[0]
+    }
+    String[] out = new String[names.size()]
+    int at = 0
+    for (String k : names.keySet()) {
+      out[at++] = k
+    }
+    return out
   }
 
   public static Pattern compile(String regex) {
@@ -613,18 +1765,71 @@ class Pattern {
     // what records where the match started and ended -- without it group(),
     // start() and end() have nothing to answer with.
     Node root = new GroupNode(p.parse(), 0)
-    return new Pattern(regex, root, p.groupCount())
+    resolveNamedBackrefs(root, p)
+    return new Pattern(regex, root, p.groupCount(), p.names)
+  }
+
+  /* A \k<name> may name a group written later, so the index is filled in after
+     the whole pattern is parsed. A name that is still unknown then is refused --
+     the JDK refuses it at the same point. */
+  private static void resolveNamedBackrefs(Node n, PatternParser p) {
+    if (n == null) {
+      return
+    }
+    if (n instanceof NamedBackRefNode) {
+      NamedBackRefNode b = (NamedBackRefNode) n
+      Integer idx = p.names.get(b.name)
+      if (idx == null) {
+        throw new PatternSyntaxException("named capturing group <" + b.name + "> does not exist", p.src, 0)
+      }
+      b.index = idx
+      return
+    }
+    for (Node k : childrenOf(n)) {
+      resolveNamedBackrefs(k, p)
+    }
+  }
+
+  private static Node[] childrenOf(Node n) {
+    if (n instanceof ConcatNode) {
+      return ((ConcatNode) n).kids
+    }
+    if (n instanceof AltNode) {
+      return ((AltNode) n).alts
+    }
+    if (n instanceof GroupNode) {
+      return new Node[] {((GroupNode) n).inner }
+    }
+    if (n instanceof RepeatNode) {
+      return new Node[] {((RepeatNode) n).inner }
+    }
+    if (n instanceof PossessiveNode) {
+      return new Node[] {((PossessiveNode) n).inner }
+    }
+    if (n instanceof AtomicNode) {
+      return new Node[] {((AtomicNode) n).inner }
+    }
+    if (n instanceof LookNode) {
+      return new Node[] {((LookNode) n).inner }
+    }
+    return new Node[0]
   }
 
   public static boolean matches(String regex, String input) {
     return compile(regex).matcher(input).matches()
   }
 
-  public int groupCount() { return groups }
+  public int groupCount() {
+    return groups
+  }
 
-  public String pattern() { return regex }
+  public String pattern() {
+    return regex
+  }
 
-  public Matcher matcher(String input) { return new Matcher(this, input) }
+  public Matcher matcher(String input) {
+    return new Matcher(this, input)
+  }
 
   /* Java's Pattern.split, which is where String.split's semantics actually
      live -- String delegates here. The rules are all in the three branches on
@@ -669,7 +1874,9 @@ class Pattern {
     return out
   }
 
-  public String toString() { return regex }
+  public String toString() {
+    return regex
+  }
 
   private boolean matchAt(MatchState st, int from, boolean anchored) {
     if (anchored) {
@@ -739,13 +1946,57 @@ class Matcher {
     }
   }
 
-  public int start() { return st.starts[0] }
-  public int end() { return st.ends[0] }
-  public int start(int g) { return st.starts[g] }
-  public int end(int g) { return st.ends[g] }
-  public int groupCount() { return pat.groupCount() }
+  public int start() {
+    return st.starts[0]
+  }
+  public int end() {
+    return st.ends[0]
+  }
+  public int start(int g) {
+    return st.starts[g]
+  }
+  public int end(int g) {
+    return st.ends[g]
+  }
+  public int groupCount() {
+    return pat.groupCount()
+  }
 
-  public String group() { return group(0) }
+  public String group() {
+    return group(0)
+  }
+
+  /* Java's group(String): the group the name was given. An unknown name is
+     IllegalArgumentException, as the JDK's is, and an unset group is null. */
+  public String group(String name) {
+    if (!matched) {
+      throw new IllegalStateException("No match found")
+    }
+    int idx = pat.groupIndex(name)
+    if (idx < 0) {
+      throw new IllegalArgumentException("No group with name <" + name + ">")
+    }
+    if (!st.set[idx]) {
+      return null
+    }
+    return input.substring(st.starts[idx], st.ends[idx])
+  }
+
+  public int start(String name) {
+    int idx = pat.groupIndex(name)
+    if (idx < 0) {
+      throw new IllegalArgumentException("No group with name <" + name + ">")
+    }
+    return st.starts[idx]
+  }
+
+  public int end(String name) {
+    int idx = pat.groupIndex(name)
+    if (idx < 0) {
+      throw new IllegalArgumentException("No group with name <" + name + ">")
+    }
+    return st.ends[idx]
+  }
 
   public String group(int g) {
     if (!matched) {
@@ -806,6 +2057,19 @@ class Matcher {
         i += 2
         continue
       }
+      if (c == '$' && i + 1 < replacement.length() && replacement.charAt(i + 1) == '<') {
+        int close = replacement.indexOf('>', i + 2)
+        if (close < 0) {
+          throw new IllegalArgumentException("named capturing group is missing trailing '>'")
+        }
+        String nm = replacement.substring(i + 2, close)
+        String val = group(nm)
+        if (val != null) {
+          b.append(val)
+        }
+        i = close + 1
+        continue
+      }
       if (c == '$' && i + 1 < replacement.length() && RegexSyntax.isDigit(replacement.charAt(i + 1))) {
         int j = i + 1
         int g = 0
@@ -825,7 +2089,9 @@ class Matcher {
     }
   }
 
-  public String toString() { return input }
+  public String toString() {
+    return input
+  }
 }
 
 class PatternSyntaxException extends IllegalArgumentException {
@@ -838,8 +2104,12 @@ class PatternSyntaxException extends IllegalArgumentException {
     this.index = index
   }
 
-  public String getPattern() { return badPattern }
-  public int getIndex() { return index }
+  public String getPattern() {
+    return badPattern
+  }
+  public int getIndex() {
+    return index
+  }
 
   // Java's getMessage is three lines: the reason and the index, the pattern,
   // and a caret under the offending character. Matching that shape is what lets
