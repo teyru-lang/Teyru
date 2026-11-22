@@ -106,7 +106,7 @@ class StringTokenizer implements Enumeration<Object> {
     int position = startPos
     while (!retDelims && position < maxPosition) {
       char c = str.charAt(position)
-      if (c > maxDelimCodePoint || !isDelimiter(c)) {
+      if (c > maxDelimCodePoint ||!isDelimiter(c)) {
         break
       }
       position++
@@ -140,7 +140,7 @@ class StringTokenizer implements Enumeration<Object> {
   }
 
   public String nextToken() {
-    if (newPosition >= 0 && !delimsChanged) {
+    if (newPosition >= 0 &&!delimsChanged) {
       currentPosition = newPosition
     } else {
       currentPosition = skipDelimiters(currentPosition)
@@ -348,7 +348,7 @@ class UUID implements Comparable<UUID> {
     long msb = SOURCE.nextLong()
     long lsb = SOURCE.nextLong()
     // version 4: the four bits after the third dash-group's top bits say so
-    msb = (msb & ~0xF000L) | 0x4000L
+    msb = (msb &~0xF000L) | 0x4000L
     // variant 2 (IETF): the two highest bits of the low half are 10
     lsb = (lsb & 0x3FFFFFFFFFFFFFFFL) | 0x8000000000000000L
     return new UUID(msb, lsb)
@@ -443,8 +443,8 @@ class UUID implements Comparable<UUID> {
      because it is the one that needs no width arithmetic. */
   public String toString() {
     return digits(mostSigBits >> 32, 8) + "-" + digits(mostSigBits >> 16, 4) + "-" +
-      digits(mostSigBits, 4) + "-" + digits(leastSigBits >> 48, 4) + "-" +
-      digits(leastSigBits, 12)
+    digits(mostSigBits, 4) + "-" + digits(leastSigBits >> 48, 4) + "-" +
+    digits(leastSigBits, 12)
   }
 
   private static String digits(long value, int digits) {
@@ -568,7 +568,6 @@ class BitSet {
   }
 
   // ------------------------------------------------------------ single bits
-
   public void set(int bitIndex) {
     if (bitIndex < 0) {
       throw new IndexOutOfBoundsException("bitIndex < 0: " + bitIndex)
@@ -603,7 +602,7 @@ class BitSet {
     if (index >= wordsInUse) {
       return
     }
-    words[index] = words[index] & ~bitAt(bitIndex)
+    words[index] = words[index] &~bitAt(bitIndex)
     recalculateWordsInUse()
   }
 
@@ -626,7 +625,6 @@ class BitSet {
   }
 
   // -------------------------------------------------------------- bit ranges
-
   public void set(int fromIndex, int toIndex) {
     checkRange(fromIndex, toIndex)
     if (fromIndex == toIndex) {
@@ -673,13 +671,13 @@ class BitSet {
     long firstMask = maskFrom(fromIndex)
     long lastMask = maskTo(toIndex)
     if (startWord == endWord) {
-      words[startWord] = words[startWord] & ~(firstMask & lastMask)
+      words[startWord] = words[startWord] &~(firstMask & lastMask)
     } else {
-      words[startWord] = words[startWord] & ~firstMask
+      words[startWord] = words[startWord] &~firstMask
       for (int i = startWord + 1 : i < endWord : i++) {
         words[i] = 0L
       }
-      words[endWord] = words[endWord] & ~lastMask
+      words[endWord] = words[endWord] &~lastMask
     }
     recalculateWordsInUse()
   }
@@ -742,7 +740,6 @@ class BitSet {
   }
 
   // -------------------------------------------------------------- bulk logic
-
   public void and(BitSet set) {
     if (this == set) {
       return
@@ -793,7 +790,7 @@ class BitSet {
   public void andNot(BitSet set) {
     int common = wordsInUse < set.wordsInUse ? wordsInUse : set.wordsInUse
     for (int i = common - 1 : i >= 0 : i--) {
-      words[i] = words[i] & ~set.words[i]
+      words[i] = words[i] &~set.words[i]
     }
     recalculateWordsInUse()
   }
@@ -809,7 +806,6 @@ class BitSet {
   }
 
   // ---------------------------------------------------------------- queries
-
   public int cardinality() {
     int sum = 0
     for (int i = 0 : i < wordsInUse : i++) {
@@ -862,7 +858,7 @@ class BitSet {
     if (u >= wordsInUse) {
       return fromIndex
     }
-    long word = ~words[u] & maskFrom(fromIndex)
+    long word =~words[u] & maskFrom(fromIndex)
     while (true) {
       if (word != 0L) {
         return u * BITS_PER_WORD + Long.numberOfTrailingZeros(word)
@@ -871,7 +867,7 @@ class BitSet {
       if (u == wordsInUse) {
         return wordsInUse * BITS_PER_WORD
       }
-      word = ~words[u]
+      word =~words[u]
     }
   }
 
@@ -910,7 +906,7 @@ class BitSet {
     if (u >= wordsInUse) {
       return fromIndex
     }
-    long word = ~words[u] & maskTo(fromIndex + 1)
+    long word =~words[u] & maskTo(fromIndex + 1)
     while (true) {
       if (word != 0L) {
         return (u + 1) * BITS_PER_WORD - 1 - Long.numberOfLeadingZeros(word)
@@ -919,12 +915,11 @@ class BitSet {
         return -1
       }
       u--
-      word = ~words[u]
+      word =~words[u]
     }
   }
 
   // ----------------------------------------------------------- Object's four
-
   public boolean equals(Object o) {
     if (o == this) {
       return true
@@ -1030,8 +1025,7 @@ class SetEnumeration<E> implements Enumeration<E> {
  *   - The date line store writes is this runtime's clock in ISO form, not
  *     java.util.Date.toString's "EEE MMM dd HH:mm:ss zzz yyyy". */
 class Properties extends HashMap<Object, Object> {
-  public Properties() {
-  }
+  public Properties() {}
 
   public String getProperty(String key) {
     Object value = get(key)
@@ -1081,7 +1075,6 @@ class Properties extends HashMap<Object, Object> {
   }
 
   // ------------------------------------------------------------------ load
-
   public void load(Path path) {
     loadText(Files.readString(path))
   }
@@ -1148,7 +1141,7 @@ class Properties extends HashMap<Object, Object> {
         /* Toggled, not set: a line ending in two backslashes ends the logical
            line, and a line ending in one continues it. */
         if (c == '\\') {
-          precedingBackslash = !precedingBackslash
+          precedingBackslash =!precedingBackslash
         } else {
           precedingBackslash = false
         }
@@ -1196,17 +1189,17 @@ class Properties extends HashMap<Object, Object> {
     boolean precedingBackslash = false
     while (keyLen < limit) {
       char c = text.charAt(keyLen)
-      if ((c == '=' || c == ':') && !precedingBackslash) {
+      if ((c == '=' || c == ':') &&!precedingBackslash) {
         valueStart = keyLen + 1
         hasSep = true
         break
       }
-      if ((c == ' ' || c == '\t' || c == '\f') && !precedingBackslash) {
+      if ((c == ' ' || c == '\t' || c == '\f') &&!precedingBackslash) {
         valueStart = keyLen + 1
         break
       }
       if (c == '\\') {
-        precedingBackslash = !precedingBackslash
+        precedingBackslash =!precedingBackslash
       } else {
         precedingBackslash = false
       }
@@ -1370,7 +1363,6 @@ class Properties extends HashMap<Object, Object> {
     return out.toString()
   }
 
-
   /* Java's own hex digits, and uppercase: store writes é, not é,
      and a file compared against one javac wrote has to agree. */
   private static String hex4(char c) {
@@ -1435,8 +1427,7 @@ class Properties extends HashMap<Object, Object> {
  * per-primitive 2-D overloads Java does not have carry the nested primitive
  * cases the object form must not be handed. */
 class ArrayOps {
-  private ArrayOps() {
-  }
+  private ArrayOps() {}
 
   /* Java's rangeCheck, in Java's order and with Java's messages: the empty
      range and the full range both pass, from past to is an IllegalArgumentException,
@@ -1455,7 +1446,6 @@ class ArrayOps {
   }
 
   // ------------------------------------------------------------------ fill
-
   public static void fill(int[] a, int fromIndex, int toIndex, int val) {
     rangeCheck(a.length, fromIndex, toIndex)
     for (int i = fromIndex : i < toIndex : i++) {
@@ -1520,7 +1510,6 @@ class ArrayOps {
   }
 
   // ----------------------------------------------------------------- sorts
-
   public static void sort(int[] a, int fromIndex, int toIndex) {
     rangeCheck(a.length, fromIndex, toIndex)
     int[] part = Arrays.copyOfRange(a, fromIndex, toIndex)
@@ -1593,7 +1582,7 @@ class ArrayOps {
     }
   }
 
-  public static <T> void sort(T[] a, int fromIndex, int toIndex, Comparator<? super T> c) {
+  public static < T > void sort(T[] a, int fromIndex, int toIndex, Comparator<? super T> c) {
     rangeCheck(a.length, fromIndex, toIndex)
     T[] part = Arrays.copyOfRange(a, fromIndex, toIndex)
     Arrays.sort(part, c)
@@ -1656,14 +1645,13 @@ class ArrayOps {
     return r < 0 ? r - fromIndex : r + fromIndex
   }
 
-  public static <T> int binarySearch(T[] a, int fromIndex, int toIndex, T key, Comparator<? super T> c) {
+  public static < T > int binarySearch(T[] a, int fromIndex, int toIndex, T key, Comparator<? super T> c) {
     rangeCheck(a.length, fromIndex, toIndex)
     int r = Arrays.binarySearch(Arrays.copyOfRange(a, fromIndex, toIndex), key, c)
     return r < 0 ? r - fromIndex : r + fromIndex
   }
 
   // ------------------------------------------------------------ deepHashCode
-
   public static int deepHashCode(Object[] a) {
     if (a == null) {
       return 0
@@ -1773,11 +1761,23 @@ class ArrayOps {
   }
 }
 
-// Base64 is java.util.Base64's encoder. The decoder is not here: nothing in
-// this library reads base64, and a program that needs it can write it -- but
-// RFC 6455's handshake needs the encoder, which is why this is.
+/* Base64, both directions, in the shapes java.util.Base64 has: the basic
+   alphabet, the URL-safe one ("-" and "_" instead of "+" and "/"), and the MIME
+   line length. The encoder was here first because RFC 6455's handshake needs
+   it; the decoder came with the data formats, because a config value, an HTTP
+   basic-auth header and a JWT body are all base64 and a library that only
+   encodes is half a function.
+
+   The decoder is strict in Java's way: a character outside the alphabet,
+   padding in the middle of a quantum, or a trailing single character throws
+   IllegalArgumentException. The MIME decoder ignores line separators, which is
+   what it exists for.
+
+   Verified against the JDK in tests/programs/t332_base64.teyru, which is the
+   same program as its .java.ref. */
 class Base64 {
   private static final String ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  private static final String URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
   public static String encodeToString(byte[] data) {
     StringBuilder b = new StringBuilder()
@@ -1812,5 +1812,112 @@ class Base64 {
   // wants and what the handshake needs.
   public static String encodeToString(String text) {
     return encodeToString(text.getBytes())
+  }
+
+  public static String encodeUrl(byte[] data) {
+    String basic = encodeToString(data)
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < basic.length() : i++) {
+      char c = basic.charAt(i)
+      if (c == '+') {
+        b.append('-')
+      } else if (c == '/') {
+        b.append('_')
+      } else {
+        b.append(c)
+      }
+    }
+    return b.toString()
+  }
+
+  public static String encodeUrl(String text) {
+    return encodeUrl(text.getBytes())
+  }
+
+  /* The MIME encoder: the basic alphabet with a line break every 76 characters,
+     which is what RFC 2045 asks for and what java.util.Base64.getMimeEncoder()
+     writes. */
+  public static String encodeMime(byte[] data) {
+    String basic = encodeToString(data)
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < basic.length() : i++) {
+      if (i > 0 && i % 76 == 0) {
+        b.append("\r\n")
+      }
+      b.append(basic.charAt(i))
+    }
+    return b.toString()
+  }
+
+  /* decode answers the bytes; the strictness is Java's. mime permits line
+     separators (and nothing else extra) between the quads. */
+  public static byte[] decode(String text) {
+    return decode(text, false)
+  }
+
+  public static byte[] decodeMime(String text) {
+    return decode(text, true)
+  }
+
+  private static byte[] decode(String text, boolean mime) {
+    ByteArrayOutputStream out = new ByteArrayOutputStream()
+    int buffer = 0
+    int bits = 0
+    int len = text.length()
+    int i = 0
+    while (i < len) {
+      char c = text.charAt(i)
+      i++
+      if (c == '=') {
+        /* Padding ends the data; anything after it other than whitespace (MIME)
+           is malformed, but Java stops at the first pad and ignores the rest of
+           the quantum, which is what this does. */
+        break
+      }
+      int v = value(c)
+      if (v < 0) {
+        if (mime && (c == '\r' || c == '\n' || c == ' ' || c == '\t')) {
+          continue
+        }
+        throw new IllegalArgumentException("Illegal base64 character " + Integer.toHexString((int) c))
+      }
+      buffer = (buffer << 6) | v
+      bits += 6
+      if (bits >= 8) {
+        bits -= 8
+        out.write((buffer >> bits) & 0xff)
+      }
+    }
+    /* A lone 6-bit tail cannot be a byte, and Java refuses it rather than
+       discarding it. */
+    if (bits >= 6) {
+      throw new IllegalArgumentException("Last unit does not have enough valid bits")
+    }
+    return out.toByteArray()
+  }
+
+  private static int value(char c) {
+    if (c >= 'A' && c <= 'Z') {
+      return c - 'A'
+    }
+    if (c >= 'a' && c <= 'z') {
+      return c - 'a' + 26
+    }
+    if (c >= '0' && c <= '9') {
+      return c - '0' + 52
+    }
+    if (c == '+') {
+      return 62
+    }
+    if (c == '/') {
+      return 63
+    }
+    if (c == '-') {
+      return 62
+    }
+    if (c == '_') {
+      return 63
+    }
+    return -1
   }
 }
