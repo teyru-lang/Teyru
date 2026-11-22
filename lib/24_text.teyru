@@ -437,6 +437,13 @@ class DecimalFormatSymbols {
     s.percentSuffix = (Boolean) d[6] == Boolean.TRUE
     s.currencyPrefix = (Boolean) d[7] == Boolean.TRUE
     s.nbspBeforePercent = (Boolean) d[8] == Boolean.TRUE
+    /* The minus is the locale's: Swedish, Norwegian, Finnish, Croatian,
+       Slovenian print U+2212 rather than a hyphen. */
+    s.minusSign = LocaleFormats.minusSign(locale)
+    /* Arabic's percent sign is U+066A. */
+    if (locale.language.equals("ar")) {
+      s.percent = '\u066a'
+    }
     return s
   }
 
@@ -588,7 +595,7 @@ abstract class NumberFormat extends Format {
   }
 
   public static NumberFormat getInstance(Locale locale) {
-    return localized("#,##0.###", locale)
+    return localized(LocaleFormats.numberPattern(locale), locale)
   }
 
   public static NumberFormat getNumberInstance() {
@@ -596,7 +603,7 @@ abstract class NumberFormat extends Format {
   }
 
   public static NumberFormat getNumberInstance(Locale locale) {
-    return localized("#,##0.###", locale)
+    return localized(LocaleFormats.numberPattern(locale), locale)
   }
 
   /* The bridge between a Locale and a DecimalFormat: the pattern is the ROOT
@@ -626,7 +633,7 @@ abstract class NumberFormat extends Format {
   }
 
   public static NumberFormat getPercentInstance(Locale locale) {
-    return localized("#,##0%", locale)
+    return localized(LocaleFormats.percentPattern(locale), locale)
   }
 
   public static NumberFormat getCurrencyInstance() {
@@ -1413,14 +1420,15 @@ class DecimalFormat extends NumberFormat {
           b.append(affix.substring(i + 1, close).replace("''", "'"))
           i = close + 1
         }
+      } else if (c == '-') {
+        /* A '-' the pattern writes is the locale's minus sign. A quoted '-'
+           takes the quoted branch above, so it stays a hyphen. */
+        b.append(symbols.getMinusSign())
+        i = i + 1
       } else if (c == '%') {
-        /* The JDK's percent pattern for de, fr and ru is "#,##0\u00a0%": the
-           sign goes after the number with a no-break space, while en and ja have
-           it tight. The affix carries a '%' wherever the pattern wrote it, so
-           the spacing is added here, in front, when the locale asks for it. */
-        if (symbols.percentNbsp()) {
-          b.append('\u00a0')
-        }
+        /* The pattern now spells the spacing itself ("#,##0\u00a0%" in de, fr,
+           ru, es and sv), so the affix is taken literally: adding the no-break
+           space here too would print two. */
         b.append(symbols.getPercent())
         i = i + 1
       } else if (affix.startsWith("‰", i)) {
@@ -1428,6 +1436,14 @@ class DecimalFormat extends NumberFormat {
         i = i + 1
       } else if (affix.startsWith("¤", i)) {
         b.append(symbols.getCurrencySymbol())
+        i = i + 1
+      } else if (c == '\u200e' || c == '\u200f' || c == '\u061c') {
+        /* The JDK's Arabic and Hebrew affixes carry bidi control marks (LRM,
+           RLM, ALM). They are directionality hints and not text, and this
+           library does not emit them: the same characters in the same order are
+           what a reader needs. tests/programs/t335_locale_table's expectation
+           is the JDK's output with these three removed, which is the one
+           deliberate difference in that file. */
         i = i + 1
       } else {
         b.append(affix.substring(i, i + 1))
@@ -1538,7 +1554,7 @@ class DecimalFormat extends NumberFormat {
     if (groupingUsed && groupingSize > 0) {
       intDigits = group(intDigits)
     }
-    out.append(intDigits)
+    out.append(localeDigits(intDigits))
     int end = fracDigits.length()
     while (end > minimumFractionDigits && fracDigits.charAt(end - 1) == '0') {
       end = end - 1
@@ -1546,8 +1562,27 @@ class DecimalFormat extends NumberFormat {
     fracDigits = fracDigits.substring(0, end)
     if (fracDigits.length() > 0 || decimalSeparatorAlwaysShown) {
       out.append(symbols.getDecimalSeparator())
-      out.append(fracDigits)
+      out.append(localeDigits(fracDigits))
     }
+  }
+
+  /* The digits are built in ASCII; a locale whose zero digit is not '0' (Arabic
+     is the one carried) prints its own. */
+  private String localeDigits(String ascii) {
+    char zero = symbols.getZeroDigit()
+    if (zero == '0') {
+      return ascii
+    }
+    StringBuilder b = new StringBuilder(ascii.length())
+    for (int i = 0 : i < ascii.length() : i++) {
+      char c = ascii.charAt(i)
+      if (c >= '0' && c <= '9') {
+        b.append((char) (zero + (c - '0')))
+      } else {
+        b.append(c)
+      }
+    }
+    return b.toString()
   }
 
   private String group(String digits) {
@@ -1837,7 +1872,16 @@ class DateFormatSymbols {
     s.shortMonths = (String[]) row[2]
     s.weekdays = (String[]) row[3]
     s.shortWeekdays = (String[]) row[4]
-    s.amPmStrings = (String[]) row[5]
+    /* AM/PM is per locale, not per language: en-CA prints "a.m."/"p.m." where
+       en-US prints "AM"/"PM". */
+    s.amPmStrings = new String[] { LocaleFormats.am(locale), LocaleFormats.pm(locale) }
+    /* The era names are the language's: Thai prints "ค.ศ.", not "AD". */
+    String erasLang = locale.language.length() == 0 ? "" : locale.language
+    for (int i = 0 : i < DateSymbols.ERAS.length : i++) {
+      if (DateSymbols.ERAS[i][0].equals(erasLang)) {
+        s.eras = new String[] {(String) DateSymbols.ERAS[i][1], (String) DateSymbols.ERAS[i][2] }
+      }
+    }
     return s
   }
 
@@ -2107,6 +2151,9 @@ class DateFields {
 class SimpleDateFormat extends DateFormat {
   private String pattern = ""
   private DateFormatSymbols symbols = new DateFormatSymbols()
+  /* The zero digit of the locale this formatter was built for: Arabic dates are
+     printed in Arabic-Indic digits. */
+  private char zeroDigit = '0'
 
   public SimpleDateFormat() {
     applyPattern("M/d/yy, h:mm" + "\u202Fa")
@@ -2126,6 +2173,7 @@ class SimpleDateFormat extends DateFormat {
      already does, so there is nothing else to decide here. */
   public SimpleDateFormat(String pattern, Locale locale) {
     this.symbols = DateFormatSymbols.getInstance(locale)
+    this.zeroDigit = DecimalFormatSymbols.getInstance(locale).getZeroDigit()
     applyPattern(pattern)
   }
 
@@ -2296,46 +2344,46 @@ class SimpleDateFormat extends DateFormat {
         boolean bc = display <= 0
         int value = bc ? 1 - display : display
         if (count == 2) {
-          appendPadded(out, Math.floorMod(value, 100), 2)
+          appendPaddedLocalized(out, Math.floorMod(value, 100), 2)
         } else {
-          appendPadded(out, value, count)
+          appendPaddedLocalized(out, value, count)
         }
       } else if (c == 'M' || c == 'L') {
         appendMonth(out, month, count)
       } else if (c == 'G') {
         out.append(symbols.getEras()[year <= 0 ? 0 : 1])
       } else if (c == 'd') {
-        appendPadded(out, day, count)
+        appendPaddedLocalized(out, day, count)
       } else if (c == 'D') {
-        appendPadded(out, dayOfYear(epochDay, year), count)
+        appendPaddedLocalized(out, dayOfYear(epochDay, year), count)
       } else if (c == 'F') {
-        appendPadded(out, Math.floorDiv(day - 1, 7) + 1, count)
+        appendPaddedLocalized(out, Math.floorDiv(day - 1, 7) + 1, count)
       } else if (c == 'E') {
         int dow = dayOfWeekIndex(epochDay)
         out.append(count >= 4 ? symbols.getWeekdays()[dow + 1] : symbols.getShortWeekdays()[dow + 1])
       } else if (c == 'u') {
-        appendPadded(out, mondayBasedDow(epochDay), count)
+        appendPaddedLocalized(out, mondayBasedDow(epochDay), count)
       } else if (c == 'a') {
         out.append(symbols.getAmPmStrings()[ampm])
       } else if (c == 'H') {
-        appendPadded(out, hour, count)
+        appendPaddedLocalized(out, hour, count)
       } else if (c == 'k') {
-        appendPadded(out, hour == 0 ? 24 : hour, count)
+        appendPaddedLocalized(out, hour == 0 ? 24 : hour, count)
       } else if (c == 'K') {
-        appendPadded(out, hour % 12, count)
+        appendPaddedLocalized(out, hour % 12, count)
       } else if (c == 'h') {
         int h = hour % 12
-        appendPadded(out, h == 0 ? 12 : h, count)
+        appendPaddedLocalized(out, h == 0 ? 12 : h, count)
       } else if (c == 'm') {
-        appendPadded(out, minute, count)
+        appendPaddedLocalized(out, minute, count)
       } else if (c == 's') {
-        appendPadded(out, second, count)
+        appendPaddedLocalized(out, second, count)
       } else if (c == 'S') {
-        appendPadded(out, milli, count)
+        appendPaddedLocalized(out, milli, count)
       } else if (c == 'w') {
-        appendPadded(out, weekOfYear(epochDay, year), count)
+        appendPaddedLocalized(out, weekOfYear(epochDay, year), count)
       } else if (c == 'W') {
-        appendPadded(out, weekOfMonth(epochDay, year, month, day), count)
+        appendPaddedLocalized(out, weekOfMonth(epochDay, year, month, day), count)
       } else if (c == 'z') {
         out.append(count >= 4 ? "Coordinated Universal Time" : "UTC")
       } else if (c == 'Z') {
@@ -2363,6 +2411,18 @@ class SimpleDateFormat extends DateFormat {
       out.append('0')
     }
     out.append(s)
+  }
+
+  /* The same, in the locale's digits: a date in an Arabic locale is written with
+     Arabic-Indic digits, and the JDK does that in the date formatter too. */
+  private void appendPaddedLocalized(StringBuilder out, int value, int width) {
+    String s = Integer.toString(value)
+    for (var k = 0 : k < width - s.length() : k++) {
+      out.append(zeroDigit)
+    }
+    for (var k = 0 : k < s.length() : k++) {
+      out.append((char) (zeroDigit + (s.charAt(k) - '0')))
+    }
   }
 
   // ------------------------------------------------------------ calendar helpers
