@@ -160,6 +160,11 @@ class YamlDocument {
 
   /* A dotted path through mappings, with \\. for a key that contains a dot. */
   public YamlNode get(String path) {
+    /* The empty path is the document itself, which is how a caller asks a
+       document that is a bare scalar (or a flow collection) what it says. */
+    if (path.length() == 0) {
+      return root
+    }
     String[] parts = split(path)
     YamlNode cur = root
     for (int i = 0 : i < parts.length : i++) {
@@ -572,6 +577,13 @@ class YamlParser {
     }
     if (b.equals("---") || b.equals("...")) {
       return new YamlScalar("", true)
+    }
+    /* A document may be a bare scalar or a flow collection ("45", "hello",
+       "[1, 2]"); only a line with a key colon starts a mapping. */
+    if (findKeyColon(b) < 0) {
+      int lineNo = numbers[cur]
+      cur++
+      return inlineValue(b, lineNo)
     }
     return parseMapping(indent)
   }

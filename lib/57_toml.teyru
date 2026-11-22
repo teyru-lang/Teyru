@@ -382,7 +382,12 @@ class TomlDocument {
     return new TomlDocument(new TomlParser(text).parse())
   }
 
+  /* The empty path is the document's root table (see YamlDocument.get for the
+     same rule in the other format). */
   public TomlNode get(String path) {
+    if (path.length() == 0) {
+      return root
+    }
     return walk(path)
   }
 
