@@ -291,6 +291,7 @@ allow 條目過期」，因為後者可能是 O2-clang 與 O2-gcc 之間的差�
 | `teyru-lang/docs` 的〈架構〉 | 編譯流程與執行期模型 | 架構改變時 |
 | `teyru-lang/docs` 的〈JSON〉／〈Web 框架〉／〈模組〉 | 各主題的完整說明 | 該主題行為改變時 |
 | `teyru-lang/docs` 的〈工具鏈〉 | `teyru fmt`／`lsp`／`test`、`-g` 與 CI 的用法與限制 | 任一工具的行為、旗標或限制改變時 |
+| `teyru-lang/docs` 的〈還沒有的東西〉 | 整層能力的現況：資料與互通、密碼學、網路、文字／地區、工具、平台，每列寫「現在有什麼」與替代做法 | 補上一層能力，或某一列的量測被重量時 |
 | `teyru-lang/docs` 的〈測試〉 | 怎麼寫 Teyru 測試：命名、結構、斷言、決定性、選取，以及 `@Test` 家族、`Assert` 的多載、`-run`／`-tag`／`-timeout`／`-deadline` 與輸出隔離 | 測試規範、測試框架、runner 旗標或 `Assert` 介面改變時 |
 | `teyru-lang/tests` | 端到端測試資料 | 新增或修改測試時 |
 | `teyru-lang/editors` | 編輯器擴充與文法 | 語法或關鍵字改變時 |
