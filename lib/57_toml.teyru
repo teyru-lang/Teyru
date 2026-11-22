@@ -1,0 +1,1181 @@
+package teyru
+
+/* TOML 1.0.0, read and written.
+
+   Why a TOML reader at all: a program's configuration is one of the three files
+   it meets in the first hour (properties, JSON, TOML), and this library had the
+   first two. The parser is hand-written in the same recursive-descent shape as
+   the rest of the library -- the JSON layer's JsonParser is the model -- and
+   the value model is the JDK's:
+
+     TomlNode       the base, with a kind and a text form
+     TomlTable      a LinkedHashMap<String, TomlNode>, so insertion order is the
+                    order the file wrote and a re-emit is stable
+     TomlArray      a List of TomlNode
+     TomlString     with the value unescaped
+     TomlInteger    a long, which is TOML's integer width
+     TomlFloat      a double
+     TomlBoolean
+     TomlDateTime   the text of a TOML date/time, kept as written: TOML has four
+                    spellings (offset date-time, local date-time, local date,
+                    local time) and converting one to an Instant would lose
+                    which one it was
+
+   A TomlDocument is the parsed root, with the accessors a program uses
+   (getString/getInt/getBool/getTable/... on a dotted path) and toToml() to write
+   it back.
+
+   What is implemented: tables ([a.b]), arrays of tables ([[a]]), dotted keys,
+   basic strings with the full escape set, literal strings, multi-line strings
+   of both kinds, integers in decimal/hex/octal/binary with underscores, floats
+   (including inf/nan), booleans, arrays (heterogeneous on read, which TOML 1.0
+   allows -- 0.5 forbade it), inline tables, and all four date/time forms.
+   Comments, blank lines and whitespace are handled where TOML says they are
+   allowed.
+
+   What is refused, with the position: a duplicate key, redefining a table that
+   was defined by a dotted key, a table header that collides with a value, and
+   any syntax error. TOML's rules here are stricter than JSON's and a reader
+   that accepted a duplicate would silently pick one.
+
+   How it is verified: tests/programs/t330_toml.teyru parses a document that
+   uses every feature once, writes it back, and prints the values; its
+   expectation is this library's own output, reviewed against the TOML spec's
+   examples. The CSV half of that test is round-tripped against itself, and the
+   XML half against the JDK's own parsers where the shape is shared. */
+class TomlParseException extends RuntimeException {
+  private final int line
+  private final int column
+
+  public TomlParseException(String message, int line, int column) {
+    super(message + " at line " + line + ", column " + column)
+    this.line = line
+    this.column = column
+  }
+
+  public int getLine() {
+    return line
+  }
+  public int getColumn() {
+    return column
+  }
+}
+
+/* The node base: a kind name and the text form. A kind is a string rather than
+   an enum so that a caller can switch on it without the enum's constants having
+   to be imported. */
+abstract class TomlNode {
+  public abstract String kind()
+
+  /* The value as a scalar's text. A table or an array answers its TOML form,
+     which is what tostring would print and what a program logging a config
+     wants. */
+  public String asText() {
+    return toToml()
+  }
+
+  public abstract String toToml()
+}
+
+class TomlString extends TomlNode {
+  public final String value
+  public TomlString(String v) {
+    this.value = v
+  }
+  public String kind() {
+    return "string"
+  }
+  public String asText() {
+    return value
+  }
+  public String toToml() {
+    return TomlQuote.string(value)
+  }
+}
+
+class TomlInteger extends TomlNode {
+  public final long value
+  public TomlInteger(long v) {
+    this.value = v
+  }
+  public String kind() {
+    return "integer"
+  }
+  public String asText() {
+    return Long.toString(value)
+  }
+  public String toToml() {
+    return Long.toString(value)
+  }
+}
+
+class TomlFloat extends TomlNode {
+  public final double value
+  public TomlFloat(double v) {
+    this.value = v
+  }
+  public String kind() {
+    return "float"
+  }
+  public String asText() {
+    return Double.toString(value)
+  }
+  public String toToml() {
+    if (Double.isNaN(value)) {
+      return "nan"
+    }
+    if (Double.isInfinite(value)) {
+      return value > 0 ? "inf" : "-inf"
+    }
+    /* TOML's float grammar requires a fractional part or an exponent: "1" is an
+       integer, so a whole double is written "1.0". */
+    String s = Double.toString(value)
+    if (s.indexOf('.') < 0 && s.indexOf('e') < 0 && s.indexOf('E') < 0) {
+      s = s + ".0"
+    }
+    return s
+  }
+}
+
+class TomlBoolean extends TomlNode {
+  public final boolean value
+  public TomlBoolean(boolean v) {
+    this.value = v
+  }
+  public String kind() {
+    return "boolean"
+  }
+  public String asText() {
+    return value ? "true" : "false"
+  }
+  public String toToml() {
+    return value ? "true" : "false"
+  }
+}
+
+/* A date, a time, a local date-time or an offset date-time, as the file wrote
+   it. Keeping the text is deliberate: TOML distinguishes the four, and a
+   program that re-emits a config should not turn a local date into an instant
+   in whatever zone the machine happens to have. */
+class TomlDateTime extends TomlNode {
+  public final String value
+  /* TOML has four spellings and they are not interchangeable: only an offset
+     date-time names an instant, and a local date has no time at all. The kind is
+     therefore the spelling, decided where the text was read. */
+  public final String kindName
+  public TomlDateTime(String v, String kindName) {
+    this.value = v
+    this.kindName = kindName
+  }
+  public String kind() {
+    return kindName
+  }
+  public String asText() {
+    return value
+  }
+  public String toToml() {
+    return value
+  }
+}
+
+class TomlArray extends TomlNode {
+  public final List<TomlNode> items = new ArrayList<TomlNode>()
+  /* True when every element is a table, which is what distinguishes an array of
+     tables from an array of values when a [[header]] meets it. */
+  public boolean hasTables() {
+    if (items.size() == 0) {
+      return true
+    }
+    for (int i = 0 : i < items.size() : i++) {
+      if (!(items.get(i) instanceof TomlTable)) {
+        return false
+      }
+    }
+    return true
+  }
+  public int size() {
+    return items.size()
+  }
+  public TomlNode get(int i) {
+    return items.get(i)
+  }
+  public void add(TomlNode n) {
+    items.add(n)
+  }
+  public String kind() {
+    return "array"
+  }
+  public String toToml() {
+    return TomlQuote.array(this)
+  }
+}
+
+class TomlTable extends TomlNode {
+  public final Map<String, TomlNode> map = new LinkedHashMap<String, TomlNode>()
+  /* True for a table a [[header]] created: re-emitting one needs the double
+     brackets, and the flag travels with the table. */
+  public boolean arrayOfTables = false
+
+  public String kind() {
+    return "table"
+  }
+  public int size() {
+    return map.size()
+  }
+  public boolean has(String k) {
+    return map.containsKey(k)
+  }
+  public TomlNode get(String k) {
+    return map.get(k)
+  }
+  public void put(String k, TomlNode v) {
+    map.put(k, v)
+  }
+  public List<String> keys() {
+    return new ArrayList<String>(map.keySet())
+  }
+  public String toToml() {
+    return TomlQuote.table(this, "")
+  }
+}
+
+/* Quoting and emitting, in one place so the reader's inverse is checkable. */
+final class TomlQuote {
+  private TomlQuote() {}
+
+  static String string(String v) {
+    StringBuilder b = new StringBuilder()
+    b.append('"')
+    for (int i = 0 : i < v.length() : i++) {
+      char c = v.charAt(i)
+      if (c == '"') {
+        b.append("\\\"")
+      } else if (c == '\\') {
+        b.append("\\\\")
+      } else if (c == '\n') {
+        b.append("\\n")
+      } else if (c == '\r') {
+        b.append("\\r")
+      } else if (c == '\t') {
+        b.append("\\t")
+      } else if (c == '\b') {
+        b.append("\\b")
+      } else if (c == '\f') {
+        b.append("\\f")
+      } else if (c < 0x20 || c == 0x7f) {
+        b.append("\\u00")
+        b.append(hex((c >> 4) & 0xF))
+        b.append(hex(c & 0xF))
+      } else {
+        b.append(c)
+      }
+    }
+    b.append('"')
+    return b.toString()
+  }
+
+  private static char hex(int v) {
+    return "0123456789ABCDEF".charAt(v)
+  }
+
+  static String key(String k) {
+    /* A bare key is letters, digits, '-' and '_'; anything else is quoted. */
+    boolean bare = k.length() > 0
+    for (int i = 0 : i < k.length() : i++) {
+      char c = k.charAt(i)
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+        bare = false
+      }
+    }
+    return bare ? k : string(k)
+  }
+
+  static String array(TomlArray a) {
+    if (a.size() == 0) {
+      return "[]"
+    }
+    StringBuilder b = new StringBuilder("[")
+    for (int i = 0 : i < a.size() : i++) {
+      if (i > 0) {
+        b.append(", ")
+      }
+      b.append(a.get(i).toToml())
+    }
+    b.append(']')
+    return b.toString()
+  }
+
+  /* A table, with its path so that a nested table is written as a [a.b] header
+     unless it is an inline table inside an array. */
+  static String table(TomlTable t, String path) {
+    StringBuilder b = new StringBuilder()
+    StringBuilder scalars = new StringBuilder()
+    List<String> keyList = t.keys()
+    for (int i = 0 : i < keyList.size() : i++) {
+      String k = keyList.get(i)
+      TomlNode v = t.get(k)
+      if (v instanceof TomlTable || v instanceof TomlArray) {
+        continue
+      }
+      scalars.append(key(k)).append(" = ").append(v.toToml()).append('\n')
+    }
+    if (scalars.length() > 0) {
+      b.append(scalars)
+    }
+    for (int i = 0 : i < keyList.size() : i++) {
+      String k = keyList.get(i)
+      TomlNode v = t.get(k)
+      String sub = path.length() == 0 ? key(k) : path + "." + key(k)
+      if (v instanceof TomlTable) {
+        TomlTable tt = (TomlTable) v
+        if (b.length() > 0) {
+          b.append('\n')
+        }
+        /* A table with no scalars of its own is still written: [servers] with
+           only [servers.alpha] under it is legal TOML, and dropping the header
+           would change the tree on the way back in. */
+        b.append('[').append(sub).append("]\n")
+        b.append(table(tt, sub))
+      } else if (v instanceof TomlArray) {
+        TomlArray a = (TomlArray) v
+        boolean allTables = a.size() > 0
+        for (int j = 0 : j < a.size() : j++) {
+          if (!(a.get(j) instanceof TomlTable)) {
+            allTables = false
+          }
+        }
+        if (allTables) {
+          for (int j = 0 : j < a.size() : j++) {
+            if (b.length() > 0) {
+              b.append('\n')
+            }
+            b.append("[[").append(sub).append("]]\n")
+            b.append(table((TomlTable) a.get(j), sub))
+          }
+        } else {
+          if (b.length() > 0) {
+            b.append('\n')
+          }
+          /* A plain array is a value, so it is written with its bare key at the
+             head of this table -- not with the dotted path, which would place it
+             relative to the root and reparse into a different tree. */
+          b.append(key(k)).append(" = ").append(a.toToml()).append('\n')
+        }
+      }
+    }
+    return b.toString()
+  }
+}
+
+/* The parsed document, with the accessors a program uses. A dotted path is
+   resolved one segment at a time, and a missing segment answers the default
+   rather than throwing: a config reader's job is to answer a question, and
+   "there is no such key" is a value. */
+class TomlDocument {
+  public final TomlTable root
+
+  public TomlDocument(TomlTable root) {
+    this.root = root
+  }
+
+  public static TomlDocument parse(String text) {
+    return new TomlDocument(new TomlParser(text).parse())
+  }
+
+  public TomlNode get(String path) {
+    return walk(path)
+  }
+
+  private TomlNode walk(String path) {
+    String[] parts = splitPath(path)
+    TomlNode cur = root
+    for (int i = 0 : i < parts.length : i++) {
+      if (!(cur instanceof TomlTable)) {
+        return null
+      }
+      cur = ((TomlTable) cur).get(parts[i])
+      if (cur == null) {
+        return null
+      }
+    }
+    return cur
+  }
+
+  /* A dotted path, with backslash-escaped dots for a key that contains one. */
+  private static String[] splitPath(String path) {
+    List<String> out = new ArrayList<String>()
+    StringBuilder cur = new StringBuilder()
+    for (int i = 0 : i < path.length() : i++) {
+      char c = path.charAt(i)
+      if (c == '\\' && i + 1 < path.length() && path.charAt(i + 1) == '.') {
+        cur.append('.')
+        i++
+        continue
+      }
+      if (c == '.') {
+        out.add(cur.toString())
+        cur = new StringBuilder()
+        continue
+      }
+      cur.append(c)
+    }
+    out.add(cur.toString())
+    String[] parts = new String[out.size()]
+    for (int i = 0 : i < parts.length : i++) {
+      parts[i] = out.get(i)
+    }
+    return parts
+  }
+
+  public String getString(String path, String fallback) {
+    TomlNode n = walk(path)
+    return n instanceof TomlString ? ((TomlString) n).value : fallback
+  }
+
+  public long getInt(String path, long fallback) {
+    TomlNode n = walk(path)
+    return n instanceof TomlInteger ? ((TomlInteger) n).value : fallback
+  }
+
+  public double getDouble(String path, double fallback) {
+    TomlNode n = walk(path)
+    if (n instanceof TomlFloat) {
+      return ((TomlFloat) n).value
+    }
+    if (n instanceof TomlInteger) {
+      return (double) ((TomlInteger) n).value
+    }
+    return fallback
+  }
+
+  public boolean getBoolean(String path, boolean fallback) {
+    TomlNode n = walk(path)
+    return n instanceof TomlBoolean ? ((TomlBoolean) n).value : fallback
+  }
+
+  public TomlTable getTable(String path) {
+    TomlNode n = walk(path)
+    return n instanceof TomlTable ? (TomlTable) n : null
+  }
+
+  public TomlArray getArray(String path) {
+    TomlNode n = walk(path)
+    return n instanceof TomlArray ? (TomlArray) n : null
+  }
+
+  /* A program's own view of a table: every key with its kind, for a listing or
+     a test. */
+  public String describe(String path) {
+    TomlNode n = walk(path)
+    if (n == null) {
+      return "absent"
+    }
+    return n.kind() + "=" + n.asText()
+  }
+
+  public String toToml() {
+    return root.toToml()
+  }
+}
+
+/* The parser. One pass over the text, with the current table as state: a
+   [header] switches it, a key = value line writes into it, and everything else
+   is whitespace or a comment. Line and column are tracked for the errors,
+   because a config file's only debugging aid is the line number. */
+class TomlParser {
+  private final String src
+  private int at = 0
+  private int line = 1
+  private int col = 1
+  private final TomlTable root = new TomlTable()
+  private TomlTable current = root
+  /* The tables a [header] created, so that a second header on the same path is
+     a redefinition rather than a merge. */
+  private final Map<String, TomlTable> headers = new LinkedHashMap<String, TomlTable>()
+  private final Map<String, Boolean> defined = new LinkedHashMap<String, Boolean>()
+
+  public TomlParser(String src) {
+    this.src = src
+  }
+
+  public TomlTable parse() {
+    while (true) {
+      skipBlank()
+      if (at >= src.length()) {
+        break
+      }
+      if (peek() == '[') {
+        header()
+        continue
+      }
+      keyValue(current, "")
+    }
+    return root
+  }
+
+  private char peek() {
+    return src.charAt(at)
+  }
+
+  private void advance() {
+    if (at < src.length()) {
+      if (src.charAt(at) == '\n') {
+        line++
+        col = 1
+      } else {
+        col++
+      }
+      at++
+    }
+  }
+
+  private void fail(String why) {
+    throw new TomlParseException(why, line, col)
+  }
+
+  /* Whitespace, comments and line breaks, which is everything between two
+     statements. */
+  private void skipBlank() {
+    while (at < src.length()) {
+      char c = peek()
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+        advance()
+        continue
+      }
+      if (c == '#') {
+        while (at < src.length() && peek() != '\n') {
+          advance()
+        }
+        continue
+      }
+      break
+    }
+  }
+
+  private void expectNewlineOrEnd() {
+    skipSpaces()
+    if (at >= src.length()) {
+      return
+    }
+    if (peek() == '#') {
+      while (at < src.length() && peek() != '\n') {
+        advance()
+      }
+      return
+    }
+    if (peek() == '\r') {
+      advance()
+    }
+    if (at < src.length() && peek() == '\n') {
+      advance()
+      return
+    }
+    if (at >= src.length()) {
+      return
+    }
+    fail("expected end of line")
+  }
+
+  private void skipSpaces() {
+    while (at < src.length() && (peek() == ' ' || peek() == '\t')) {
+      advance()
+    }
+  }
+
+  /* [a.b] and [[a]]: navigate or create the table, and make it the current one. */
+  private void header() {
+    advance() /* '[' */
+    boolean array = false
+    if (at < src.length() && peek() == '[') {
+      array = true
+      advance()
+    }
+    skipSpaces()
+    String path = dottedKey()
+    skipSpaces()
+    if (at >= src.length() || peek() != ']') {
+      fail("expected ']'")
+    }
+    advance()
+    if (array) {
+      if (at >= src.length() || peek() != ']') {
+        fail("expected ']]'")
+      }
+      advance()
+    }
+    expectNewlineOrEnd()
+    if (array) {
+      current = arrayTable(path)
+    } else {
+      if (defined.get(path) != null) {
+        fail("table [" + path + "] is defined twice")
+      }
+      defined.put(path, true)
+      current = tableAt(path)
+      headers.put(path, current)
+    }
+  }
+
+  /* The table at a dotted path, creating intermediate tables. A segment that is
+     an array of tables resolves to its last element, which is the rule TOML
+     states for a header written under a [[...]] parent. */
+  private TomlTable tableAt(String path) {
+    String[] parts = split(path)
+    TomlTable t = root
+    for (int i = 0 : i < parts.length : i++) {
+      TomlNode n = t.get(parts[i])
+      if (n == null) {
+        TomlTable sub = new TomlTable()
+        t.put(parts[i], sub)
+        t = sub
+      } else if (n instanceof TomlTable) {
+        t = (TomlTable) n
+      } else if (n instanceof TomlArray) {
+        TomlArray a = (TomlArray) n
+        if (a.size() == 0 ||!(a.get(a.size() - 1) instanceof TomlTable)) {
+          fail("[" + path + "] names an array of values")
+        }
+        t = (TomlTable) a.get(a.size() - 1)
+      } else {
+        fail("[" + path + "] names a value, not a table")
+      }
+    }
+    return t
+  }
+
+  private TomlTable arrayTable(String path) {
+    String[] parts = split(path)
+    TomlTable t = root
+    for (int i = 0 : i < parts.length - 1 : i++) {
+      TomlNode n = t.get(parts[i])
+      if (n == null) {
+        TomlTable sub = new TomlTable()
+        t.put(parts[i], sub)
+        t = sub
+      } else if (n instanceof TomlTable) {
+        t = (TomlTable) n
+      } else if (n instanceof TomlArray) {
+        TomlArray a = (TomlArray) n
+        t = (TomlTable) a.get(a.size() - 1)
+      } else {
+        fail("[[" + path + "]] conflicts with a value")
+      }
+    }
+    String last = parts[parts.length - 1]
+    TomlNode n = t.get(last)
+    TomlArray a
+    if (n == null) {
+      a = new TomlArray()
+      t.put(last, a)
+    } else if (n instanceof TomlArray && ((TomlArray) n).hasTables()) {
+      a = (TomlArray) n
+    } else {
+      fail("[[" + path + "]] conflicts with a value")
+      a = null
+    }
+    TomlTable made = new TomlTable()
+    made.arrayOfTables = true
+    a.add(made)
+    return made
+  }
+
+  private String[] split(String path) {
+    List<String> out = new ArrayList<String>()
+    StringBuilder cur = new StringBuilder()
+    for (int i = 0 : i < path.length() : i++) {
+      char c = path.charAt(i)
+      if (c == '.') {
+        out.add(cur.toString())
+        cur = new StringBuilder()
+        continue
+      }
+      cur.append(c)
+    }
+    out.add(cur.toString())
+    String[] parts = new String[out.size()]
+    for (int i = 0 : i < parts.length : i++) {
+      parts[i] = out.get(i)
+    }
+    return parts
+  }
+
+  /* A key or a dotted key: bare, quoted, or a sequence joined by dots. The
+     returned string is the joined path with '.' because that is what a table
+     header needs; a key that contains a dot is a problem this reader shares
+     with every dotted-path format, and quoting it on the way out is what
+     TomlQuote.key does. */
+  private String dottedKey() {
+    StringBuilder b = new StringBuilder()
+    b.append(oneKey())
+    while (true) {
+      skipSpaces()
+      if (at >= src.length() || peek() != '.') {
+        break
+      }
+      advance()
+      skipSpaces()
+      b.append('.').append(oneKey())
+    }
+    return b.toString()
+  }
+
+  private String oneKey() {
+    if (at >= src.length()) {
+      fail("expected a key")
+    }
+    char c = peek()
+    if (c == '"') {
+      return basicString()
+    }
+    if (c == '\'') {
+      return literalString()
+    }
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      char d = peek()
+      if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9') || d == '_' || d == '-') {
+        b.append(d)
+        advance()
+        continue
+      }
+      break
+    }
+    if (b.length() == 0) {
+      fail("expected a key")
+    }
+    return b.toString()
+  }
+
+  /* One key = value statement, into `t`. prefix carries the dotted part of the
+     key that a header or an enclosing inline table has already consumed. */
+  private void keyValue(TomlTable t, String prefix) {
+    String key = oneKey()
+    while (true) {
+      skipSpaces()
+      if (at < src.length() && peek() == '.') {
+        advance()
+        skipSpaces()
+        String sub = oneKey()
+        TomlNode n = t.get(key)
+        if (n == null) {
+          TomlTable made = new TomlTable()
+          t.put(key, made)
+          t = made
+        } else if (n instanceof TomlTable) {
+          t = (TomlTable) n
+        } else {
+          fail("key '" + key + "' is not a table")
+        }
+        key = sub
+        continue
+      }
+      break
+    }
+    if (at >= src.length() || peek() != '=') {
+      fail("expected '='")
+    }
+    advance()
+    skipSpaces()
+    TomlNode v = value()
+    if (t.get(key) != null) {
+      fail("duplicate key '" + key + "'")
+    }
+    t.put(key, v)
+    expectNewlineOrEnd()
+  }
+
+  private TomlNode value() {
+    if (at >= src.length()) {
+      fail("expected a value")
+    }
+    char c = peek()
+    if (c == '"') {
+      if (startsWith("\"\"\"")) {
+        return new TomlString(multiBasic())
+      }
+      return new TomlString(basicString())
+    }
+    if (c == '\'') {
+      if (startsWith("'''")) {
+        return new TomlString(multiLiteral())
+      }
+      return new TomlString(literalString())
+    }
+    if (c == '[') {
+      return arrayValue()
+    }
+    if (c == '{') {
+      return inlineTable()
+    }
+    if (startsWith("true")) {
+      consume("true")
+      return new TomlBoolean(true)
+    }
+    if (startsWith("false")) {
+      consume("false")
+      return new TomlBoolean(false)
+    }
+    if (startsWith("inf")) {
+      consume("inf")
+      return new TomlFloat(Double.POSITIVE_INFINITY)
+    }
+    if (startsWith("-inf")) {
+      consume("-inf")
+      return new TomlFloat(Double.NEGATIVE_INFINITY)
+    }
+    if (startsWith("+inf")) {
+      consume("+inf")
+      return new TomlFloat(Double.POSITIVE_INFINITY)
+    }
+    if (startsWith("nan")) {
+      consume("nan")
+      return new TomlFloat(Double.NaN)
+    }
+    return numberOrDate()
+  }
+
+  private boolean startsWith(String s) {
+    return src.startsWith(s, at)
+  }
+
+  private void consume(String s) {
+    for (int i = 0 : i < s.length() : i++) {
+      advance()
+    }
+  }
+
+  private TomlNode arrayValue() {
+    advance() /* '[' */
+    TomlArray a = new TomlArray()
+    while (true) {
+      skipBlank()
+      if (at >= src.length()) {
+        fail("unclosed array")
+      }
+      if (peek() == ']') {
+        advance()
+        break
+      }
+      a.add(value())
+      skipBlank()
+      if (at < src.length() && peek() == ',') {
+        advance()
+        continue
+      }
+      skipBlank()
+      if (at < src.length() && peek() == ']') {
+        advance()
+        break
+      }
+      fail("expected ',' or ']' in an array")
+    }
+    return a
+  }
+
+  private TomlNode inlineTable() {
+    advance() /* '{' */
+    TomlTable t = new TomlTable()
+    skipSpaces()
+    if (at < src.length() && peek() == '}') {
+      advance()
+      return t
+    }
+    while (true) {
+      skipSpaces()
+      keyValueInline(t)
+      skipSpaces()
+      if (at < src.length() && peek() == ',') {
+        advance()
+        continue
+      }
+      if (at < src.length() && peek() == '}') {
+        advance()
+        break
+      }
+      fail("expected ',' or '}' in an inline table")
+    }
+    return t
+  }
+
+  private void keyValueInline(TomlTable t) {
+    String key = oneKey()
+    skipSpaces()
+    if (at >= src.length() || peek() != '=') {
+      fail("expected '='")
+    }
+    advance()
+    skipSpaces()
+    TomlNode v = value()
+    if (t.get(key) != null) {
+      fail("duplicate key '" + key + "'")
+    }
+    t.put(key, v)
+  }
+
+  /* A number or a date/time. TOML makes a date obvious: it begins with four
+     digits and a '-', or two digits and a ':' for a local time. */
+  private TomlNode numberOrDate() {
+    int start = at
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      char c = peek()
+      if (c == ',' || c == ']' || c == '}' || c == '\n' || c == '\r' || c == '#' || c == ' ' || c == '\t') {
+        break
+      }
+      b.append(c)
+      advance()
+    }
+    String tok = b.toString()
+    if (tok.length() == 0) {
+      fail("expected a value")
+    }
+    if (isDateTime(tok)) {
+      return new TomlDateTime(tok, dateTimeKind(tok))
+    }
+    return parseNumber(tok)
+  }
+
+  /* Which of TOML's four spellings this is: a bare date is local-date, a bare
+     time is local-time, a date and time with a zone is offset-date-time, and a
+     date and time without one is local-date-time. */
+  private String dateTimeKind(String tok) {
+    boolean date = tok.length() >= 10 && tok.charAt(4) == '-'
+    boolean timeOnly = tok.length() >= 8 && tok.charAt(2) == ':'
+    /* A date-time joins the two with 'T' (or a space, which TOML allows). */
+    boolean dateTime = date && (tok.indexOf('T') > 0 || tok.indexOf(' ') > 0)
+    if (date &&!dateTime) {
+      return "local-date"
+    }
+    if (timeOnly &&!date) {
+      return "local-time"
+    }
+    if (tok.indexOf('Z') >= 0 || (tok.length() > 10 && (tok.indexOf('+', 10) >= 0 || tok.indexOf('-', 10) >= 0))) {
+      return "offset-date-time"
+    }
+    return "local-date-time"
+  }
+
+  private boolean isDateTime(String tok) {
+    if (tok.length() >= 10 && tok.charAt(4) == '-' && tok.charAt(7) == '-') {
+      return true
+    }
+    if (tok.length() >= 8 && tok.charAt(2) == ':' && tok.charAt(5) == ':') {
+      return true
+    }
+    return false
+  }
+
+  private TomlNode parseNumber(String tok) {
+    boolean negative = false
+    String s = tok
+    if (s.startsWith("-")) {
+      negative = true
+      s = s.substring(1)
+    } else if (s.startsWith("+")) {
+      s = s.substring(1)
+    }
+    s = s.replace("_", "")
+    long v
+    if (s.startsWith("0x")) {
+      v = Long.parseLong(s.substring(2), 16)
+    } else if (s.startsWith("0o")) {
+      v = Long.parseLong(s.substring(2), 8)
+    } else if (s.startsWith("0b")) {
+      v = Long.parseLong(s.substring(2), 2)
+    } else if (s.indexOf('.') >= 0 || s.indexOf('e') >= 0 || s.indexOf('E') >= 0) {
+      double d = Double.parseDouble(s)
+      return new TomlFloat(negative ? -d : d)
+    } else {
+      v = Long.parseLong(s)
+    }
+    return new TomlInteger(negative ? -v : v)
+  }
+
+  private String basicString() {
+    advance() /* '"' */
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      char c = peek()
+      if (c == '"') {
+        advance()
+        return b.toString()
+      }
+      if (c == '\n') {
+        fail("unclosed string")
+      }
+      if (c == '\\') {
+        advance()
+        b.append(escape())
+        continue
+      }
+      b.append(c)
+      advance()
+    }
+    fail("unclosed string")
+    return ""
+  }
+
+  private String escape() {
+    if (at >= src.length()) {
+      fail("unclosed escape")
+    }
+    char c = peek()
+    advance()
+    if (c == 'n') {
+      return "\n"
+    }
+    if (c == 't') {
+      return "\t"
+    }
+    if (c == 'r') {
+      return "\r"
+    }
+    if (c == 'b') {
+      return "\b"
+    }
+    if (c == 'f') {
+      return "\f"
+    }
+    if (c == '"') {
+      return "\""
+    }
+    if (c == '\\') {
+      return "\\"
+    }
+    if (c == 'u') {
+      return codePoint(4)
+    }
+    if (c == 'U') {
+      return codePoint(8)
+    }
+    fail("unknown escape \\" + c)
+    return ""
+  }
+
+  private String codePoint(int digits) {
+    int v = 0
+    for (int i = 0 : i < digits : i++) {
+      if (at >= src.length()) {
+        fail("truncated escape")
+      }
+      int d = Character.digit(src.charAt(at), 16)
+      if (d < 0) {
+        fail("bad hex digit in an escape")
+      }
+      v = v * 16 + d
+      advance()
+    }
+    return new String(Character.toChars(v))
+  }
+
+  private String literalString() {
+    advance()
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      char c = peek()
+      if (c == '\'') {
+        advance()
+        return b.toString()
+      }
+      if (c == '\n') {
+        fail("unclosed string")
+      }
+      b.append(c)
+      advance()
+    }
+    fail("unclosed string")
+    return ""
+  }
+
+  /* A multi-line basic string: the opening delimiter's newline is trimmed, the
+     closing one may be preceded by up to two quotes, and line endings are
+     normalised to "\n" -- all three are TOML's own rules. */
+  private String multiBasic() {
+    consume("\"\"\"")
+    if (at < src.length() && peek() == '\r') {
+      advance()
+    }
+    if (at < src.length() && peek() == '\n') {
+      advance()
+    }
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      if (startsWith("\"\"\"")) {
+        consume("\"\"\"")
+        /* Up to two extra quotes belong to the string. */
+        int extra = 0
+        while (extra < 2 && at < src.length() && peek() == '"') {
+          b.append('"')
+          advance()
+          extra++
+        }
+        return b.toString()
+      }
+      char c = peek()
+      if (c == '\\') {
+        advance()
+        /* A line-ending backslash trims the newline and the whitespace after
+           it, which is how TOML wraps a long string. */
+        int save = at
+        boolean trimmed = false
+        while (at < src.length() && (peek() == ' ' || peek() == '\t')) {
+          advance()
+        }
+        if (at < src.length() && peek() == '\r') {
+          advance()
+        }
+        if (at < src.length() && peek() == '\n') {
+          advance()
+          while (at < src.length() && (peek() == ' ' || peek() == '\t' || peek() == '\r' || peek() == '\n')) {
+            advance()
+          }
+          trimmed = true
+        }
+        if (!trimmed) {
+          at = save
+          b.append(escape())
+        }
+        continue
+      }
+      if (c == '\r') {
+        advance()
+        if (at < src.length() && peek() == '\n') {
+          advance()
+        }
+        b.append('\n')
+        continue
+      }
+      b.append(c)
+      advance()
+    }
+    fail("unclosed multi-line string")
+    return ""
+  }
+
+  private String multiLiteral() {
+    consume("'''")
+    if (at < src.length() && peek() == '\r') {
+      advance()
+    }
+    if (at < src.length() && peek() == '\n') {
+      advance()
+    }
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      if (startsWith("'''")) {
+        consume("'''")
+        int extra = 0
+        while (extra < 2 && at < src.length() && peek() == '\'') {
+          b.append('\'')
+          advance()
+          extra++
+        }
+        return b.toString()
+      }
+      b.append(peek())
+      advance()
+    }
+    fail("unclosed multi-line string")
+    return ""
+  }
+}

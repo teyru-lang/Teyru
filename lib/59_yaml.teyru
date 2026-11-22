@@ -1,0 +1,1166 @@
+package teyru
+
+/* YAML 1.2, the block-and-flow subset a configuration file actually uses.
+
+   YAML is not a small language, and a library that claimed all of it would need
+   anchors, aliases, merge keys, tags, directives and five scalar styles before
+   the first program ran. This reader implements the part a config file is
+   written in, and *refuses* the rest by name -- the same rule as the rest of
+   this standard library (an unimplemented construct is a named exception, never
+   a silently different answer):
+
+   Implemented
+     - block mappings (key: value) nested by indentation, including the
+       sequence-of-mappings form ("- name: x" plus following keys);
+     - block sequences ("- item") nested under a key or at the top;
+     - flow collections ([a, b] and {a: b}) on one line;
+     - plain scalars, single-quoted ('' escapes '), double-quoted with the
+       escape set, and the two block scalars (| literal and > folded) with the
+       indentation and chomping indicators;
+     - comments, blank lines, a leading --- and a trailing ...;
+     - the null forms (~, null, empty value), true/false, and the tags YAML 1.2
+       gives those; integers and floats are kept as text and converted by the
+       caller (a YAML reader that decided "1.10" was a float loses the trailing
+       zero in a version string -- the famous Norway problem's cousin).
+
+   Refused, with a message that names the construct
+     - anchors (&a), aliases (*a) and merge keys (<<): resolving them needs a
+       document-wide graph and a cycle check;
+     - explicit tags (!!str, !custom);
+     - multi-document streams (a --- after the first document).
+
+   The tree is the same three classes as the TOML reader, spelled for YAML:
+   YamlMapping, YamlSequence, YamlScalar. Keeping scalars as text is the one
+   design decision worth arguing: it makes this a *parser* (what the file says)
+   rather than a *typer* (what the file means), and the caller who wants a long
+   writes Long.parseLong, which is also the place that can report a bad value
+   with the file's own line.
+
+   How it is verified: tests/programs/t331_yaml.teyru parses a document that
+   uses every construct once, prints the tree, writes it back, reparses, and
+   checks each refusal by catching it and printing the message. */
+class YamlParseException extends RuntimeException {
+  private final int line
+
+  public YamlParseException(String message, int line) {
+    super(message + " at line " + line)
+    this.line = line
+  }
+
+  public int getLine() {
+    return line
+  }
+}
+
+abstract class YamlNode {
+  public abstract String kind()
+}
+
+class YamlScalar extends YamlNode {
+  public final String value
+  /* True for ~, null and an empty value. A caller distinguishing "absent" from
+     "explicitly null" reads this. */
+  public final boolean isNull
+
+  public YamlScalar(String value, boolean isNull) {
+    this.value = value
+    this.isNull = isNull
+  }
+
+  public String kind() {
+    return "scalar"
+  }
+
+  public long asLong() {
+    if (isNull) {
+      throw new NumberFormatException("the value is null")
+    }
+    return Long.parseLong(value)
+  }
+
+  public double asDouble() {
+    if (isNull) {
+      throw new NumberFormatException("the value is null")
+    }
+    return Double.parseDouble(value)
+  }
+
+  public boolean asBoolean() {
+    if (isNull) {
+      throw new NumberFormatException("the value is null")
+    }
+    if (value.equals("true") || value.equals("True") || value.equals("TRUE")) {
+      return true
+    }
+    if (value.equals("false") || value.equals("False") || value.equals("FALSE")) {
+      return false
+    }
+    throw new NumberFormatException("not a boolean: " + value)
+  }
+}
+
+class YamlSequence extends YamlNode {
+  public final List<YamlNode> items = new ArrayList<YamlNode>()
+
+  public String kind() {
+    return "sequence"
+  }
+  public int size() {
+    return items.size()
+  }
+  public YamlNode get(int i) {
+    return items.get(i)
+  }
+  public void add(YamlNode n) {
+    items.add(n)
+  }
+}
+
+class YamlMapping extends YamlNode {
+  public final Map<String, YamlNode> map = new LinkedHashMap<String, YamlNode>()
+  /* Keys in the order they were seen; a LinkedHashMap's keySet would do, but the
+     writer wants a List it can index. */
+  public final List<String> order = new ArrayList<String>()
+
+  public String kind() {
+    return "mapping"
+  }
+  public int size() {
+    return map.size()
+  }
+  public boolean has(String k) {
+    return map.containsKey(k)
+  }
+  public YamlNode get(String k) {
+    return map.get(k)
+  }
+
+  public void put(String k, YamlNode v) {
+    if (!map.containsKey(k)) {
+      order.add(k)
+    }
+    map.put(k, v)
+  }
+
+  public List<String> keys() {
+    return new ArrayList<String>(order)
+  }
+}
+
+class YamlDocument {
+  public final YamlNode root
+
+  public YamlDocument(YamlNode root) {
+    this.root = root
+  }
+
+  public static YamlDocument parse(String text) {
+    return new YamlDocument(new YamlParser(text).parse())
+  }
+
+  /* A dotted path through mappings, with \\. for a key that contains a dot. */
+  public YamlNode get(String path) {
+    String[] parts = split(path)
+    YamlNode cur = root
+    for (int i = 0 : i < parts.length : i++) {
+      if (!(cur instanceof YamlMapping)) {
+        return null
+      }
+      cur = ((YamlMapping) cur).get(parts[i])
+      if (cur == null) {
+        return null
+      }
+    }
+    return cur
+  }
+
+  private static String[] split(String path) {
+    List<String> out = new ArrayList<String>()
+    StringBuilder cur = new StringBuilder()
+    for (int i = 0 : i < path.length() : i++) {
+      char c = path.charAt(i)
+      if (c == '\\' && i + 1 < path.length() && path.charAt(i + 1) == '.') {
+        cur.append('.')
+        i++
+        continue
+      }
+      if (c == '.') {
+        out.add(cur.toString())
+        cur = new StringBuilder()
+        continue
+      }
+      cur.append(c)
+    }
+    out.add(cur.toString())
+    String[] parts = new String[out.size()]
+    for (int i = 0 : i < parts.length : i++) {
+      parts[i] = out.get(i)
+    }
+    return parts
+  }
+
+  public String getString(String path, String fallback) {
+    YamlNode n = get(path)
+    if (n instanceof YamlScalar &&!((YamlScalar) n).isNull) {
+      return ((YamlScalar) n).value
+    }
+    return fallback
+  }
+
+  public long getLong(String path, long fallback) {
+    YamlNode n = get(path)
+    if (n instanceof YamlScalar &&!((YamlScalar) n).isNull) {
+      try {
+        return Long.parseLong(((YamlScalar) n).value)
+      } catch (NumberFormatException e) {
+        return fallback
+      }
+    }
+    return fallback
+  }
+
+  public boolean getBoolean(String path, boolean fallback) {
+    YamlNode n = get(path)
+    if (n instanceof YamlScalar &&!((YamlScalar) n).isNull) {
+      try {
+        return ((YamlScalar) n).asBoolean()
+      } catch (NumberFormatException e) {
+        return fallback
+      }
+    }
+    return fallback
+  }
+
+  public YamlMapping getMapping(String path) {
+    YamlNode n = get(path)
+    return n instanceof YamlMapping ? (YamlMapping) n : null
+  }
+
+  public YamlSequence getSequence(String path) {
+    YamlNode n = get(path)
+    return n instanceof YamlSequence ? (YamlSequence) n : null
+  }
+
+  public String describe(String path) {
+    YamlNode n = get(path)
+    if (n == null) {
+      return "absent"
+    }
+    if (n instanceof YamlScalar) {
+      YamlScalar s = (YamlScalar) n
+      return s.isNull ? "null" : s.value
+    }
+    return n.kind()
+  }
+
+  public String toYaml() {
+    StringBuilder b = new StringBuilder()
+    YamlWriter.write(root, b, 0, true)
+    return b.toString()
+  }
+}
+
+/* The writer: block style, two-space indent, and a scalar quoted only when the
+   plain form would read back as something else. Quoting is the interesting part
+   -- "yes" is a plain scalar in YAML 1.2 but a boolean in 1.1, and a reader that
+   quoted nothing would produce files that a 1.1 parser misreads. This writer
+   quotes anything that is not unambiguously a string. */
+final class YamlWriter {
+  private YamlWriter() {}
+
+  static void write(YamlNode n, StringBuilder b, int depth, boolean top) {
+    if (n instanceof YamlMapping) {
+      writeMapping((YamlMapping) n, b, depth, top)
+    } else if (n instanceof YamlSequence) {
+      writeSequence((YamlSequence) n, b, depth, top)
+    } else {
+      YamlScalar s = (YamlScalar) n
+      b.append(s.isNull ? "null" : scalar(s.value))
+      b.append('\n')
+    }
+  }
+
+  private static void indent(StringBuilder b, int depth) {
+    for (int i = 0 : i < depth : i++) {
+      b.append("  ")
+    }
+  }
+
+  private static void writeMapping(YamlMapping m, StringBuilder b, int depth, boolean top) {
+    if (m.size() == 0) {
+      indent(b, depth)
+      b.append("{}\n")
+      return
+    }
+    List<String> keys = m.keys()
+    for (int i = 0 : i < keys.size() : i++) {
+      String k = keys.get(i)
+      YamlNode v = m.get(k)
+      indent(b, depth)
+      b.append(key(k)).append(':')
+      if (v instanceof YamlScalar) {
+        YamlScalar s = (YamlScalar) v
+        b.append(' ').append(s.isNull ? "null" : scalar(s.value)).append('\n')
+      } else if (isEmpty(v)) {
+        b.append(' ').append(v instanceof YamlMapping ? "{}" : "[]").append('\n')
+      } else if (v instanceof YamlMapping) {
+        b.append('\n')
+        writeMapping((YamlMapping) v, b, depth + 1, false)
+      } else {
+        b.append('\n')
+        writeSequence((YamlSequence) v, b, depth + 1, false)
+      }
+    }
+  }
+
+  private static boolean isEmpty(YamlNode v) {
+    if (v instanceof YamlMapping) {
+      return ((YamlMapping) v).size() == 0
+    }
+    if (v instanceof YamlSequence) {
+      return ((YamlSequence) v).size() == 0
+    }
+    return false
+  }
+
+  private static void writeSequence(YamlSequence s, StringBuilder b, int depth, boolean top) {
+    if (s.size() == 0) {
+      indent(b, depth)
+      b.append("[]\n")
+      return
+    }
+    for (int i = 0 : i < s.size() : i++) {
+      YamlNode v = s.get(i)
+      indent(b, depth)
+      b.append('-')
+      if (v instanceof YamlScalar) {
+        YamlScalar sc = (YamlScalar) v
+        b.append(' ').append(sc.isNull ? "null" : scalar(sc.value)).append('\n')
+      } else if (isEmpty(v)) {
+        b.append(' ').append(v instanceof YamlMapping ? "{}" : "[]").append('\n')
+      } else if (v instanceof YamlMapping) {
+        /* "- key: v" on the dash line, the rest aligned under it: the form a
+           YAML writer has to produce for a list of objects. */
+        YamlMapping m = (YamlMapping) v
+        List<String> keys = m.keys()
+        if (keys.size() == 0) {
+          b.append(" {}\n")
+          continue
+        }
+        StringBuilder inner = new StringBuilder()
+        writeMapping(m, inner, depth + 1, false)
+        String text = inner.toString()
+        int firstNewline = text.indexOf('\n')
+        /* The dash replaces this line's indentation: "- key: v", with the rest
+           of the mapping already at depth + 1. */
+        String firstLine = text.substring(0, firstNewline).trim()
+        b.append(' ').append(firstLine).append('\n')
+        b.append(text.substring(firstNewline + 1))
+      } else {
+        b.append('\n')
+        writeSequence((YamlSequence) v, b, depth + 1, false)
+      }
+    }
+  }
+
+  /* A key in plain form when it is a simple word, quoted otherwise. */
+  static String key(String k) {
+    if (isPlainSafe(k, true)) {
+      return k
+    }
+    return quote(k)
+  }
+
+  static String scalar(String s) {
+    if (s.length() == 0) {
+      return "\"\""
+    }
+    if (isPlainSafe(s, false)) {
+      return s
+    }
+    return quote(s)
+  }
+
+  private static boolean isPlainSafe(String s, boolean key) {
+    char first = s.charAt(0)
+    if ("-?:,[]{}#&*!|>'\"%@`".indexOf(first) >= 0) {
+      return false
+    }
+    if (first == ' ' || s.charAt(s.length() - 1) == ' ') {
+      return false
+    }
+    /* A value that a YAML 1.1 reader would take as a non-string has to be
+       quoted, or the file means something else somewhere else. */
+    if (!key) {
+      String low = s.toLowerCase()
+      if (low.equals("null") || low.equals("~") || low.equals("true") || low.equals("false") || low.equals("yes") || low.equals("no") || low.equals("on") || low.equals("off")) {
+        return false
+      }
+      /* A numeric-looking scalar is written unquoted: this reader keeps scalars
+         as text, so "1" and 1 are the same node, and quoting it would make a
+         round-tripped file harder to read for no gain. */
+      if (looksNumeric(s) && (s.indexOf(' ') >= 0 || s.indexOf(':') >= 0)) {
+        return false
+      }
+    }
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c == ':' && i + 1 < s.length() && s.charAt(i + 1) == ' ') {
+        return false
+      }
+      if (c == '#' && i > 0 && s.charAt(i - 1) == ' ') {
+        return false
+      }
+      if (c == '\n' || c == '\t' || c == '\r') {
+        return false
+      }
+      if ("[]{},&*!|>'\"%@`".indexOf(c) >= 0) {
+        return false
+      }
+    }
+    if (s.endsWith(":")) {
+      return false
+    }
+    return true
+  }
+
+  private static boolean looksNumeric(String s) {
+    boolean any = false
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if ((c >= '0' && c <= '9')) {
+        any = true
+        continue
+      }
+      if (c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || c == 'x' || c == 'o' || c == 'X' || c == 'O' || c == 'a' || c == 'b' || c == 'c' || c == 'd' || c == 'f' || c == 'A' || c == 'B' || c == 'C' || c == 'D' || c == 'F') {
+        continue
+      }
+      return false
+    }
+    return any
+  }
+
+  static String quote(String s) {
+    StringBuilder b = new StringBuilder()
+    b.append('"')
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c == '"') {
+        b.append("\\\"")
+      } else if (c == '\\') {
+        b.append("\\\\")
+      } else if (c == '\n') {
+        b.append("\\n")
+      } else if (c == '\t') {
+        b.append("\\t")
+      } else if (c == '\r') {
+        b.append("\\r")
+      } else if (c < 0x20) {
+        b.append("\\x").append(hex((c >> 4) & 0xF)).append(hex(c & 0xF))
+      } else {
+        b.append(c)
+      }
+    }
+    b.append('"')
+    return b.toString()
+  }
+
+  private static char hex(int v) {
+    return "0123456789ABCDEF".charAt(v)
+  }
+}
+
+/* The parser. YAML's indentation is the grammar, so the reader keeps a stack of
+   "(indent, container)" and decides on each new line whether it continues the
+   current container, opens a child, or closes back. Lines are pre-split with
+   their original numbers, and a line that is only a comment or whitespace is
+   dropped before that walk -- which is legal because both are invisible in
+   block context. */
+class YamlParser {
+  private final String[] lines
+  private final int[] numbers
+  private int cur = 0
+
+  public YamlParser(String text) {
+    List<String> kept = new ArrayList<String>()
+    List<Integer> nums = new ArrayList<Integer>()
+    String[] raw = text.split("\n")
+    for (int i = 0 : i < raw.length : i++) {
+      String line = raw[i]
+      if (line.endsWith("\r")) {
+        line = line.substring(0, line.length() - 1)
+      }
+      kept.add(line)
+      nums.add(i + 1)
+    }
+    String[] ls = new String[kept.size()]
+    int[] ns = new int[kept.size()]
+    for (int i = 0 : i < ls.length : i++) {
+      ls[i] = kept.get(i)
+      ns[i] = nums.get(i)
+    }
+    this.lines = ls
+    this.numbers = ns
+  }
+
+  /* Blank lines and comments are invisible in block context -- they are
+     consumed here, and only a block scalar reads them, because there they are
+     the content. */
+  private void skipNoise() {
+    while (cur < lines.length) {
+      String t = lines[cur].trim()
+      if (t.length() == 0 || t.startsWith("#")) {
+        cur++
+        continue
+      }
+      break
+    }
+  }
+
+  public YamlNode parse() {
+    skipNoise()
+    if (lines.length == 0) {
+      return new YamlScalar("", true)
+    }
+    /* A leading document marker is consumed; a second one is a stream this
+       reader does not read. */
+    if (cur < lines.length && isMarker(lines[cur], "---")) {
+      cur++
+      skipNoise()
+    }
+    if (cur >= lines.length) {
+      return new YamlScalar("", true)
+    }
+    int indent = indentOf(lines[cur])
+    YamlNode n = parseBlock(indent)
+    if (cur < lines.length && isMarker(lines[cur], "...")) {
+      cur++
+    }
+    if (cur < lines.length) {
+      fail("unexpected content (indentation " + indentOf(lines[cur]) + ")");
+    }
+    return n
+  }
+
+  private boolean isMarker(String line, String m) {
+    String t = line.trim()
+    return t.equals(m) || t.startsWith(m + " ")
+  }
+
+  private void fail(String why) {
+    int lineNo = cur < numbers.length ? numbers[cur] : (numbers.length > 0 ? numbers[numbers.length - 1] : 1)
+    throw new YamlParseException(why, lineNo)
+  }
+
+  private int indentOf(String line) {
+    int n = 0
+    while (n < line.length() && line.charAt(n) == ' ') {
+      n++
+    }
+    return n
+  }
+
+  private String body(String line) {
+    return line.substring(indentOf(line))
+  }
+
+  private YamlNode parseBlock(int indent) {
+    skipNoise()
+    String b = body(lines[cur])
+    if (b.startsWith("- ") || b.equals("-")) {
+      return parseSequence(indent)
+    }
+    if (b.equals("---") || b.equals("...")) {
+      return new YamlScalar("", true)
+    }
+    return parseMapping(indent)
+  }
+
+  private YamlSequence parseSequence(int indent) {
+    YamlSequence seq = new YamlSequence()
+    while (true) {
+      skipNoise()
+      if (cur >= lines.length) {
+        break
+      }
+      String b = body(lines[cur])
+      if (indentOf(lines[cur]) != indent) {
+        break
+      }
+      if (isMarker(lines[cur], "---") || isMarker(lines[cur], "...")) {
+        break
+      }
+      if (!(b.startsWith("- ") || b.equals("-"))) {
+        break
+      }
+      String rest = b.length() > 1 ? b.substring(2) : ""
+      if (rest.trim().length() == 0) {
+        cur++
+        if (cur >= lines.length) {
+          seq.add(new YamlScalar("", true))
+          break
+        }
+        int childIndent = indentOf(lines[cur])
+        if (childIndent <= indent) {
+          seq.add(new YamlScalar("", true))
+          continue
+        }
+        seq.add(parseBlock(childIndent))
+        continue
+      }
+      /* "- key: value" starts a mapping whose first key is on the dash line;
+         "- scalar" is just a scalar (or a flow collection). The distinction is
+         a key colon before any comment, and it decides whether the rest of the
+         item is rewritten to be indented at the child level so parseMapping can
+         read it. */
+      int dashIndent = indent
+      if (findKeyColon(rest) >= 0) {
+        lines[cur] = spaces(dashIndent + 2) + rest
+        seq.add(parseMapping(dashIndent + 2))
+        continue
+      }
+      cur++
+      seq.add(inlineValue(rest))
+    }
+    return seq
+  }
+
+  private String spaces(int n) {
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < n : i++) {
+      b.append(' ')
+    }
+    return b.toString()
+  }
+
+  private YamlMapping parseMapping(int indent) {
+    YamlMapping m = new YamlMapping()
+    while (true) {
+      skipNoise()
+      if (cur >= lines.length) {
+        break
+      }
+      String line = lines[cur]
+      int lineIndent = indentOf(line)
+      if (lineIndent != indent) {
+        if (lineIndent > indent) {
+          fail("unexpected indentation")
+        }
+        break
+      }
+      String b = body(line)
+      if (b.startsWith("- ") || b.equals("-")) {
+        break
+      }
+      /* A document marker ends this document; parse() decides whether a second
+         one is the "multi-document" refusal or the single trailing "...". */
+      if (isMarker(line, "---") || isMarker(line, "...")) {
+        break
+      }
+      int colon = findKeyColon(b)
+      if (colon < 0) {
+        fail("expected 'key: value'")
+      }
+      String rawKey = b.substring(0, colon).trim()
+      String key = unquoteKey(rawKey)
+      String rest = b.substring(colon + 1).trim()
+      if (rest.equals("|") || rest.startsWith("|") || rest.equals(">") || rest.startsWith(">")) {
+        /* The key line is behind us before the block scalar reads on: it starts
+           at the line *after* the indicator. */
+        cur++
+        String scalar = blockScalar(rest, indent)
+        m.put(key, new YamlScalar(scalar, false))
+        continue
+      }
+      cur++
+      if (rest.length() == 0) {
+        /* The value is the next block at a deeper indent, or null. */
+        skipNoise()
+        if (cur >= lines.length) {
+          m.put(key, new YamlScalar("", true))
+          break
+        }
+        int childIndent = indentOf(lines[cur])
+        String childBody = body(lines[cur])
+        /* A sequence may sit at the same indent as its key -- YAML's one
+           exception to the indentation rule, and the one every file uses. */
+        if (childIndent == indent && (childBody.startsWith("- ") || childBody.equals("-"))) {
+          m.put(key, parseSequence(indent))
+          continue
+        }
+        if (childIndent <= indent) {
+          m.put(key, new YamlScalar("", true))
+          continue
+        }
+        m.put(key, parseBlock(childIndent))
+        continue
+      }
+      m.put(key, inlineValue(rest, numbers[cur - 1]))
+    }
+    return m
+  }
+
+  /* Where the key's colon is: the first ':' that is followed by a space or the
+     end of the line, and not inside a quoted key. */
+  private int findKeyColon(String b) {
+    boolean single = false
+    boolean dbl = false
+    for (int i = 0 : i < b.length() : i++) {
+      char c = b.charAt(i)
+      if (c == '\'' &&!dbl) {
+        single =!single
+        continue
+      }
+      if (c == '"' &&!single) {
+        dbl =!dbl
+        continue
+      }
+      if (single || dbl) {
+        continue
+      }
+      if (c == ':' && (i + 1 == b.length() || b.charAt(i + 1) == ' ')) {
+        return i
+      }
+      if (c == '#' && i > 0 && b.charAt(i - 1) == ' ') {
+        return -1
+      }
+    }
+    return -1
+  }
+
+  private String unquoteKey(String k) {
+    if (k.length() >= 2 && k.charAt(0) == '"' && k.charAt(k.length() - 1) == '"') {
+      return unescape(k.substring(1, k.length() - 1), true)
+    }
+    if (k.length() >= 2 && k.charAt(0) == '\'' && k.charAt(k.length() - 1) == '\'') {
+      return unescape(k.substring(1, k.length() - 1), false)
+    }
+    return k
+  }
+
+  /* The value after "key:" on the same line: a flow collection, a quoted
+     scalar, or a plain scalar with a trailing comment removed. */
+  private YamlNode inlineValue(String rest) {
+    return inlineValue(rest, cur < numbers.length ? numbers[cur] : 1)
+  }
+
+  /* line is the line the value was written on: the caller has already advanced
+     past it, so the error would otherwise point at the next line. */
+  private YamlNode inlineValue(String rest, int line) {
+    char c = rest.charAt(0)
+    if (c == '&' || c == '*') {
+      throw new YamlParseException(c == '&' ? "anchors (&name) are not supported: resolving one needs a document-wide graph" : "aliases (*name) are not supported: resolving one needs a document-wide graph", line)
+    }
+    if (c == '!') {
+      throw new YamlParseException("explicit tags (!tag) are not supported", line)
+    }
+    if (c == '|' || c == '>') {
+      throw new YamlParseException("a block scalar needs its own lines", line)
+    }
+    if (c == '[') {
+      Flow flow = new Flow(rest, cur < numbers.length ? numbers[cur] : 1)
+      YamlNode n = flow.sequence()
+      flow.finish()
+      return n
+    }
+    if (c == '{') {
+      Flow flow = new Flow(rest, cur < numbers.length ? numbers[cur] : 1)
+      YamlNode n = flow.mapping()
+      flow.finish()
+      return n
+    }
+    return scalarNode(rest)
+  }
+
+  /* A plain or quoted scalar, with a comment stripped from the plain form. */
+  private YamlNode scalarNode(String text) {
+    String s = text
+    if (s.length() > 0 && s.charAt(0) == '"') {
+      if (s.length() < 2 || s.charAt(s.length() - 1) != '"') {
+        fail("unclosed double-quoted scalar")
+      }
+      return new YamlScalar(unescape(s.substring(1, s.length() - 1), true), false)
+    }
+    if (s.length() > 0 && s.charAt(0) == '\'') {
+      if (s.length() < 2 || s.charAt(s.length() - 1) != '\'') {
+        fail("unclosed single-quoted scalar")
+      }
+      return new YamlScalar(unescape(s.substring(1, s.length() - 1), false), false)
+    }
+    /* A comment starts at " #" and runs to the end of the line. */
+    int hash = -1
+    for (int i = 1 : i < s.length() : i++) {
+      if (s.charAt(i) == '#' && s.charAt(i - 1) == ' ') {
+        hash = i
+        break
+      }
+    }
+    if (hash >= 0) {
+      s = s.substring(0, hash).trim()
+    }
+    if (s.length() == 0 || s.equals("~") || s.equals("null") || s.equals("Null") || s.equals("NULL")) {
+      return new YamlScalar("", true)
+    }
+    return new YamlScalar(s, false)
+  }
+
+  private String unescape(String s, boolean dbl) {
+    if (!dbl) {
+      /* Single quotes: '' is the only escape. */
+      StringBuilder b = new StringBuilder()
+      for (int i = 0 : i < s.length() : i++) {
+        char c = s.charAt(i)
+        if (c == '\'' && i + 1 < s.length() && s.charAt(i + 1) == '\'') {
+          b.append('\'')
+          i++
+          continue
+        }
+        b.append(c)
+      }
+      return b.toString()
+    }
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c != '\\') {
+        b.append(c)
+        continue
+      }
+      i++
+      if (i >= s.length()) {
+        fail("unclosed escape")
+      }
+      char e = s.charAt(i)
+      if (e == 'n') {
+        b.append('\n')
+      } else if (e == 't') {
+        b.append('\t')
+      } else if (e == 'r') {
+        b.append('\r')
+      } else if (e == '0') {
+        b.append('\u0000')
+      } else if (e == 'b') {
+        b.append('\b')
+      } else if (e == 'f') {
+        b.append('\f')
+      } else if (e == '"') {
+        b.append('"')
+      } else if (e == '\\') {
+        b.append('\\')
+      } else if (e == '/') {
+        b.append('/')
+      } else if (e == 'u') {
+        b.append(hexChar(s, i + 1, 4, 4))
+        i += 4
+      } else if (e == 'U') {
+        b.append(hexChar(s, i + 1, 8, 8))
+        i += 8
+      } else if (e == 'x') {
+        b.append(hexChar(s, i + 1, 2, 2))
+        i += 2
+      } else {
+        fail("unknown escape \\" + e)
+      }
+    }
+    return b.toString()
+  }
+
+  private String hexChar(String s, int at, int digits, int width) {
+    if (at + digits > s.length()) {
+      fail("truncated escape")
+    }
+    int v = Integer.parseInt(s.substring(at, at + digits), 16)
+    if (!Character.isValidCodePoint(v)) {
+      fail("escape out of range")
+    }
+    return new String(Character.toChars(v))
+  }
+
+  /* A | or > scalar: the lines after the indicator that are indented deeper than
+     the key, with the chomping indicator's rule for the trailing newline. */
+  private String blockScalar(String indicator, int keyIndent) {
+    boolean literal = indicator.charAt(0) == '|'
+    char chomp = ' '
+    int explicitIndent = 0
+    for (int i = 1 : i < indicator.length() : i++) {
+      char c = indicator.charAt(i)
+      if (c == '-' || c == '+') {
+        chomp = c
+      } else if (c >= '1' && c <= '9') {
+        explicitIndent = c - '0'
+      }
+    }
+    int lineNo = cur < numbers.length ? numbers[cur] : 1
+    List<String> body = new ArrayList<String>()
+    int blockIndent = explicitIndent > 0 ? keyIndent + explicitIndent : -1
+    while (cur < lines.length) {
+      String line = lines[cur]
+      int li = indentOf(line)
+      if (line.trim().length() == 0) {
+        body.add("")
+        cur++
+        continue
+      }
+      if (blockIndent < 0) {
+        if (li <= keyIndent) {
+          break
+        }
+        blockIndent = li
+      }
+      if (li < blockIndent) {
+        break
+      }
+      body.add(line.length() > blockIndent ? line.substring(blockIndent) : "")
+      cur++
+    }
+    /* Trailing blank lines belong to the scalar's chomping, not to the next
+       block, so they were all consumed above; the chomping rule decides how
+       many survive. */
+    int end = body.size()
+    while (end > 0 && body.get(end - 1).length() == 0) {
+      end--
+    }
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < end : i++) {
+      if (i > 0) {
+        if (literal) {
+          b.append('\n')
+        } else if (body.get(i).length() == 0) {
+          /* Folded: a blank line is one newline, and the already-newline case
+             is covered because the next non-blank line appends nothing. */
+          b.append('\n')
+        } else if (body.get(i - 1).length() != 0) {
+          b.append(' ')
+        }
+      }
+      b.append(body.get(i))
+    }
+    int trailing = body.size() - end
+    if (chomp == '-') {
+      /* strip: no trailing newline at all */
+    } else if (chomp == '+') {
+      b.append('\n')
+      for (int i = 0 : i < trailing : i++) {
+        b.append('\n')
+      }
+    } else if (end > 0) {
+      b.append('\n')
+    }
+    if (b.length() == 0) {
+      return "";
+    }
+    return b.toString()
+  }
+}
+
+/* A flow collection on one line. Kept separate from the block parser because
+   its grammar is the JSON-ish one -- commas and brackets -- and mixing the two
+   is where a hand-written YAML reader goes wrong. */
+class Flow {
+  private final String s
+  private int at = 0
+  private final int line
+
+  public Flow(String s, int line) {
+    this.s = s
+    this.line = line
+  }
+
+  private void fail(String why) {
+    throw new YamlParseException(why, line)
+  }
+
+  private void skipSpaces() {
+    while (at < s.length() && (s.charAt(at) == ' ' || s.charAt(at) == '\t')) {
+      at++
+    }
+  }
+
+  public YamlNode sequence() {
+    if (at >= s.length() || s.charAt(at) != '[') {
+      fail("expected '['")
+    }
+    at++
+    YamlSequence seq = new YamlSequence()
+    skipSpaces()
+    if (at < s.length() && s.charAt(at) == ']') {
+      at++
+      return seq
+    }
+    while (true) {
+      skipSpaces()
+      seq.add(value())
+      skipSpaces()
+      if (at >= s.length()) {
+        fail("unclosed flow sequence")
+      }
+      char c = s.charAt(at)
+      at++
+      if (c == ']') {
+        return seq
+      }
+      if (c != ',') {
+        fail("expected ',' or ']' in a flow sequence")
+      }
+    }
+  }
+
+  public YamlNode mapping() {
+    if (at >= s.length() || s.charAt(at) != '{') {
+      fail("expected '{'")
+    }
+    at++
+    YamlMapping m = new YamlMapping()
+    skipSpaces()
+    if (at < s.length() && s.charAt(at) == '}') {
+      at++
+      return m
+    }
+    while (true) {
+      skipSpaces()
+      String k = nodeText()
+      skipSpaces()
+      if (at >= s.length() || s.charAt(at) != ':') {
+        fail("expected ':' in a flow mapping")
+      }
+      at++
+      skipSpaces()
+      m.put(k, value())
+      skipSpaces()
+      if (at >= s.length()) {
+        fail("unclosed flow mapping")
+      }
+      char c = s.charAt(at)
+      at++
+      if (c == '}') {
+        return m
+      }
+      if (c != ',') {
+        fail("expected ',' or '}' in a flow mapping")
+      }
+    }
+  }
+
+  private YamlNode value() {
+    skipSpaces()
+    if (at >= s.length()) {
+      fail("expected a value")
+    }
+    char c = s.charAt(at)
+    if (c == '&' || c == '*') {
+      fail("anchors and aliases are not supported in a flow collection either")
+    }
+    if (c == '!') {
+      fail("explicit tags are not supported")
+    }
+    if (c == '[') {
+      return sequence()
+    }
+    if (c == '{') {
+      return mapping()
+    }
+    String text = nodeText()
+    if (text.equals("~") || text.equals("null") || text.length() == 0) {
+      return new YamlScalar("", true)
+    }
+    return new YamlScalar(text, false)
+  }
+
+  /* One scalar's text, quoted or plain, up to a ',' ']' '}' or ':' that is not
+     inside quotes. */
+  private String nodeText() {
+    skipSpaces()
+    if (at < s.length() && s.charAt(at) == '"') {
+      return quoted('"')
+    }
+    if (at < s.length() && s.charAt(at) == '\'') {
+      return quoted('\'')
+    }
+    int start = at
+    while (at < s.length()) {
+      char c = s.charAt(at)
+      if (c == ',' || c == ']' || c == '}' || c == ':') {
+        break
+      }
+      at++
+    }
+    return s.substring(start, at).trim()
+  }
+
+  private String quoted(char q) {
+    at++
+    StringBuilder b = new StringBuilder()
+    while (at < s.length()) {
+      char c = s.charAt(at)
+      at++
+      if (c == q) {
+        if (q == '\'' && at < s.length() && s.charAt(at) == '\'') {
+          b.append('\'')
+          at++
+          continue
+        }
+        return unescape(b.toString(), q == '"')
+      }
+      if (q == '"' && c == '\\') {
+        if (at >= s.length()) {
+          fail("unclosed escape")
+        }
+        char e = s.charAt(at)
+        at++
+        b.append("\\").append(e)
+        continue
+      }
+      b.append(c)
+    }
+    fail("unclosed quoted scalar")
+    return ""
+  }
+
+  private String unescape(String s, boolean dbl) {
+    if (!dbl) {
+      return s
+    }
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c != '\\') {
+        b.append(c)
+        continue
+      }
+      i++
+      if (i >= s.length()) {
+        fail("unclosed escape")
+      }
+      char e = s.charAt(i)
+      if (e == 'n') {
+        b.append('\n')
+      } else if (e == 't') {
+        b.append('\t')
+      } else if (e == 'r') {
+        b.append('\r')
+      } else if (e == '"') {
+        b.append('"')
+      } else if (e == '\\') {
+        b.append('\\')
+      } else if (e == 'u') {
+        if (i + 4 >= s.length()) {
+          fail("truncated escape")
+        }
+        int v = Integer.parseInt(s.substring(i + 1, i + 5), 16)
+        b.append(new String(Character.toChars(v)))
+        i += 4
+      } else {
+        b.append(e)
+      }
+    }
+    return b.toString()
+  }
+
+  /* Nothing but whitespace and a comment may follow a flow collection. */
+  public void finish() {
+    skipSpaces()
+    if (at < s.length() && s.charAt(at) != '#') {
+      fail("trailing content after a flow collection")
+    }
+  }
+}

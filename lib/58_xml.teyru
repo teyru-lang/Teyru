@@ -1,0 +1,708 @@
+package teyru
+
+/* XML 1.0, read into a small tree and written back.
+
+   A parser rather than a binding layer: the tree is what the format is, and a
+   binding on top of it (like the JSON binding in 27_json_binding.teyru) is a
+   separate decision that a program can make with the tree in hand. The shape
+   follows the DOM's names for the things it has, because a reader who knows
+   Java does not need a second vocabulary:
+
+     XmlNode        kind + name + text, the base
+     XmlElement     name, attributes (insertion ordered), children, text
+     XmlText        a character-data run (and CDATA, which keeps its flag)
+     XmlComment     a comment
+     XmlDocument    the root element, plus the prolog's version and encoding
+
+   What is implemented: the XML declaration, elements and attributes (single and
+   double quoted), character data, CDATA, comments, character and entity
+   references (the five predefined ones plus decimal and hexadecimal numeric
+   references), the empty-element form <a/>, and whitespace handling that keeps
+   text exactly where the document put it.
+
+   What is refused, on purpose and with a position:
+     - a DOCTYPE declaration. This is not laziness: an internal DTD lets a
+       document redefine entities, and a parser that expands them is the XXE
+       hole (an external entity reading /etc/passwd into an error message). A
+       document that needs a DTD needs a real XML stack, and saying so is
+       better than being half of one.
+     - processing instructions other than the XML declaration, for the same
+       reason: <?xml-stylesheet?> and friends change what the document means.
+     - any malformed document: an unclosed element, a mismatched end tag, an
+       attribute without a value, a name that is not a name.
+
+   Namespaces are not resolved: the prefix stays part of the name ("soap:Body"
+   is that string). Resolving them needs a namespace stack, and a program that
+   needs it is talking to a schema, which is outside a tree this small.
+
+   How it is verified: tests/programs/t328_xml.teyru parses a document with
+   every construct once, prints the tree, writes it back and reparses it, and
+   checks the refusal cases (DOCTYPE, mismatched tags) by catching the
+   exception and printing its message. */
+class XmlParseException extends RuntimeException {
+  private final int line
+  private final int column
+
+  public XmlParseException(String message, int line, int column) {
+    super(message + " at line " + line + ", column " + column)
+    this.line = line
+    this.column = column
+  }
+
+  public int getLine() {
+    return line
+  }
+  public int getColumn() {
+    return column
+  }
+}
+
+abstract class XmlNode {
+  public abstract String kind()
+}
+
+class XmlText extends XmlNode {
+  public final String text
+  public final boolean cdata
+
+  public XmlText(String text, boolean cdata) {
+    this.text = text
+    this.cdata = cdata
+  }
+
+  public String kind() {
+    return cdata ? "cdata" : "text"
+  }
+}
+
+class XmlComment extends XmlNode {
+  public final String text
+
+  public XmlComment(String text) {
+    this.text = text
+  }
+
+  public String kind() {
+    return "comment"
+  }
+}
+
+class XmlElement extends XmlNode {
+  public final String name
+  public final Map<String, String> attributes = new LinkedHashMap<String, String>()
+  public final List<XmlNode> children = new ArrayList<XmlNode>()
+  /* The concatenation of this element's direct text children, which is what a
+     caller asking "what does this element say" wants; it is computed on demand
+     rather than stored, because a document that mutates the tree would leave a
+     cached copy stale. */
+  public XmlElement(String name) {
+    this.name = name
+  }
+
+  public String kind() {
+    return "element"
+  }
+
+  public String getAttribute(String name) {
+    return attributes.get(name)
+  }
+
+  public String getAttribute(String name, String fallback) {
+    String v = attributes.get(name)
+    return v == null ? fallback : v
+  }
+
+  public List<XmlElement> elements() {
+    List<XmlElement> out = new ArrayList<XmlElement>()
+    for (int i = 0 : i < children.size() : i++) {
+      if (children.get(i) instanceof XmlElement) {
+        out.add((XmlElement) children.get(i))
+      }
+    }
+    return out
+  }
+
+  public List<XmlElement> elements(String name) {
+    List<XmlElement> out = new ArrayList<XmlElement>()
+    for (int i = 0 : i < children.size() : i++) {
+      XmlNode n = children.get(i)
+      if (n instanceof XmlElement && ((XmlElement) n).name.equals(name)) {
+        out.add((XmlElement) n)
+      }
+    }
+    return out
+  }
+
+  /* The first child element with this name, or null. This is the accessor a
+     hand-written XML caller writes most often. */
+  public XmlElement child(String name) {
+    for (int i = 0 : i < children.size() : i++) {
+      XmlNode n = children.get(i)
+      if (n instanceof XmlElement && ((XmlElement) n).name.equals(name)) {
+        return (XmlElement) n
+      }
+    }
+    return null
+  }
+
+  public String text() {
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < children.size() : i++) {
+      XmlNode n = children.get(i)
+      if (n instanceof XmlText) {
+        b.append(((XmlText) n).text)
+      }
+    }
+    return b.toString()
+  }
+
+  /* The text of every descendant text node, joined. An element that wraps a
+     value in one child (<a><b>v</b></a>) is common enough that asking for
+     "whatever text is in here" needs a name. */
+  public String deepText() {
+    StringBuilder b = new StringBuilder()
+    appendDeepText(this, b)
+    return b.toString()
+  }
+
+  private static void appendDeepText(XmlElement e, StringBuilder b) {
+    for (int i = 0 : i < e.children.size() : i++) {
+      XmlNode n = e.children.get(i)
+      if (n instanceof XmlText) {
+        b.append(((XmlText) n).text)
+      } else if (n instanceof XmlElement) {
+        appendDeepText((XmlElement) n, b)
+      }
+    }
+  }
+
+  public XmlElement add(XmlNode n) {
+    children.add(n)
+    return this
+  }
+
+  public XmlElement setAttribute(String name, String value) {
+    attributes.put(name, value)
+    return this
+  }
+
+  public String toXml() {
+    StringBuilder b = new StringBuilder()
+    XmlWriter.writeElement(this, b, 0, false)
+    return b.toString()
+  }
+}
+
+class XmlDocument {
+  public final XmlElement root
+  public final String version
+  public final String encoding
+
+  public XmlDocument(XmlElement root, String version, String encoding) {
+    this.root = root
+    this.version = version
+    this.encoding = encoding
+  }
+
+  public static XmlDocument parse(String text) {
+    return new XmlParser(text).parse()
+  }
+
+  public String toXml() {
+    StringBuilder b = new StringBuilder()
+    b.append("<?xml version=\"").append(version).append("\" encoding=\"").append(encoding).append("\"?>\n")
+    XmlWriter.writeElement(root, b, 0, true)
+    b.append('\n')
+    return b.toString()
+  }
+}
+
+/* Escaping on the way out. Everything but the five predefined entities and the
+   printable range becomes a numeric reference, which is the only form that does
+   not depend on the reader's DTD. */
+final class XmlWriter {
+  private XmlWriter() {}
+
+  static String escapeText(String s) {
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c == '&') {
+        b.append("&amp;")
+      } else if (c == '<') {
+        b.append("&lt;")
+      } else if (c == '>') {
+        b.append("&gt;")
+      } else if (c == '\r') {
+        b.append("&#13;")
+      } else if (c < 0x20 && c != '\n' && c != '\t') {
+        b.append("&#").append((int) c).append(';')
+      } else {
+        b.append(c)
+      }
+    }
+    return b.toString()
+  }
+
+  static String escapeAttr(String s) {
+    StringBuilder b = new StringBuilder()
+    for (int i = 0 : i < s.length() : i++) {
+      char c = s.charAt(i)
+      if (c == '&') {
+        b.append("&amp;")
+      } else if (c == '<') {
+        b.append("&lt;")
+      } else if (c == '"') {
+        b.append("&quot;")
+      } else if (c == '\n') {
+        b.append("&#10;")
+      } else if (c == '\r') {
+        b.append("&#13;")
+      } else if (c == '\t') {
+        b.append("&#9;")
+      } else {
+        b.append(c)
+      }
+    }
+    return b.toString()
+  }
+
+  static void indent(StringBuilder b, int depth) {
+    for (int i = 0 : i < depth : i++) {
+      b.append("  ")
+    }
+  }
+
+  static void writeElement(XmlElement e, StringBuilder b, int depth, boolean pretty) {
+    writeNode(e, b, depth, pretty, false)
+  }
+
+  /* laidOut is the parent's decision: a child of a laid-out parent starts on its
+     own line whether or not it has children of its own. pretty is this
+     element's own: only an element whose children are elements or comments gets
+     a trailing newline and nested indentation, because adding whitespace around
+     text would change the text. */
+  private static void writeNode(XmlElement e, StringBuilder b, int depth, boolean pretty, boolean laidOut) {
+    boolean layout = pretty && hasElementChild(e) &&!hasMeaningfulText(e)
+    if (laidOut) {
+      indent(b, depth)
+    }
+    b.append('<').append(e.name)
+    List<String> names = new ArrayList<String>(e.attributes.keySet())
+    for (int i = 0 : i < names.size() : i++) {
+      String k = names.get(i)
+      b.append(' ').append(k).append("=\"").append(escapeAttr(e.attributes.get(k))).append('"')
+    }
+    if (e.children.size() == 0) {
+      b.append("/>")
+      if (laidOut) {
+        b.append('\n')
+      }
+      return
+    }
+    b.append('>')
+    if (layout) {
+      b.append('\n')
+    }
+    for (int i = 0 : i < e.children.size() : i++) {
+      XmlNode n = e.children.get(i)
+      if (n instanceof XmlText) {
+        XmlText t = (XmlText) n
+        if (layout &&!t.cdata && t.text.trim().length() == 0) {
+          continue
+        }
+        if (t.cdata) {
+          if (layout) {
+            indent(b, depth + 1)
+          }
+          b.append("<![CDATA[").append(t.text).append("]]>")
+          if (layout) {
+            b.append('\n')
+          }
+        } else {
+          b.append(escapeText(t.text))
+        }
+      } else if (n instanceof XmlComment) {
+        if (layout) {
+          indent(b, depth + 1)
+        }
+        b.append("<!--").append(((XmlComment) n).text).append("-->")
+        if (layout) {
+          b.append('\n')
+        }
+      } else if (n instanceof XmlElement) {
+        writeNode((XmlElement) n, b, depth + 1, pretty, layout)
+      }
+    }
+    if (layout) {
+      indent(b, depth)
+    }
+    b.append("</").append(e.name).append('>')
+    if (laidOut) {
+      b.append('\n')
+    }
+  }
+
+  private static boolean hasMeaningfulText(XmlElement e) {
+    for (int i = 0 : i < e.children.size() : i++) {
+      XmlNode n = e.children.get(i)
+      if (n instanceof XmlText) {
+        XmlText t = (XmlText) n
+        if (t.cdata || t.text.trim().length() > 0) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  private static boolean hasElementChild(XmlElement e) {
+    for (int i = 0 : i < e.children.size() : i++) {
+      if (e.children.get(i) instanceof XmlElement) {
+        return true
+      }
+    }
+    return false
+  }
+}
+
+/* The parser: a cursor over the text and three mutually recursive readers
+   (prolog, element, content). Line and column are tracked because that is the
+   only debugging aid an XML document has. */
+class XmlParser {
+  private final String src
+  private int at = 0
+  private int line = 1
+  private int col = 1
+  private String version = "1.0"
+  private String encoding = "UTF-8"
+
+  public XmlParser(String src) {
+    this.src = src
+  }
+
+  public XmlDocument parse() {
+    prolog()
+    skipWhitespace()
+    if (at >= src.length() || src.charAt(at) != '<') {
+      fail("expected a root element")
+    }
+    XmlElement root = element()
+    skipWhitespace()
+    while (at < src.length() && startsWith("<!--")) {
+      comment()
+      skipWhitespace()
+    }
+    if (at < src.length()) {
+      fail("trailing content after the root element")
+    }
+    return new XmlDocument(root, version, encoding)
+  }
+
+  private char peek() {
+    return src.charAt(at)
+  }
+
+  private boolean startsWith(String s) {
+    return src.startsWith(s, at)
+  }
+
+  private void advance() {
+    if (at < src.length()) {
+      if (src.charAt(at) == '\n') {
+        line++
+        col = 1
+      } else {
+        col++
+      }
+      at++
+    }
+  }
+
+  private void consume(String s) {
+    for (int i = 0 : i < s.length() : i++) {
+      advance()
+    }
+  }
+
+  private void fail(String why) {
+    throw new XmlParseException(why, line, col)
+  }
+
+  private void skipWhitespace() {
+    while (at < src.length()) {
+      char c = peek()
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+        advance()
+        continue
+      }
+      break
+    }
+  }
+
+  private void prolog() {
+    boolean first = true
+    while (at < src.length()) {
+      skipWhitespace()
+      if (at >= src.length()) {
+        return
+      }
+      if (startsWith("<?xml")) {
+        if (!first) {
+          fail("the XML declaration must be first")
+        }
+        declaration()
+        first = false
+        continue
+      }
+      if (startsWith("<?")) {
+        fail("processing instructions are not supported (they change the document's meaning)")
+      }
+      if (startsWith("<!DOCTYPE")) {
+        fail("a DOCTYPE is not supported: this parser does not expand entities, "
+          + "which is what keeps an external entity from reading a local file")
+      }
+      if (startsWith("<!--")) {
+        comment()
+        first = false
+        continue
+      }
+      return
+    }
+  }
+
+  private void declaration() {
+    consume("<?xml")
+    while (at < src.length()) {
+      skipWhitespace()
+      if (startsWith("?>")) {
+        consume("?>")
+        return
+      }
+      String name = name()
+      skipWhitespace()
+      if (at >= src.length() || peek() != '=') {
+        fail("expected '=' in the XML declaration")
+      }
+      advance()
+      skipWhitespace()
+      String value = quoted()
+      if (name.equals("version")) {
+        version = value
+      } else if (name.equals("encoding")) {
+        encoding = value
+      }
+    }
+    fail("unclosed XML declaration")
+  }
+
+  private String name() {
+    int start = at
+    while (at < src.length()) {
+      char c = peek()
+      if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == ':') {
+        advance()
+        continue
+      }
+      break
+    }
+    if (at == start) {
+      fail("expected a name")
+    }
+    return src.substring(start, at)
+  }
+
+  private String quoted() {
+    if (at >= src.length() || (peek() != '"' && peek() != '\'')) {
+      fail("expected a quoted value")
+    }
+    char q = peek()
+    advance()
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      char c = peek()
+      if (c == q) {
+        advance()
+        return b.toString()
+      }
+      if (c == '<') {
+        fail("'<' is not allowed in an attribute value")
+      }
+      if (c == '&') {
+        b.append(reference())
+        continue
+      }
+      b.append(c)
+      advance()
+    }
+    fail("unclosed attribute value")
+    return ""
+  }
+
+  private XmlComment comment() {
+    consume("<!--")
+    StringBuilder b = new StringBuilder()
+    while (at < src.length()) {
+      if (startsWith("-->")) {
+        consume("-->")
+        return new XmlComment(b.toString())
+      }
+      b.append(peek())
+      advance()
+    }
+    fail("unclosed comment")
+    return null
+  }
+
+  private XmlElement element() {
+    advance() /* '<' */
+    String name = name()
+    XmlElement e = new XmlElement(name)
+    while (true) {
+      skipWhitespace()
+      if (at >= src.length()) {
+        fail("unclosed start tag <" + name + ">")
+      }
+      char c = peek()
+      if (c == '/') {
+        advance()
+        if (at >= src.length() || peek() != '>') {
+          fail("expected '>'")
+        }
+        advance()
+        return e
+      }
+      if (c == '>') {
+        advance()
+        break
+      }
+      String attr = name()
+      skipWhitespace()
+      if (at >= src.length() || peek() != '=') {
+        fail("expected '=' after attribute " + attr)
+      }
+      advance()
+      skipWhitespace()
+      String value = quoted()
+      if (e.attributes.containsKey(attr)) {
+        fail("duplicate attribute " + attr)
+      }
+      e.attributes.put(attr, value)
+    }
+    content(e)
+    return e
+  }
+
+  private void content(XmlElement e) {
+    while (at < src.length()) {
+      if (startsWith("</")) {
+        consume("</")
+        String end = name()
+        skipWhitespace()
+        if (at >= src.length() || peek() != '>') {
+          fail("expected '>'")
+        }
+        advance()
+        if (!end.equals(e.name)) {
+          fail("end tag </" + end + "> does not match <" + e.name + ">")
+        }
+        return
+      }
+      if (startsWith("<![CDATA[")) {
+        consume("<![CDATA[")
+        int start = at
+        while (at < src.length() &&!startsWith("]]>")) {
+          advance()
+        }
+        if (at >= src.length()) {
+          fail("unclosed CDATA section")
+        }
+        String text = src.substring(start, at)
+        consume("]]>")
+        e.children.add(new XmlText(text, true))
+        continue
+      }
+      if (startsWith("<!--")) {
+        e.children.add(comment())
+        continue
+      }
+      if (startsWith("<?")) {
+        fail("processing instructions are not supported")
+      }
+      if (peek() == '<') {
+        e.children.add(element())
+        continue
+      }
+      StringBuilder b = new StringBuilder()
+      while (at < src.length() && peek() != '<') {
+        if (peek() == '&') {
+          b.append(reference())
+          continue
+        }
+        b.append(peek())
+        advance()
+      }
+      e.children.add(new XmlText(b.toString(), false))
+    }
+    fail("unclosed element <" + e.name + ">")
+  }
+
+  /* A character or entity reference, with the cursor on '&'. */
+  private String reference() {
+    advance() /* '&' */
+    if (at < src.length() && peek() == '#') {
+      advance()
+      boolean hex = false
+      if (at < src.length() && (peek() == 'x' || peek() == 'X')) {
+        hex = true
+        advance()
+      }
+      int start = at
+      while (at < src.length() && peek() != ';') {
+        advance()
+      }
+      if (at >= src.length()) {
+        fail("unclosed character reference")
+      }
+      String digits = src.substring(start, at)
+      advance() /* ';' */
+      int code
+      try {
+        code = Integer.parseInt(digits, hex ? 16 : 10)
+      } catch (NumberFormatException ex) {
+        fail("bad character reference &" + (hex ? "#x" : "#") + digits + ";")
+        return ""
+      }
+      if (!Character.isValidCodePoint(code)) {
+        fail("character reference out of range: " + code)
+      }
+      return new String(Character.toChars(code))
+    }
+    int start = at
+    while (at < src.length() && peek() != ';') {
+      advance()
+    }
+    if (at >= src.length()) {
+      fail("unclosed entity reference")
+    }
+    String entity = src.substring(start, at)
+    advance() /* ';' */
+    if (entity.equals("amp")) {
+      return "&"
+    }
+    if (entity.equals("lt")) {
+      return "<"
+    }
+    if (entity.equals("gt")) {
+      return ">"
+    }
+    if (entity.equals("quot")) {
+      return "\""
+    }
+    if (entity.equals("apos")) {
+      return "'"
+    }
+    fail("unknown entity &" + entity + "; (a DTD is not read, so only the five predefined entities exist)")
+    return ""
+  }
+}

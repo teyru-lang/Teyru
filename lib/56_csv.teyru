@@ -1,0 +1,278 @@
+package teyru
+
+/* CSV, in the two dialects a program meets: RFC 4180 (with the quoting rules a
+   spreadsheet writes) and a lenient reader that accepts the TSV-shaped files
+   people actually have.
+
+   The API is the shape every CSV library converges on, because the shape is
+   decided by the format rather than by taste:
+
+     - a reader over a String (the whole file) or a Reader (a stream), because a
+       CSV file is often larger than the record you want;
+     - the delimiter and quote characters are configurable, because a
+       semicolon-delimited CSV and a quoted TSV are both "CSV" in the wild;
+     - readRecord() answers one String[] or null at the end, and readAll()
+       answers a List<String[]> -- Java has no Tuple, so an array is the row;
+     - a writer that quotes exactly when it must, and never otherwise: a CSV
+       that quotes everything is valid but unreadable, and one that quotes
+       nothing is wrong the moment a comma appears.
+
+   The rules, from RFC 4180 §2:
+     - fields are separated by commas and records by CRLF; a lone LF is
+       accepted on input and written as the writer's line separator;
+     - a field may be quoted with '"', and inside it a '"' is written twice; a
+       quoted field may contain delimiters and line breaks;
+     - the last record may or may not end with a line break.
+
+   What this deliberately does not do: type inference, headers, or a mapping
+   from row to object. Each of those is a library decision, and a parser that
+   guessed "007" was a number would be wrong in the one file that mattered. The
+   caller reads Strings and converts with Integer.parseInt and friends.
+
+   How it is verified: tests/programs/t327_csv.teyru round-trips every case
+   through the writer and back, and compares the parse results with a table of
+   expected rows; the quoting cases are the RFC's own examples. */
+
+/* One CSV record as a row of Strings. */
+class CsvReader {
+  private final Reader in
+  private final char delimiter
+  private final char quote
+  private final boolean trimUnquoted
+  private final List<String> chars = new ArrayList<String>()
+  private int at = 0
+  private boolean haveLookahead = false
+  private int lookahead = 0
+
+  public CsvReader(String text) {
+    this(new StringChars(text), ',', '"', false)
+  }
+
+  public CsvReader(String text, char delimiter) {
+    this(new StringChars(text), delimiter, '"', false)
+  }
+
+  public CsvReader(String text, char delimiter, char quote) {
+    this(new StringChars(text), delimiter, quote, false)
+  }
+
+  public CsvReader(Reader in, char delimiter, char quote, boolean trimUnquoted) {
+    this.in = in
+    this.delimiter = delimiter
+    this.quote = quote
+    this.trimUnquoted = trimUnquoted
+  }
+
+  private int next() {
+    if (haveLookahead) {
+      haveLookahead = false
+      return lookahead
+    }
+    return in.read()
+  }
+
+  private void unread(int c) {
+    if (c < 0) {
+      return
+    }
+    lookahead = c
+    haveLookahead = true
+  }
+
+  /* One record, or null at the end of the input. An empty line is a record with
+     one empty field only when it is the whole input; a blank line between
+     records is skipped, which is what a spreadsheet writes and what every CSV
+     reader in practice does. */
+  public String[] readRecord() {
+    int first = next()
+    while (first == '\n' || first == '\r') {
+      /* A blank line: skip it, but a CRLF pair is one line. */
+      if (first == '\r') {
+        int second = next()
+        if (second != '\n') {
+          unread(second)
+        }
+      }
+      first = next()
+    }
+    if (first < 0) {
+      return null
+    }
+    List<String> fields = new ArrayList<String>()
+    StringBuilder field = new StringBuilder()
+    boolean quoted = false
+    boolean any = false
+    int c = first
+    while (c >= 0) {
+      any = true
+      if (quoted) {
+        if (c == quote) {
+          int n = next()
+          if (n == quote) {
+            field.append((char) quote)
+            c = next()
+            continue
+          }
+          quoted = false
+          c = n
+          continue
+        }
+        field.append((char) c)
+        c = next()
+        continue
+      }
+      if (c == quote && field.length() == 0) {
+        quoted = true
+        c = next()
+        continue
+      }
+      if (c == delimiter) {
+        fields.add(finishField(field, quoted))
+        field = new StringBuilder()
+        c = next()
+        continue
+      }
+      if (c == '\n' || c == '\r') {
+        if (c == '\r') {
+          int n = next()
+          if (n != '\n') {
+            unread(n)
+          }
+        }
+        break
+      }
+      field.append((char) c)
+      c = next()
+    }
+    if (!any) {
+      return null
+    }
+    fields.add(finishField(field, quoted))
+    String[] out = new String[fields.size()]
+    for (int i = 0 : i < out.length : i++) {
+      out[i] = fields.get(i)
+    }
+    return out
+  }
+
+  private String finishField(StringBuilder field, boolean quoted) {
+    if (!quoted && trimUnquoted) {
+      return field.toString().trim()
+    }
+    return field.toString()
+  }
+
+  public List<String[]> readAll() {
+    List<String[]> out = new ArrayList<String[]>()
+    while (true) {
+      String[] row = readRecord()
+      if (row == null) {
+        break
+      }
+      out.add(row)
+    }
+    return out
+  }
+
+  public void close() {
+    in.close()
+  }
+}
+
+/* The writer. quote() is the one decision: a value is quoted when it contains
+   the delimiter, a quote, a line break, or when it has leading or trailing space
+   (which an unquoted field would lose on the way back in). */
+class CsvWriter {
+  private final StringBuilder out = new StringBuilder()
+  private final char delimiter
+  private final char quote
+  private final String lineSeparator
+
+  public CsvWriter() {
+    this(',', '"', "\n")
+  }
+
+  public CsvWriter(char delimiter, char quote, String lineSeparator) {
+    this.delimiter = delimiter
+    this.quote = quote
+    this.lineSeparator = lineSeparator
+  }
+
+  public CsvWriter writeRecord(String[] fields) {
+    for (int i = 0 : i < fields.length : i++) {
+      if (i > 0) {
+        out.append(delimiter)
+      }
+      out.append(quoteIfNeeded(fields[i]))
+    }
+    out.append(lineSeparator)
+    return this
+  }
+
+  public CsvWriter writeRecord(List<String> fields) {
+    String[] row = new String[fields.size()]
+    for (int i = 0 : i < row.length : i++) {
+      row[i] = fields.get(i)
+    }
+    return writeRecord(row)
+  }
+
+  private String quoteIfNeeded(String v) {
+    if (v == null) {
+      return ""
+    }
+    boolean need = v.length() == 0 ? false : (v.charAt(0) == ' ' || v.charAt(v.length() - 1) == ' ')
+    for (int i = 0 : i < v.length() : i++) {
+      char c = v.charAt(i)
+      if (c == delimiter || c == quote || c == '\n' || c == '\r') {
+        need = true
+      }
+    }
+    if (v.length() == 0) {
+      /* An empty field and a quoted empty field mean the same thing; the
+         unquoted one is what a reader gives back, so it is what is written. */
+      return ""
+    }
+    if (!need) {
+      return v
+    }
+    StringBuilder b = new StringBuilder()
+    b.append(quote)
+    for (int i = 0 : i < v.length() : i++) {
+      char c = v.charAt(i)
+      if (c == quote) {
+        b.append(quote)
+      }
+      b.append(c)
+    }
+    b.append(quote)
+    return b.toString()
+  }
+
+  public String toString() {
+    return out.toString()
+  }
+}
+
+/* A String as a Reader, which the standard library does not have: BufferedReader
+   takes one, and the character-at-a-time interface is what a CSV parser wants
+   because a quoted field may hold anything. */
+final class StringChars implements Reader {
+  private final String s
+  private int at = 0
+
+  public StringChars(String s) {
+    this.s = s == null ? "" : s
+  }
+
+  public int read() {
+    if (at >= s.length()) {
+      return -1
+    }
+    char c = s.charAt(at)
+    at++
+    return c
+  }
+
+  public void close() {}
+}
