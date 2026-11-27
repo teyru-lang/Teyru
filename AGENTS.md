@@ -1022,6 +1022,20 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   81,830 行），且它對用到註解的程式是具名拒絕（`TY-INT-0100`）。實測呼叫 TLS 的程式在兩個建置上
   一模一樣（都連 `libssl`、都印 `ctx=1`）。
 
+- **原子欄位更新器（`lib/62`）與它掀開的兩個中繼資料缺口**：
+  `AtomicIntegerFieldUpdater`／`AtomicLongFieldUpdater`／`AtomicReferenceFieldUpdater`
+  的鎖是**宣告類別的 `Class` 物件**（同一個類別的每個 updater 共用它，所以同一個欄位的
+  兩個 updater 互相排斥），欄位透過反射讀寫；型別不符是 `IllegalArgumentException`，
+  欄位不存在是 `RuntimeException` 包住 `NoSuchFieldException`（照 JDK）。這批 API 一
+  push 就暴露了 W13.2 可達性分析的兩個洞，**兩個都修在分析／發射，不是繞過**：
+  ①`triggers()` 原本只跟呼叫邊（含建構子呼叫），**沒有跟「反射使用者的子類別」**——
+  updater 把反射寫在 `AtomicFieldUpdater`，程式只命名 `AtomicIntegerFieldUpdater`，
+  於是那個類別沒被算成「到得了使用者」；現在使用者的所有子型別都算到得了（只往寬的
+  方向走，符合這個檔案的規則）。②**表有發、卻沒接上**：`reflectUsed` 原本只由「程式
+  自己的呼叫點」設定，一個只呼叫 library 使用者（從沒自己寫反射呼叫）的程式因此不產
+  生啟動時的 attach 清單，第一次查詢得到空成員表；現在掃描一旦 widen 成「所有類別」，
+  就設 `reflectUsed`。回歸測試是 `tests/programs/t342_updaters.teyru`（與 JDK 逐行
+  相同），hello 的 `-O2` 大小前後都是 **109,608** 位元組（沒有因為放寬而變大）。
 - **並行工具的最後一塊（`lib/61`，以及 `checker.go` 的匯入表）**：`CompletableFuture`、
   `ReentrantReadWriteLock`、`Exchanger` 三件，加上 `Lock` 介面（`ReentrantLock` 現在
   也有它）。三個決定要記住：①**非同步工廠用自己的 daemon 執行緒**，不是池——Java 用
