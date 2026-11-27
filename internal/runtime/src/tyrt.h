@@ -685,6 +685,9 @@ struct tythread {
   void *vwait_q;
   /* The continuation: a ucontext_t on POSIX (NULL on Windows, where virtual
      threads are refused), and the mmap'd stack it runs on. */
+  /* The body object when Thread.start wrapped run() for an uncaught handler;
+     NULL means the Thread object itself is the body. */
+  void *vbody;
   void *vctx;
   char *vstack;
   size_t vstack_bytes;
@@ -932,6 +935,7 @@ void ty_thread_join_all(void);
    reaches the program's own run() without the runtime knowing the layout of a
    class it was not compiled against. */
 int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int32_t sel);
+int64_t ty_thread_start_body(void *obj, void *body, int64_t id, tystr *name, int32_t daemon, int32_t sel);
 
 /* The C half of Thread.ofVirtual().start(): the same arguments as
    ty_thread_start0, without a daemon flag because a virtual thread is counted
@@ -941,6 +945,7 @@ int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int
    where the runtime has no fibers, it throws UnsupportedOperationException
    rather than silently running the work on a platform thread. */
 int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel);
+int64_t ty_thread_start_virtual_body(void *obj, void *body, int64_t id, tystr *name, int32_t sel);
 
 /* ---- virtual thread waits ---------------------------------------------
 

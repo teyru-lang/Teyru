@@ -1135,7 +1135,8 @@ static void vthread_entry(void) {
   frame.ex = NULL;
   ty_cur_catch = &frame;
   if (setjmp(frame.buf) == 0) {
-    ((void (*)(void *))ty_itab(t->obj, t->vsel))(t->obj);
+    void *target = t->vbody ? t->vbody : t->obj;
+    ((void (*)(void *))ty_itab(target, t->vsel))(target);
   } else {
     ty_cur_catch = frame.prev;
     ty_uncaught_thread(frame.ex, t);
@@ -1173,6 +1174,10 @@ static void vthread_entry(void) {
 #endif /* !_WIN32 */
 
 int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel) {
+  return ty_thread_start_virtual_body(obj, NULL, id, name, sel);
+}
+
+int64_t ty_thread_start_virtual_body(void *obj, void *body, int64_t id, tystr *name, int32_t sel) {
 #if defined(_WIN32)
   /* No fibers in this runtime. Refusing by name is the only answer that does
      not lie about what the thread is: running the work on a platform thread
@@ -1196,6 +1201,7 @@ int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel
   if (t->jpriority == 0) t->jpriority = 5;
   t->is_virtual = 1;
   t->vsel = sel;
+  t->vbody = body;
   t->finished = 0;
   t->started = 1;
   js_set(t, TY_JS_RUNNABLE);
@@ -1813,21 +1819,36 @@ void ty_thread_join_all(void) {
  * makes. */
 
 typedef struct {
+  /* The object whose run() is dispatched, and, when a wrapper Runnable is what
+     has to run, the Thread object standing for it -- identity and body are the
+     same object unless Thread.start wrapped the body to dispatch an uncaught
+     exception handler. */
   void *obj;
+  void *body;
   int32_t sel;
 } body_args;
 
 static void *thread_body(void *p) {
   body_args b = *(body_args *)p;
   free(p);
-  ((void (*)(void *))ty_itab(b.obj, b.sel))(b.obj);
+  void *target = b.body ? b.body : b.obj;
+  ((void (*)(void *))ty_itab(target, b.sel))(target);
   return NULL;
 }
 
 int64_t ty_thread_start0(void *obj, int64_t id, tystr *name, int32_t daemon, int32_t sel) {
+  return ty_thread_start_body(obj, NULL, id, name, daemon, sel);
+}
+
+/* Start a thread whose identity is `obj` but whose run() is dispatched on
+   `body`. Thread.start passes a wrapper Runnable so that an uncaught exception
+   can reach the program's handler before the runtime prints it; currentThread()
+   still answers `obj`. */
+int64_t ty_thread_start_body(void *obj, void *body, int64_t id, tystr *name, int32_t daemon, int32_t sel) {
   body_args *b = (body_args *)malloc(sizeof(body_args));
   if (!b) abort();
   b->obj = obj;
+  b->body = body;
   b->sel = sel;
   return ty_thread_spawn(thread_body, b, obj, id, name, daemon);
 }

@@ -149,6 +149,11 @@ var nativeTable = map[string]nativeFn{
 	"Thread.start0(Thread,J,String,Z)": {
 		fn: "ty_thread_start0", selClass: "teyru.Runnable", selMethod: "run",
 	},
+	/* The same start with a separate body object: Thread.start wraps run() so
+	   that an uncaught exception reaches the program's handler first. */
+	"Thread.startBody0(Thread,Runnable,J,String,Z)": {
+		fn: "ty_thread_start_body", selClass: "teyru.Runnable", selMethod: "run",
+	},
 	/* The virtual-thread half of the same start. The runtime creates a
 	   continuation and hands it to a carrier instead of creating an operating
 	   system thread; the selector is the same one start0 needs, for the same
@@ -156,11 +161,15 @@ var nativeTable = map[string]nativeFn{
 	"Thread.startVirtual0(Thread,J,String)": {
 		fn: "ty_thread_start_virtual0", selClass: "teyru.Runnable", selMethod: "run",
 	},
+	/* The virtual half with a separate body, for the uncaught-handler wrapper. */
+	"Thread.startVirtualBody0(Thread,Runnable,J,String)": {
+		fn: "ty_thread_start_virtual_body", selClass: "teyru.Runnable", selMethod: "run",
+	},
 	"Thread.join0(J)":            {fn: "ty_thread_join"},
 	"Thread.joinTimeout0(J,J)":   {fn: "ty_thread_join_timeout"},
 	"Thread.jstate0(J)":          {fn: "ty_thread_jstate"},
 	"Thread.currentPriority0()":  {fn: "ty_thread_priority_current"},
-	"Thread.setPriority0(J,I)":  {fn: "ty_thread_set_priority"},
+	"Thread.setPriority0(J,I)":   {fn: "ty_thread_set_priority"},
 	"Thread.alive0(J)":           {fn: "ty_thread_alive"},
 	"Thread.nextId0()":           {fn: "ty_thread_next_id"},
 	"Thread.current0()":          {fn: "ty_thread_current_obj"},

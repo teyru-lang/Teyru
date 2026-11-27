@@ -70,11 +70,17 @@ class Thread implements Runnable {
      rather than stored in the runtime earlier: the registry entry does not
      exist until start(), and setDaemon may not be called after it. */
   private static native long start0(Thread t, long id, String name, boolean daemon)
+  /* The same start with a separate body: Thread.start passes a wrapper Runnable
+     so that an uncaught exception reaches the program's handler first. The
+     Thread object is still the identity -- currentThread(), getName() and the
+     registry entry all answer it. */
+  private static native long startBody0(Thread t, Runnable body, long id, String name, boolean daemon)
 
   /* Start a virtual thread that runs t.run(). The runtime makes a continuation
      with its own stack and hands it to a carrier; no operating system thread is
      created. The id is the one the Thread object was given when it was built. */
   private static native void startVirtual0(Thread t, long id, String name)
+  private static native void startVirtualBody0(Thread t, Runnable body, long id, String name)
 
   /* The id a Thread object gets when it is built: the runtime's counter, so that
      getId() answers the same number before and after start(). */
@@ -143,6 +149,16 @@ class Thread implements Runnable {
      must not be collected while the program can still ask about it. */
   private static Thread mainOf
 
+  /* Java's uncaught-exception handler: the thread's own, else the static
+     default, else the runtime's report. It is an interface rather than an
+     abstract class because Java's is, and a nested one because Java's is
+     Thread.UncaughtExceptionHandler. */
+  public interface UncaughtExceptionHandler {
+    void uncaughtException(Thread t, Throwable e)
+  }
+  private UncaughtExceptionHandler uncaught
+  private static UncaughtExceptionHandler defaultUncaught
+
   /* Java's three constants and the stored value. The value is a hint: this
      runtime does not change an operating system thread's priority, and Java
      does not promise that setPriority changes scheduling either -- what it does
@@ -195,11 +211,59 @@ class Thread implements Runnable {
       throw new IllegalStateException("thread already started")
     }
     this.started = true
-    if (this.virtual) {
-      Thread.startVirtual0(this, this.tid, this.name)
-    } else {
-      Thread.start0(this, this.tid, this.name, this.daemon)
+    final Thread self = this
+    Runnable body = new Runnable() {
+      public void run() {
+        try {
+          self.run()
+        } catch (Throwable thrown) {
+          /* The handler runs here; when there is none, the throw goes on and
+             the runtime prints Java's line, which is what Java's default
+             handler does. */
+          if (!Thread.dispatchUncaught(self, thrown)) {
+            throw thrown
+          }
+        }
+      }
     }
+    if (this.virtual) {
+      Thread.startVirtualBody0(this, body, this.tid, this.name)
+      return
+    }
+    Thread.startBody0(this, body, this.tid, this.name, this.daemon)
+  }
+
+  public void setUncaughtExceptionHandler(UncaughtExceptionHandler handler) {
+    this.uncaught = handler
+  }
+
+  /* Java answers the group's handler when the thread has none of its own; this
+     library has no ThreadGroup, so the answer is the default handler. */
+  public UncaughtExceptionHandler getUncaughtExceptionHandler() {
+    return this.uncaught != null ? this.uncaught : Thread.defaultUncaught
+  }
+
+  public static void setDefaultUncaughtExceptionHandler(UncaughtExceptionHandler handler) {
+    Thread.defaultUncaught = handler
+  }
+
+  public static UncaughtExceptionHandler getDefaultUncaughtExceptionHandler() {
+    return Thread.defaultUncaught
+  }
+
+  /* Called by the wrapper above. Answers true when a handler ran, so that the
+     wrapper knows whether to rethrow; a handler that throws falls through to the
+     runtime's report, as Java's does for the original exception. */
+  static boolean dispatchUncaught(Thread t, Throwable e) {
+    UncaughtExceptionHandler handler = t != null ? t.uncaught : null
+    if (handler == null) {
+      handler = Thread.defaultUncaught
+    }
+    if (handler == null) {
+      return false
+    }
+    handler.uncaughtException(t, e)
+    return true
   }
 
   /* Whether this is a virtual thread. The main thread and every thread built
