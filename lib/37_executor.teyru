@@ -106,7 +106,14 @@ interface Executor {
 
 /* Java's ExecutorService: submitting, and shutting down. */
 interface ExecutorService extends Executor {
-  <T> Future<T> submit(Callable<T> task)
+  < T > Future<T> submit(Callable<T> task)
+  /* Run every task and wait for all of them, answering their futures in the
+     list's order. Java's invokeAll; a task that throws fails its own future and
+     does not stop the others. */
+  < T > List<Future<T>> invokeAll(List<Callable<T>> tasks)
+  /* Run every task and answer the first value to arrive; if every task fails,
+     ExecutionException carries the last failure. */
+  < T > T invokeAny(List<Callable<T>> tasks)
   /* Stop taking work. The tasks already handed to the pool -- the ones queued
      and the ones running -- finish, and then the workers leave. */
   void shutdown()
@@ -151,8 +158,7 @@ class ExecutionException extends Exception {
    which extends IllegalStateException for the same reason: the program that
    cancelled the task is the program calling get(). */
 class CancellationException extends IllegalStateException {
-  public CancellationException() {
-  }
+  public CancellationException() {}
   public CancellationException(String message) {
     super(message)
   }
@@ -161,8 +167,7 @@ class CancellationException extends IllegalStateException {
 /* Handed to execute() or submit() after the pool has been shut down. Java's
    class of the same name. */
 class RejectedExecutionException extends RuntimeException {
-  public RejectedExecutionException() {
-  }
+  public RejectedExecutionException() {}
   public RejectedExecutionException(String message) {
     super(message)
   }
@@ -344,10 +349,10 @@ class ThreadPool implements ExecutorService {
       public void run() {
         while (true) {
           Runnable task = self.claim()
-          if (task == null) {
+            if (task == null) {
             return
           }
-          try {
+            try {
             task.run()
           } catch (Throwable failure) {
             /* A task that came in through execute() has no Future to carry its
@@ -360,7 +365,7 @@ class ThreadPool implements ExecutorService {
                reaches here: FutureTask catches its throwable and keeps it for
                get(). */
             self.workerFailed()
-            throw failure
+              throw failure
           }
         }
       }
@@ -405,13 +410,81 @@ class ThreadPool implements ExecutorService {
     }
   }
 
-  public <T> Future<T> submit(Callable<T> task) {
+  public < T > Future<T> submit(Callable<T> task) {
     if (task == null) {
       throw new NullPointerException("the task is null")
     }
     FutureTask<T> future = new FutureTask<T>(task)
     this.execute(future)
     return future
+  }
+
+  public < T > List<Future<T>> invokeAll(List<Callable<T>> tasks) {
+    List<Future<T>> futures = new ArrayList<Future<T>>()
+    for (int i = 0 : i < tasks.size() : i++) {
+      futures.add(this.submit(tasks.get(i)))
+    }
+    /* Waiting on each in order does not delay the answer: invokeAll waits for
+       every task by contract, and get() on an earlier future returns as soon as
+       that one is done. */
+    for (int i = 0 : i < futures.size() : i++) {
+      futures.get(i).get()
+    }
+    return futures
+  }
+
+  /* invokeAny: every task is submitted, and the first one to answer wins. The
+     tasks are wrapped so that the queue's own failure path does not matter: the
+     wrapper records a value and opens the latch, or records the failure and
+     opens it only when the last task has failed. */
+  public < T > T invokeAny(List<Callable<T>> tasks) {
+    if (tasks.size() == 0) {
+      throw new IllegalArgumentException("no tasks")
+    }
+    final CountDownLatch done = new CountDownLatch(1)
+    final Object[] winner = new Object[1]
+    final boolean[] won = new boolean[1]
+    final Throwable[] lastFailure = new Throwable[1]
+    final int[] remaining = new int[] { tasks.size() }
+    for (int i = 0 : i < tasks.size() : i++) {
+      final Callable<T> task = tasks.get(i)
+      /* The wrapper is a named value before it is submitted: inference on a
+         call whose only argument is an anonymous class does not settle T, and
+         naming it does. */
+      Callable<Void> wrapper = new Callable<Void>() {
+        public Void call() {
+          try {
+            T v = task.call()
+            synchronized (winner) {
+              if (!won[0]) {
+                won[0] = true
+                winner[0] = v
+              }
+            }
+            done.countDown()
+          } catch (Throwable thrown) {
+            boolean last = false
+            synchronized (winner) {
+              lastFailure[0] = thrown
+              remaining[0] = remaining[0] - 1
+              last = remaining[0] == 0
+            }
+            if (last) {
+              done.countDown()
+            }
+          }
+          return null
+        }
+      }
+      this.submit(wrapper)
+    }
+    done.await()
+    synchronized (winner) {
+      if (won[0]) {
+        return (T) winner[0]
+      }
+    }
+    throw new ExecutionException("no task completed successfully", lastFailure[0])
   }
 
   public void shutdown() {
@@ -565,8 +638,7 @@ class Executors {
      process; so does this. */
   private static int pools = 0
 
-  private Executors() {
-  }
+  private Executors() {}
 
   /* Called by the three factories. Threads are named the way
      java.util.concurrent names them -- pool-N-thread-M -- so a thread dump

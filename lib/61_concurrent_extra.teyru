@@ -765,6 +765,172 @@ class CompletableFuture<T> implements Future<T> {
   }
 }
 
+/* java.util.concurrent.Phaser: a reusable barrier whose party count can change.
+
+   The state is the phase, the number of registered parties, and how many have
+   arrived in this phase, all under the phaser's monitor. A party that arrives
+   takes the arrival count up; the arrival that reaches the party count advances
+   the phase, resets the arrival count, and wakes the waiters. Deregistering is
+   an arrival that also takes a party out, and the last one out terminates the
+   phaser -- Java's negative phase, which is what isTerminated reports.
+
+   The two numbers Java returns are kept apart, because a test can see the
+   difference: arrive() answers the phase it arrived in, while
+   arriveAndAwaitAdvance() answers the phase after the advance. */
+class Phaser {
+  /* Java's terminated phase, and the value getPhase answers after termination
+     that came from the last party leaving (the +1 is the phase the advance
+     would have reached, with the sign bit set). */
+  private static final int TERMINATED = -2147483648
+  private int parties
+  private int phase
+  private int arrivals
+  private boolean terminated
+
+  public Phaser() {}
+
+  public Phaser(int parties) {
+    if (parties < 0) {
+      throw new IllegalArgumentException("parties must not be negative: " + parties)
+    }
+    this.parties = parties
+  }
+
+  public int register() {
+    synchronized (this) {
+      return doRegister(1)
+    }
+  }
+
+  public int bulkRegister(int n) {
+    if (n < 0) {
+      throw new IllegalArgumentException("parties must not be negative: " + n)
+    }
+    synchronized (this) {
+      return doRegister(n)
+    }
+  }
+
+  private int doRegister(int n) {
+    if (this.terminated) {
+      return this.phase
+    }
+    this.parties = this.parties + n
+    return this.phase
+  }
+
+  /* The arrival, answering the phase it happened in. The arrival that completes
+     the phase advances it before returning, which is why the answer is the old
+     phase and not the new one. */
+  public int arrive() {
+    synchronized (this) {
+      if (this.terminated) {
+        return this.phase
+      }
+      int at = this.phase
+      this.arrivals = this.arrivals + 1
+      if (this.arrivals >= this.parties) {
+        advance()
+      }
+      return at
+    }
+  }
+
+  public int arriveAndDeregister() {
+    synchronized (this) {
+      if (this.terminated) {
+        return this.phase
+      }
+      int at = this.phase
+      this.parties = this.parties - 1
+      this.arrivals = this.arrivals + 1
+      if (this.parties == 0) {
+        this.phase = (this.phase + 1) | TERMINATED
+        this.terminated = true
+        this.notifyAll()
+      } else if (this.arrivals >= this.parties) {
+        advance()
+      }
+      return at
+    }
+  }
+
+  /* Arrive and wait for the phase to change, answering the new phase. When this
+     arrival is the one that completes the phase, the wait is skipped because the
+     phase has already moved. */
+  public int arriveAndAwaitAdvance() {
+    synchronized (this) {
+      if (this.terminated) {
+        return this.phase
+      }
+      int at = this.phase
+      this.arrivals = this.arrivals + 1
+      if (this.arrivals >= this.parties) {
+        advance()
+      }
+      while (!this.terminated && this.phase == at) {
+        this.wait(-1L)
+      }
+      return this.phase
+    }
+  }
+
+  /* Wait for this phase to end. A phase that has already ended (or a terminated
+     phaser) answers at once with the current phase. */
+  public int awaitAdvance(int phaseToAwait) {
+    synchronized (this) {
+      while (!this.terminated && this.phase == phaseToAwait) {
+        this.wait(-1L)
+      }
+      return this.phase
+    }
+  }
+
+  private void advance() {
+    this.phase = this.phase + 1
+    this.arrivals = 0
+    this.notifyAll()
+  }
+
+  public void forceTermination() {
+    synchronized (this) {
+      this.terminated = true
+      this.phase = TERMINATED
+      this.notifyAll()
+    }
+  }
+
+  public boolean isTerminated() {
+    synchronized (this) {
+      return this.terminated
+    }
+  }
+
+  public int getPhase() {
+    synchronized (this) {
+      return this.phase
+    }
+  }
+
+  public int getRegisteredParties() {
+    synchronized (this) {
+      return this.parties
+    }
+  }
+
+  public int getArrivedParties() {
+    synchronized (this) {
+      return this.arrivals
+    }
+  }
+
+  public int getUnarrivedParties() {
+    synchronized (this) {
+      return this.parties - this.arrivals
+    }
+  }
+}
+
 /* java.util.concurrent.locks.ReentrantReadWriteLock: many readers or one
    writer, reentrant in each mode.
 
