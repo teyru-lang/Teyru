@@ -593,6 +593,11 @@ struct tythread {
      it with the thread's shadow stack). */
   void *soe;
   int32_t state;          /* one of TY_TH_* below */
+  /* Java's Thread.State, as getState() reports it: a different question from
+     `state`, which is what the collector cares about. Kept beside it rather
+     than derived, because WAITING and BLOCKED are both TY_TH_BLOCKED to the
+     collector and different answers to a program. */
+  int32_t jstate;
   /* How many stop points this thread is inside. Stopping is not nested -- no
      path in the runtime blocks inside another blocking call -- and the depth is
      what keeps the transitions honest anyway: only the transition from 0 to 1
@@ -878,6 +883,15 @@ int64_t ty_thread_next_id(void);
    and the prelude throws InterruptedException. */
 int32_t ty_thread_join(int64_t id);
 int32_t ty_thread_join_timeout(int64_t id, int64_t timeout_ns);
+
+/* Java's Thread.State, as getState() numbers it. */
+#define TY_JS_NEW 0
+#define TY_JS_RUNNABLE 1
+#define TY_JS_BLOCKED 2
+#define TY_JS_WAITING 3
+#define TY_JS_TIMED_WAITING 4
+#define TY_JS_TERMINATED 5
+int32_t ty_thread_jstate(int64_t id);
 int32_t ty_thread_alive(int64_t id);
 /* Sleep for the duration, or until interrupted. Answers 1 when interrupted, in
    which case the interrupt status is cleared. */

@@ -129,6 +129,10 @@
 #define TYPLAT_WANT_SOCKETS 1
 #include "tyrt.h"
 
+/* Set the Java state of a thread (Thread.State); defined with the registry
+   below. Declared here because the wait points above use it. */
+static void js_set(tythread *t, int32_t st);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -733,11 +737,16 @@ static void vt_yield(void) {
 
 /* --------------------------------------------------------- the wait wrappers */
 
-void ty_cond_wait(typlat_cond *c, typlat_mutex *m) {
+/* The wait with the Java state it should report. Object.wait and join report
+   WAITING, a timed wait reports TIMED_WAITING, and a thread queueing for a
+   monitor reports BLOCKED -- three different answers, one wait. */
+static void cond_wait_as(typlat_cond *c, typlat_mutex *m, int32_t js) {
+  js_set(ty_self, js);
   if (!ty_self->is_virtual) {
     ty_thread_stopped_begin();
     typlat_cond_wait(c, m);
     ty_thread_stopped_end();
+    js_set(ty_self, TY_JS_RUNNABLE);
     return;
   }
   tythread *self = ty_self;
@@ -748,14 +757,17 @@ void ty_cond_wait(typlat_cond *c, typlat_mutex *m) {
   vt_park(-1, 0, 0);
   typlat_mutex_lock(m);
   vt_vwq_detach(self);
+  js_set(ty_self, TY_JS_RUNNABLE);
 }
 
-int32_t ty_cond_timedwait(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns) {
+static int32_t cond_timedwait_as(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns, int32_t js) {
+  js_set(ty_self, js);
   if (!ty_self->is_virtual) {
     int r;
     ty_thread_stopped_begin();
     r = typlat_cond_timedwait(c, m, timeout_ns);
     ty_thread_stopped_end();
+    js_set(ty_self, TY_JS_RUNNABLE);
     return r;
   }
   tythread *self = ty_self;
@@ -765,7 +777,16 @@ int32_t ty_cond_timedwait(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns) {
   int timed_out = vt_park(-1, 0, deadline);
   typlat_mutex_lock(m);
   vt_vwq_detach(self);
+  js_set(ty_self, TY_JS_RUNNABLE);
   return timed_out;
+}
+
+void ty_cond_wait(typlat_cond *c, typlat_mutex *m) {
+  cond_wait_as(c, m, TY_JS_WAITING);
+}
+
+int32_t ty_cond_timedwait(typlat_cond *c, typlat_mutex *m, int64_t timeout_ns) {
+  return cond_timedwait_as(c, m, timeout_ns, TY_JS_TIMED_WAITING);
 }
 
 void ty_cond_signal(typlat_cond *c) {
@@ -1136,6 +1157,7 @@ static void vthread_entry(void) {
     t->sp = 0;
   }
   typlat_mutex_lock(&t->mtx);
+  js_set(t, TY_JS_TERMINATED);
   t->finished = 1;
   ty_cond_broadcast(&t->cv);
   typlat_mutex_unlock(&t->mtx);
@@ -1175,6 +1197,7 @@ int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel
   t->vsel = sel;
   t->finished = 0;
   t->started = 1;
+  js_set(t, TY_JS_RUNNABLE);
   /* Born stopped: it has not run, so a collection must not wait for it, and it
      is counted as stopped from the instant it is live. stop_depth is 1 so that
      the entry's stopped_end is the matching half. */
@@ -1509,6 +1532,7 @@ int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, t
      itself, and are read by the collector only after the thread has stopped,
      which is after it filled them in. */
   t->state = TY_TH_RUNNING;
+  js_set(t, TY_JS_RUNNABLE);
   t->finished = 0;
   t->started = 1;
   if (reused) {
@@ -1559,6 +1583,21 @@ int64_t ty_thread_next_id(void) {
   t->finished = 1;
   registry_insert(t, 0);
   return id;
+}
+
+/* Set the Java state of a thread, relaxed: it is a diagnostic another thread
+   polls, and the polling itself synchronises through the thread's mutex. */
+static void js_set(tythread *t, int32_t st) {
+  __atomic_store_n(&t->jstate, st, __ATOMIC_RELAXED);
+}
+
+int32_t ty_thread_jstate(int64_t id) {
+  tythread *t = registry_find(id);
+  if (!t) return TY_JS_NEW;
+  int32_t st = __atomic_load_n(&t->jstate, __ATOMIC_RELAXED);
+  if (st == TY_JS_NEW && __atomic_load_n(&t->started, __ATOMIC_RELAXED) == 0) return TY_JS_NEW;
+  if (__atomic_load_n(&t->finished, __ATOMIC_RELAXED)) return TY_JS_TERMINATED;
+  return st;
 }
 
 int32_t ty_thread_join(int64_t id) {
@@ -1690,6 +1729,7 @@ int32_t ty_thread_sleep_ms(int64_t millis) {
      interrupt (a collection's broadcast, or the operating system) sleeps for
      the part of the duration that is left rather than starting it again. */
   typlat_mutex_lock(&self->mtx);
+  js_set(self, TY_JS_TIMED_WAITING);
   int64_t ns = millis > INT64_MAX / 1000000 ? INT64_MAX : millis * 1000000;
   int64_t now = ty_nanos();
   int64_t deadline = ns > INT64_MAX - now ? INT64_MAX : now + ns;
@@ -1706,6 +1746,7 @@ int32_t ty_thread_sleep_ms(int64_t millis) {
     ty_cond_timedwait(&self->cv, &self->mtx, left);
   }
   if (intr) __atomic_store_n(&self->interrupted, 0, __ATOMIC_SEQ_CST);
+  js_set(self, TY_JS_RUNNABLE);
   typlat_mutex_unlock(&self->mtx);
   return intr;
 }
@@ -1925,8 +1966,9 @@ void ty_sync_enter(void *obj) {
        thread, and while it is in the wait its stack does not change. The wait
        is the stop point, and a virtual thread parks here instead of blocking
        its carrier. */
-    ty_cond_wait(&m->cv, &m->mtx);
+    cond_wait_as(&m->cv, &m->mtx, TY_JS_BLOCKED);
   }
+  js_set(ty_self, TY_JS_RUNNABLE);
   m->owned = 1;
   m->owner = ty_self;
   m->count++;

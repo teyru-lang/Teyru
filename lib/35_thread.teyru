@@ -55,7 +55,6 @@ package teyru
 // Interrupt status lives on the Thread object, as in Java, so a thread that was
 // interrupted before start() runs with the status set, and one that finished
 // keeps whatever status it ended with.
-
 class Thread implements Runnable {
   // ------------------------------------------------------------------ natives
   //
@@ -99,6 +98,7 @@ class Thread implements Runnable {
   /* The timed form; the deadline is passed in nanoseconds so a sub-millisecond
      budget is expressible even though the API is milliseconds. */
   private static native boolean joinTimeout0(long id, long timeoutNanos)
+  private static native int jstate0(long id)
   private static native boolean alive0(long id)
 
   /* Sleep, answering true when the sleep was interrupted (and clearing the
@@ -117,7 +117,6 @@ class Thread implements Runnable {
   private static native boolean currentDaemon0()
 
   // ------------------------------------------------------------------- fields
-
   private Runnable target
   private String name
   /* The id, whether or not the thread has been started: java.lang.Thread gives
@@ -143,7 +142,6 @@ class Thread implements Runnable {
   private static Thread mainOf
 
   // ----------------------------------------------------------- constructors
-
   public Thread() {
     this(null, null)
   }
@@ -213,6 +211,40 @@ class Thread implements Runnable {
      zero case goes to join() rather than returning at once. An interrupt still
      ends the wait with InterruptedException; a timeout simply returns, and
      isAlive() is how the caller asks whether it finished. */
+  /* Java's Thread.State, in Java's order and with Java's names. */
+  public enum State {
+    NEW, RUNNABLE, BLOCKED, WAITING, TIMED_WAITING, TERMINATED
+  }
+
+  /* What the thread is doing, as the runtime reports it. A thread that was
+     never started answers NEW without asking the registry, and one that has
+     finished answers TERMINATED: those two are the object's own facts. The
+     rest come from the runtime, which records them at each wait point -- sleep
+     and the timed waits as TIMED_WAITING, the untimed ones as WAITING, a thread
+     queueing for a monitor as BLOCKED. */
+  public State getState() {
+    if (!this.started) {
+      return State.NEW
+    }
+    int s = Thread.jstate0(this.tid)
+    if (s == 1) {
+      return State.RUNNABLE
+    }
+    if (s == 2) {
+      return State.BLOCKED
+    }
+    if (s == 3) {
+      return State.WAITING
+    }
+    if (s == 4) {
+      return State.TIMED_WAITING
+    }
+    if (s == 5) {
+      return State.TERMINATED
+    }
+    return State.NEW
+  }
+
   public void join(long millis) {
     if (millis <= 0) {
       join()
@@ -295,7 +327,7 @@ class Thread implements Runnable {
 
   /* Give the processor up. Java's Thread.yield is a hint with no guarantee, and
      this is the same hint: the operating system chooses what runs next. */
-  public static native void yield()
+  public static native void yield ()
 
   /* Sleep for at least this many milliseconds. A negative duration is an
      IllegalArgumentException, as it is in Java; sleep(0) yields. An interrupt
@@ -399,14 +431,13 @@ class Thread implements Runnable {
 class ThreadLocal<T> {
   private Supplier<? extends T> initial
 
-  public ThreadLocal() {
-  }
+  public ThreadLocal() {}
 
   private ThreadLocal(Supplier<? extends T> initial) {
     this.initial = initial
   }
 
-  public static <S> ThreadLocal<S> withInitial(Supplier<? extends S> supplier) {
+  public static < S > ThreadLocal<S> withInitial(Supplier<? extends S> supplier) {
     return new ThreadLocal<S>(supplier)
   }
 

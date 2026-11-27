@@ -1,8 +1,7 @@
 package teyru
 
 class Object {
-  public Object() {
-  }
+  public Object() {}
   public native String toString()
   public native int hashCode()
   public native boolean equals(Object o)
@@ -18,8 +17,8 @@ class Object {
      back when it wakes. They throw IllegalMonitorStateException when the
      calling thread does not own the monitor, as java.lang.Object says.
 
-     wait(long) is the whole of waiting here: the unbounded wait() and the
-     nanosecond form are not implemented, and nothing declares them. It is a
+     wait(long) and wait() are the whole of waiting here: the nanosecond form is
+     not implemented, and nothing declares it. It is a
      Teyru method rather than a native one because the interrupt is: the native
      half (wait0) answers whether the wait ended because the thread was
      interrupted, and the throw below happens in Teyru code, which is what lets
@@ -32,12 +31,19 @@ class Object {
       throw new InterruptedException()
     }
   }
+
+  /* Java's wait(): the unbounded form. A negative timeout is how the runtime
+     spells "until notified", which is what wait0 already does for join. */
+  public final void wait() {
+    if (Object.wait0(this, -1L)) {
+      throw new InterruptedException()
+    }
+  }
   public final native void notify()
   public final native void notifyAll()
 }
 
-interface Cloneable {
-}
+interface Cloneable {}
 
 /* java.lang.CharSequence, the one type here that is not a Teyru invention: it
    is what a String, a StringBuilder and a StringBuffer are all, and Java's API
