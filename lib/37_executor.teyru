@@ -335,6 +335,9 @@ class ThreadPool implements ExecutorService {
   private boolean stopped
   private int created
   private String prefix
+  /* How workers are made. A null factory is the default naming (prefix+number),
+     which is what every pool built without one gets. */
+  private ThreadFactory factory
 
   /* Called with this pool's monitor held. */
   private void startWorker() {
@@ -345,14 +348,14 @@ class ThreadPool implements ExecutorService {
        wait until there is another. It is written as an object rather than a
        method because a thread runs a Runnable, and the loop must go on for as
        long as the pool wants the worker. */
-    Thread t = new Thread(new Runnable() {
+    Runnable body = new Runnable() {
       public void run() {
         while (true) {
           Runnable task = self.claim()
-            if (task == null) {
+          if (task == null) {
             return
           }
-            try {
+          try {
             task.run()
           } catch (Throwable failure) {
             /* A task that came in through execute() has no Future to carry its
@@ -365,18 +368,26 @@ class ThreadPool implements ExecutorService {
                reaches here: FutureTask catches its throwable and keeps it for
                get(). */
             self.workerFailed()
-              throw failure
+            throw failure
           }
         }
       }
-    }, this.prefix + this.created)
+    }
+    /* The factory decides the thread's name and daemon flag; the default is the
+       pool-N-thread-M naming java.util.concurrent uses. */
+    Thread t = this.factory == null ? new Thread(body, this.prefix + this.created) : this.factory.newThread(body)
     t.start()
   }
 
   public ThreadPool(int core, long keepAliveMillis, String prefix) {
+    this(core, keepAliveMillis, prefix, null)
+  }
+
+  public ThreadPool(int core, long keepAliveMillis, String prefix, ThreadFactory factory) {
     this.core = core
     this.keepAlive = keepAliveMillis
     this.prefix = prefix
+    this.factory = factory
     /* Under the monitor, which is what startWorker expects: a worker started
        a moment ago is already in claim(), and the fields it guards must not be
        written from outside the critical section it reads them in. The worker
@@ -633,6 +644,91 @@ class ThreadPool implements ExecutorService {
 /* The pool factories java.util.concurrent.Executors has, and only those: the
    scheduled and work-stealing ones need machinery this standard library does
    not have. */
+/* java.util.concurrent.TimeUnit: the seven units and their conversions.
+
+   Java's is an enum whose constants carry a scale; this is a final class with
+   the same seven values and the same arithmetic. The library's own APIs still
+   take milliseconds (see the concurrency section of the docs), so a caller uses
+   this to convert into the unit an API wants, and sleep() is the one method that
+   waits. */
+class TimeUnit {
+  public static final TimeUnit NANOSECONDS = new TimeUnit("NANOSECONDS", 1L)
+  public static final TimeUnit MICROSECONDS = new TimeUnit("MICROSECONDS", 1000L)
+  public static final TimeUnit MILLISECONDS = new TimeUnit("MILLISECONDS", 1000000L)
+  public static final TimeUnit SECONDS = new TimeUnit("SECONDS", 1000000000L)
+  public static final TimeUnit MINUTES = new TimeUnit("MINUTES", 60000000000L)
+  public static final TimeUnit HOURS = new TimeUnit("HOURS", 3600000000000L)
+  public static final TimeUnit DAYS = new TimeUnit("DAYS", 86400000000000L)
+
+  private final String name
+  private final long nanosPerUnit
+
+  private TimeUnit(String name, long nanosPerUnit) {
+    this.name = name
+    this.nanosPerUnit = nanosPerUnit
+  }
+
+  public String name() {
+    return this.name
+  }
+
+  public String toString() {
+    return this.name
+  }
+
+  public long toNanos(long d) {
+    return d * this.nanosPerUnit
+  }
+
+  public long toMicros(long d) {
+    return d * this.nanosPerUnit / 1000L
+  }
+
+  public long toMillis(long d) {
+    return d * this.nanosPerUnit / 1000000L
+  }
+
+  public long toSeconds(long d) {
+    return d * this.nanosPerUnit / 1000000000L
+  }
+
+  public long toMinutes(long d) {
+    return d * this.nanosPerUnit / 60000000000L
+  }
+
+  public long toHours(long d) {
+    return d * this.nanosPerUnit / 3600000000000L
+  }
+
+  public long toDays(long d) {
+    return d * this.nanosPerUnit / 86400000000000L
+  }
+
+  /* The same arithmetic in the other direction: a duration in this unit, as the
+     target unit. */
+  public long convert(long sourceDuration, TimeUnit sourceUnit) {
+    long nanos = sourceDuration * sourceUnit.nanosPerUnit
+    return nanos / this.nanosPerUnit
+  }
+
+  /* Java's sleep: a wait in this unit, through Thread.sleep's milliseconds. A
+     sub-millisecond duration still sleeps at least a millisecond, which is the
+     resolution the runtime has. */
+  public void sleep(long timeout) {
+    long ms = timeout * this.nanosPerUnit / 1000000L
+    Thread.sleep(ms > 0 ? ms : 1L)
+  }
+}
+
+/* java.util.concurrent.ThreadFactory: how a pool makes its worker threads.
+
+   The pool asks the factory for each worker it starts, so a program can name
+   them, make them daemons, or hand out its own subclass. Java's default factory
+   numbers them; Executors.defaultThreadFactory() is here for the same reason. */
+interface ThreadFactory {
+  Thread newThread(Runnable r)
+}
+
 /* java.util.concurrent.CompletionService: a queue of futures in completion
    order, rather than in submission order. Java's shape has a BlockingQueue
    inside; this has the same monitor-backed list the rest of the library uses for
@@ -750,6 +846,29 @@ class Executors {
     return new ThreadPool(core, keepAlive, "pool-" + Executors.pools + "-thread-")
   }
 
+  private static ExecutorService newPool(int core, long keepAlive, ThreadFactory factory) {
+    Executors.pools = Executors.pools + 1
+    return new ThreadPool(core, keepAlive, "pool-" + Executors.pools + "-thread-", factory)
+  }
+
+  /* Java's default factory: a non-daemon thread named pool-N-thread-M, with M
+     counting up from one. */
+  public static ThreadFactory defaultThreadFactory() {
+    Executors.pools = Executors.pools + 1
+    final String prefix = "pool-" + Executors.pools + "-thread-"
+    final int[] next = new int[] { 1 }
+    return new ThreadFactory() {
+      public Thread newThread(Runnable r) {
+        int n
+        synchronized (next) {
+          n = next[0]
+          next[0] = next[0] + 1
+        }
+        return new Thread(r, prefix + n)
+      }
+    }
+  }
+
   /* A pool of exactly this many threads, with every one of them started before
      the constructor returns. A pool of zero or fewer is an
      IllegalArgumentException, as it is in Java. */
@@ -760,6 +879,13 @@ class Executors {
     return Executors.newPool(nThreads, 0L)
   }
 
+  public static ExecutorService newFixedThreadPool(int nThreads, ThreadFactory factory) {
+    if (nThreads <= 0) {
+      throw new IllegalArgumentException("pool size must be greater than zero: " + nThreads)
+    }
+    return Executors.newPool(nThreads, 0L, factory)
+  }
+
   /* A pool of exactly one thread, which is a fixed pool of one and nothing
      more: Java's single-thread executor also wraps every task so that a later
      one cannot run before an earlier one has finished, and taking from one
@@ -768,9 +894,17 @@ class Executors {
     return Executors.newPool(1, 0L)
   }
 
+  public static ExecutorService newSingleThreadExecutor(ThreadFactory factory) {
+    return Executors.newPool(1, 0L, factory)
+  }
+
   /* The unbounded pool: one worker per task that arrives with none idle, each
      of them leaving after 60 seconds with nothing to do. */
   public static ExecutorService newCachedThreadPool() {
     return Executors.newPool(0, 60000L)
+  }
+
+  public static ExecutorService newCachedThreadPool(ThreadFactory factory) {
+    return Executors.newPool(0, 60000L, factory)
   }
 }
