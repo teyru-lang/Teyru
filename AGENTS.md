@@ -1022,6 +1022,14 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   81,830 行），且它對用到註解的程式是具名拒絕（`TY-INT-0100`）。實測呼叫 TLS 的程式在兩個建置上
   一模一樣（都連 `libssl`、都印 `ctx=1`）。
 
+- **`Charset` 為什麼還是沒有（2026-11-28 的嘗試，已回退）**：`java.nio.charset` 的
+  `StandardCharsets`／`Charset.forName` 與 `String.getBytes(Charset)` 都可以用 Teyru
+  寫（拉丁 1 與 ASCII 是一行一個 code unit 的迴圈），但 **`String(byte[], Charset)`
+  寫不出來**：String 的儲存屬於執行期，Teyru 建構子的 `this(...)` 轉呼（一般類別可用）
+  不會把被呼叫建構子的回傳值放進 `new` 配置的物件，所以 `new String(bytes, charset)`
+  得到空字串。要嘛把四種編碼寫進執行期（與 `lib/` 的實作重複），要嘛在編譯器支援
+  「原生儲存類別的建構子轉呼」，兩者都不是這一輪該做的事。於是整個檔案回退，`Charset`
+  留在 `docs/gaps` 的「沒有」清單裡；下一次要動的人從這兩條路的取捨開始。
 - **原子欄位更新器（`lib/62`）與它掀開的兩個中繼資料缺口**：
   `AtomicIntegerFieldUpdater`／`AtomicLongFieldUpdater`／`AtomicReferenceFieldUpdater`
   的鎖是**宣告類別的 `Class` 物件**（同一個類別的每個 updater 共用它，所以同一個欄位的
