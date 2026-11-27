@@ -457,6 +457,204 @@ class CompletableFuture<T> implements Future<T> {
     return next
   }
 
+  /* whenComplete: the stage runs on both outcomes, sees the throwable, and
+     passes the original value or failure through unchanged -- the difference
+     from handle is that its answer is ignored. */
+  public CompletableFuture<T> whenComplete(BiConsumer<T, Throwable> action) {
+    final CompletableFuture<T> next = new CompletableFuture<T>()
+    final CompletableFuture<T> self = this
+    final BiConsumer<T, Throwable> c = action
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          try {
+          c.accept(failed == null ? self.valueNow() : null, failed)
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+            return
+        }
+          if (failed != null) {
+          next.completeExceptionally(failed)
+        } else {
+          next.complete(self.valueNow())
+        }
+      }
+    })
+    return next
+  }
+
+  /* thenCombine and its two action forms: a stage that needs both answers. The
+     pair runs when the second of the two finishes, on that thread. */
+  public < U, V > CompletableFuture<V> thenCombine(CompletableFuture<U> other, BiFunction<T, U, V> fn) {
+    final CompletableFuture<V> next = new CompletableFuture<V>()
+    final CompletableFuture<T> left = this
+    final CompletableFuture<U> right = other
+    final BiFunction<T, U, V> f = fn
+    final Runnable run = new Runnable() {
+      public void run() {
+        Throwable leftFailed = left.failureNow()
+        if (leftFailed != null) {
+          next.completeExceptionally(leftFailed)
+          return
+        }
+        Throwable rightFailed = right.failureNow()
+        if (rightFailed != null) {
+          next.completeExceptionally(rightFailed)
+          return
+        }
+        try {
+          next.complete(f.apply(left.valueNow(), right.valueNow()))
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    }
+    attachWhenBoth(left, right, run)
+    return next
+  }
+
+  public < U > CompletableFuture<Void> thenAcceptBoth(CompletableFuture<U> other, BiConsumer<T, U> action) {
+    final CompletableFuture<Void> next = new CompletableFuture<Void>()
+    final CompletableFuture<T> left = this
+    final CompletableFuture<U> right = other
+    final BiConsumer<T, U> c = action
+    final Runnable run = new Runnable() {
+      public void run() {
+        Throwable leftFailed = left.failureNow()
+        if (leftFailed != null) {
+          next.completeExceptionally(leftFailed)
+          return
+        }
+        Throwable rightFailed = right.failureNow()
+        if (rightFailed != null) {
+          next.completeExceptionally(rightFailed)
+          return
+        }
+        try {
+          c.accept(left.valueNow(), right.valueNow())
+          next.complete(null)
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    }
+    attachWhenBoth(left, right, run)
+    return next
+  }
+
+  /* runAfterBoth waits for both and then runs, ignoring both values. */
+  public CompletableFuture<Void> runAfterBoth(CompletableFuture<?> other, Runnable action) {
+    final CompletableFuture<Void> next = new CompletableFuture<Void>()
+    final CompletableFuture<T> left = this
+    final CompletableFuture<?> right = other
+    final Runnable r = action
+    final Runnable run = new Runnable() {
+      public void run() {
+        Throwable leftFailed = left.failureNow()
+        if (leftFailed != null) {
+          next.completeExceptionally(leftFailed)
+          return
+        }
+        Throwable rightFailed = right.failureNow()
+        if (rightFailed != null) {
+          next.completeExceptionally(rightFailed)
+          return
+        }
+        try {
+          r.run()
+          next.complete(null)
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    }
+    attachWhenBoth(left, right, run)
+    return next
+  }
+
+  /* The either forms: the first of the two to finish decides, and the other's
+     later completion is ignored (its answer goes nowhere). */
+  public < U > CompletableFuture<U> applyToEither(CompletableFuture<T> other, Function<T, U> fn) {
+    final CompletableFuture<U> next = new CompletableFuture<U>()
+    final CompletableFuture<T> left = this
+    final CompletableFuture<T> right = other
+    final Function<T, U> f = fn
+    left.attach(new Runnable() {
+      public void run() {
+        completeEither(next, left, f)
+      }
+    })
+    right.attach(new Runnable() {
+      public void run() {
+        completeEither(next, right, f)
+      }
+    })
+    return next
+  }
+
+  private static < T, U > void completeEither(CompletableFuture<U> next, CompletableFuture<T> winner, Function<T, U> fn) {
+    if (next.isDone()) {
+      return
+    }
+    Throwable failed = winner.failureNow()
+    if (failed != null) {
+      next.completeExceptionally(failed)
+      return
+    }
+    try {
+      next.complete(fn.apply(winner.valueNow()))
+    } catch (Throwable thrown) {
+      next.completeExceptionally(thrown)
+    }
+  }
+
+  public CompletableFuture<Void> acceptEither(CompletableFuture<T> other, Consumer<T> action) {
+    return applyToEither(other, v -> {
+      action.accept(v)
+        return null
+    })
+  }
+
+  public CompletableFuture<Void> runAfterEither(CompletableFuture<?> other, Runnable action) {
+    final CompletableFuture<Void> next = new CompletableFuture<Void>()
+    final CompletableFuture<T> left = this
+    final CompletableFuture<?> right = other
+    final Runnable r = action
+    Runnable run = new Runnable() {
+      public void run() {
+        if (next.isDone()) {
+          return
+        }
+        try {
+          r.run()
+          next.complete(null)
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    }
+    left.attach(run)
+    right.attach(run)
+    return next
+  }
+
+  /* Runs an action when both futures are done, whichever finishes last. */
+  private static void attachWhenBoth(CompletableFuture<?> left, CompletableFuture<?> right, Runnable action) {
+    final int[] remaining = new int[] { 2 }
+    Runnable part = new Runnable() {
+      public void run() {
+        synchronized (remaining) {
+          remaining[0] = remaining[0] - 1
+          if (remaining[0] == 0) {
+            action.run()
+          }
+        }
+      }
+    }
+    left.attach(part)
+    right.attach(part)
+  }
+
   /* ---------------------------------------------------------- combining */
 
   /* allOf: done when every one of them is (failed if any failed). The answer is
