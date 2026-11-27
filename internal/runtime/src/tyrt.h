@@ -598,6 +598,10 @@ struct tythread {
      than derived, because WAITING and BLOCKED are both TY_TH_BLOCKED to the
      collector and different answers to a program. */
   int32_t jstate;
+  /* Thread.getPriority(). A hint with no scheduling effect here -- the operating
+     system decides -- but Java stores and inherits it, and a program reads it
+     back. */
+  int32_t jpriority;
   /* How many stop points this thread is inside. Stopping is not nested -- no
      path in the runtime blocks inside another blocking call -- and the depth is
      what keeps the transitions honest anyway: only the transition from 0 to 1
@@ -892,6 +896,9 @@ int32_t ty_thread_join_timeout(int64_t id, int64_t timeout_ns);
 #define TY_JS_TIMED_WAITING 4
 #define TY_JS_TERMINATED 5
 int32_t ty_thread_jstate(int64_t id);
+int32_t ty_thread_priority(int64_t id);
+int32_t ty_thread_priority_current(void);
+void ty_thread_set_priority(int64_t id, int32_t priority);
 int32_t ty_thread_alive(int64_t id);
 /* Sleep for the duration, or until interrupted. Answers 1 when interrupted, in
    which case the interrupt status is cleared. */

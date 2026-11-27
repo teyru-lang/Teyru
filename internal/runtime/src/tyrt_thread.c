@@ -1193,6 +1193,7 @@ int64_t ty_thread_start_virtual0(void *obj, int64_t id, tystr *name, int32_t sel
   t->obj = obj;
   t->name = name;
   t->daemon = 0;
+  if (t->jpriority == 0) t->jpriority = 5;
   t->is_virtual = 1;
   t->vsel = sel;
   t->finished = 0;
@@ -1526,6 +1527,7 @@ int64_t ty_thread_spawn(void *(*fn)(void *), void *arg, void *obj, int64_t id, t
   t->obj = obj;
   t->name = name;
   t->daemon = daemon;
+  if (t->jpriority == 0) t->jpriority = 5;
   /* Registered before the thread runs, so that join() called the instant after
      start() finds something to wait for. The thread's own fields -- its stack
      bounds, its shadow stack, where it parked -- are filled in by the thread
@@ -1579,6 +1581,7 @@ int64_t ty_thread_next_id(void) {
   typlat_mutex_init(&t->mtx);
   typlat_cond_init(&t->cv);
   t->id = id;
+  t->jpriority = 5;
   t->state = TY_TH_DONE;
   t->finished = 1;
   registry_insert(t, 0);
@@ -1589,6 +1592,23 @@ int64_t ty_thread_next_id(void) {
    polls, and the polling itself synchronises through the thread's mutex. */
 static void js_set(tythread *t, int32_t st) {
   __atomic_store_n(&t->jstate, st, __ATOMIC_RELAXED);
+}
+
+int32_t ty_thread_priority_current(void) {
+  int32_t p = ty_self->jpriority;
+  return p == 0 ? 5 : p;
+}
+
+int32_t ty_thread_priority(int64_t id) {
+  tythread *t = registry_find(id);
+  if (!t) return 5;
+  return __atomic_load_n(&t->jpriority, __ATOMIC_RELAXED);
+}
+
+void ty_thread_set_priority(int64_t id, int32_t priority) {
+  tythread *t = registry_find(id);
+  if (!t) return;
+  __atomic_store_n(&t->jpriority, priority, __ATOMIC_RELAXED);
 }
 
 int32_t ty_thread_jstate(int64_t id) {

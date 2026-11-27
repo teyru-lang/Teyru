@@ -99,6 +99,8 @@ class Thread implements Runnable {
      budget is expressible even though the API is milliseconds. */
   private static native boolean joinTimeout0(long id, long timeoutNanos)
   private static native int jstate0(long id)
+  private static native int currentPriority0()
+  private static native void setPriority0(long id, int priority)
   private static native boolean alive0(long id)
 
   /* Sleep, answering true when the sleep was interrupted (and clearing the
@@ -141,6 +143,16 @@ class Thread implements Runnable {
      must not be collected while the program can still ask about it. */
   private static Thread mainOf
 
+  /* Java's three constants and the stored value. The value is a hint: this
+     runtime does not change an operating system thread's priority, and Java
+     does not promise that setPriority changes scheduling either -- what it does
+     promise is that getPriority answers what was set and that a new thread
+     starts at its creator's priority, which is what is implemented here. */
+  public static final int MIN_PRIORITY = 1
+  public static final int NORM_PRIORITY = 5
+  public static final int MAX_PRIORITY = 10
+  private int priority
+
   // ----------------------------------------------------------- constructors
   public Thread() {
     this(null, null)
@@ -158,9 +170,11 @@ class Thread implements Runnable {
     this.tid = Thread.nextId0()
     this.target = target
     this.name = (name == null) ? ("Thread-" + this.tid) : name
-    /* java.lang.Thread inherits the daemon status of the thread that makes it,
-       which is what keeps a worker created by a daemon a daemon. */
+    /* java.lang.Thread inherits the daemon status and the priority of the
+       thread that makes it, which is what keeps a worker created by a daemon a
+       daemon. */
     this.daemon = Thread.currentDaemon0()
+    this.priority = Thread.currentPriority0()
   }
 
   // -------------------------------------------------------------- the thread
@@ -261,6 +275,20 @@ class Thread implements Runnable {
 
   public long getId() {
     return this.tid
+  }
+
+  public int getPriority() {
+    return this.priority
+  }
+
+  /* Java's check: outside 1..10 is IllegalArgumentException. The value is also
+     handed to the runtime, so that a thread created later inherits it. */
+  public void setPriority(int newPriority) {
+    if (newPriority < Thread.MIN_PRIORITY || newPriority > Thread.MAX_PRIORITY) {
+      throw new IllegalArgumentException("priority out of range: " + newPriority)
+    }
+    this.priority = newPriority
+    Thread.setPriority0(this.tid, newPriority)
   }
 
   public String getName() {
