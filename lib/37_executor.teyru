@@ -712,9 +712,15 @@ class TimeUnit {
   }
 
   /* Java's sleep: a wait in this unit, through Thread.sleep's milliseconds. A
-     sub-millisecond duration still sleeps at least a millisecond, which is the
-     resolution the runtime has. */
+     zero or negative duration returns at once -- Java's implementation only
+     calls Thread.sleep when the timeout is positive, so a negative one is a
+     silent no-op rather than Thread.sleep's IllegalArgumentException. A
+     positive duration below a millisecond still sleeps a millisecond, which is
+     the resolution the runtime has. */
   public void sleep(long timeout) {
+    if (timeout <= 0) {
+      return
+    }
     long ms = timeout * this.nanosPerUnit / 1000000L
     Thread.sleep(ms > 0 ? ms : 1L)
   }
