@@ -1044,6 +1044,16 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   生啟動時的 attach 清單，第一次查詢得到空成員表；現在掃描一旦 widen 成「所有類別」，
   就設 `reflectUsed`。回歸測試是 `tests/programs/t342_updaters.teyru`（與 JDK 逐行
   相同），hello 的 `-O2` 大小前後都是 **109,608** 位元組（沒有因為放寬而變大）。
+- **未攔截例外的處理常式，以及「身分與本體」的分離（`lib/35`、`tyrt_thread.c`）**：
+  `Thread.UncaughtExceptionHandler`（自己的與 static 的 default）、`setUncaughtExceptionHandler`／
+  `getUncaughtExceptionHandler`、`setDefaultUncaughtExceptionHandler`／
+  `getDefaultUncaughtExceptionHandler`。作法是 **`Thread.start()` 先包一層 Runnable**：它
+  呼叫 `run()`、接住 `Throwable`、交給處理常式，沒有處理常式就重丟（執行期印的那一行
+  因此不變）。這需要把**執行期的身分與本體分開**——`ty_thread_start_body(obj, body, …)`
+  讓 `currentThread()`／`getName()` 回答 Thread 物件、分派跑在包裝上；虛擬執行緒用同一個
+  分法（`vbody`）。**已知差異**：Java 的 `getUncaughtExceptionHandler` 在執行緒自己沒有
+  handler 時回答 **ThreadGroup**，這裡沒有 ThreadGroup，所以回答 static default；類別註解
+  與測試都寫明。測試 `t344_uncaught`（與 JDK 逐行相同，處理常式都裝好所以 stderr 全空）。
 - **`Thread.State` 與執行期的第二個狀態欄位（`tyrt_thread.c` 的 `jstate`）**：收集器要的
   `state`（`TY_TH_RUNNING`／`PARKED`／`BLOCKED`／`DONE`）與程式要的 `Thread.State` 是
   **兩個問題**——`WAITING` 與 `BLOCKED` 對收集器是同一件事，對程式是兩個答案——所以
