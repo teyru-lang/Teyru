@@ -170,6 +170,7 @@ var nativeTable = map[string]nativeFn{
 	"Thread.jstate0(J)":          {fn: "ty_thread_jstate"},
 	"Thread.currentPriority0()":  {fn: "ty_thread_priority_current"},
 	"Thread.setPriority0(J,I)":   {fn: "ty_thread_set_priority"},
+	"Thread.holdsLock(Object)":   {fn: "ty_holds_lock"},
 	"Thread.alive0(J)":           {fn: "ty_thread_alive"},
 	"Thread.nextId0()":           {fn: "ty_thread_next_id"},
 	"Thread.current0()":          {fn: "ty_thread_current_obj"},

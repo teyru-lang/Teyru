@@ -107,6 +107,14 @@ class Thread implements Runnable {
   private static native int jstate0(long id)
   private static native int currentPriority0()
   private static native void setPriority0(long id, int priority)
+  /* Whether the calling thread owns this object's monitor. Java's
+     Thread.holdsLock, which is what a program asserts with. */
+  public static native boolean holdsLock(Object obj)
+
+  /* A spin-wait hint. Java's does nothing on most platforms and promises
+     nothing; an empty method is the same contract here, and having it means a
+     program that calls it compiles and links. */
+  public static void onSpinWait() {}
   private static native boolean alive0(long id)
 
   /* Sleep, answering true when the sleep was interrupted (and clearing the

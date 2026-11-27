@@ -1999,6 +1999,23 @@ static void interrupt_wake(tythread *t) {
   }
 }
 
+/* Thread.holdsLock: true when the calling thread owns the object's monitor. An
+   object nobody has ever synchronized on has no entry, and the answer is false;
+   the entry mon_get would make is harmless, but a program that only asks should
+   not grow the map. */
+int32_t ty_holds_lock(void *obj) {
+  uint32_t b = mon_bucket(obj);
+  int32_t held = 0;
+  for (tymon *m = __atomic_load_n(&mon_buckets[b], __ATOMIC_ACQUIRE); m; m = m->next) {
+    if (m->key != obj) continue;
+    typlat_mutex_lock(&m->mtx);
+    held = m->owned && m->owner == ty_self;
+    typlat_mutex_unlock(&m->mtx);
+    break;
+  }
+  return held;
+}
+
 void ty_sync_enter(void *obj) {
   tymon *m = mon_get(obj);
   typlat_mutex_lock(&m->mtx);

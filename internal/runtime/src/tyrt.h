@@ -901,6 +901,7 @@ int32_t ty_thread_join_timeout(int64_t id, int64_t timeout_ns);
 int32_t ty_thread_jstate(int64_t id);
 int32_t ty_thread_priority(int64_t id);
 int32_t ty_thread_priority_current(void);
+int32_t ty_holds_lock(void *obj);
 void ty_thread_set_priority(int64_t id, int32_t priority);
 int32_t ty_thread_alive(int64_t id);
 /* Sleep for the duration, or until interrupted. Answers 1 when interrupted, in
