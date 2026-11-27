@@ -827,6 +827,9 @@ class Phaser {
       if (this.terminated) {
         return this.phase
       }
+      if (this.arrivals >= this.parties) {
+        throw new IllegalStateException("Attempted arrival of unregistered party")
+      }
       int at = this.phase
       this.arrivals = this.arrivals + 1
       if (this.arrivals >= this.parties) {
@@ -840,6 +843,9 @@ class Phaser {
     synchronized (this) {
       if (this.terminated) {
         return this.phase
+      }
+      if (this.arrivals >= this.parties) {
+        throw new IllegalStateException("Attempted arrival of unregistered party")
       }
       int at = this.phase
       this.parties = this.parties - 1
@@ -862,6 +868,9 @@ class Phaser {
     synchronized (this) {
       if (this.terminated) {
         return this.phase
+      }
+      if (this.arrivals >= this.parties) {
+        throw new IllegalStateException("Attempted arrival of unregistered party")
       }
       int at = this.phase
       this.arrivals = this.arrivals + 1
