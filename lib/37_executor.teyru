@@ -633,6 +633,108 @@ class ThreadPool implements ExecutorService {
 /* The pool factories java.util.concurrent.Executors has, and only those: the
    scheduled and work-stealing ones need machinery this standard library does
    not have. */
+/* java.util.concurrent.CompletionService: a queue of futures in completion
+   order, rather than in submission order. Java's shape has a BlockingQueue
+   inside; this has the same monitor-backed list the rest of the library uses for
+   a queue, so take() waits on the service's monitor and the task that finishes
+   wakes the waiter.
+
+   The wrapper is what makes the order work: the pool runs the real task, and
+   when it returns the wrapper adds its own future to the completed list before
+   returning. A task that throws still reaches that point, because FutureTask
+   keeps the failure inside the future -- take() then answers a future whose
+   get() throws, which is Java's behaviour. */
+interface CompletionService<V> {
+  Future<V> submit(Callable<V> task)
+  /* The next future to finish, waiting for one. */
+  Future<V> take()
+  /* The next finished future, or null when none has finished yet. */
+  Future<V> poll()
+  /* The next finished future, waiting at most this many milliseconds. */
+  Future<V> poll(long millis)
+}
+
+class ExecutorCompletionService<V> implements CompletionService<V> {
+  private final Executor executor
+  private final List<Future<V>> ready = new ArrayList<Future<V>>()
+
+  public ExecutorCompletionService(Executor executor) {
+    if (executor == null) {
+      throw new NullPointerException("the executor is null")
+    }
+    this.executor = executor
+  }
+
+  public Future<V> submit(Callable<V> task) {
+    if (task == null) {
+      throw new NullPointerException("the task is null")
+    }
+    final FutureTask<V> future = new FutureTask<V>(task)
+    final ExecutorCompletionService<V> self = this
+    /* A Runnable, because the pool's execute() takes one and the future keeps
+       its own answer. Running future.run() here is what Java's queueing
+       decorator does: the task runs on the pool, and the wrapper only notices
+       that it finished. */
+    Runnable wrapper = new Runnable() {
+      public void run() {
+        future.run()
+        self.finished(future)
+      }
+    }
+    this.executor.execute(wrapper)
+    return future
+  }
+
+  private void finished(Future<V> future) {
+    synchronized (this) {
+      this.ready.add(future)
+      this.notifyAll()
+    }
+  }
+
+  public Future<V> take() {
+    synchronized (this) {
+      while (this.ready.size() == 0) {
+        this.wait(-1L)
+      }
+      Future<V> f = this.ready.get(0)
+      this.ready.remove(0)
+      return f
+    }
+  }
+
+  public Future<V> poll() {
+    synchronized (this) {
+      if (this.ready.size() == 0) {
+        return null
+      }
+      Future<V> f = this.ready.get(0)
+      this.ready.remove(0)
+      return f
+    }
+  }
+
+  public Future<V> poll(long millis) {
+    long deadline = System.nanoTime() + millis * 1000000L
+    synchronized (this) {
+      while (this.ready.size() == 0) {
+        long left = deadline - System.nanoTime()
+        if (left <= 0) {
+          return null
+        }
+        long ms = left / 1000000L
+        if (ms <= 0) {
+          ms = 1
+        }
+        this.wait(ms)
+      }
+      Future<V> f = this.ready.get(0)
+      this.ready.remove(0)
+      return f
+    }
+  }
+}
+
 class Executors {
   /* For the thread names. Java starts at 1 and numbers pools within the
      process; so does this. */
