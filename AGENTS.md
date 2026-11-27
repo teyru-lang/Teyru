@@ -1022,6 +1022,21 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   81,830 行），且它對用到註解的程式是具名拒絕（`TY-INT-0100`）。實測呼叫 TLS 的程式在兩個建置上
   一模一樣（都連 `libssl`、都印 `ctx=1`）。
 
+- **並行工具的最後一塊（`lib/61`，以及 `checker.go` 的匯入表）**：`CompletableFuture`、
+  `ReentrantReadWriteLock`、`Exchanger` 三件，加上 `Lock` 介面（`ReentrantLock` 現在
+  也有它）。三個決定要記住：①**非同步工廠用自己的 daemon 執行緒**，不是池——Java 用
+  daemon 的 common pool，這裡沒有共用池；用池的話工作執行緒的 60 秒 idle 會讓程式在
+  `main` 返回後多活一分鐘。②**時長一律毫秒**（`get(long)`、`exchange(V, long)`、
+  `tryLock(long)`），沒有 `TimeUnit`；③`tryLock(long)` 以外的等待都是
+  `Object.wait(-1)`，逾時用單調時鐘，與 `ReentrantLock` 同一個形狀。
+  **`submit(Runnable)` 刻意沒有加**：加了的版本會讓 `pool.submit(() -> { ... })`
+  因為多載解析先選 `Callable<Void>` 而報「missing return statement」——一個自然寫法
+  失敗的 API 不如不要，等於留著「沒有 `submit(Runnable)`」這條具名缺口。
+  匯入表補上文件早就公布的套件（`java.util.concurrent(.atomic/.locks)`、
+  `java.security(.spec)`、`javax.crypto(.spec)`、`java.nio`、`java.util.logging`、
+  `java.util.zip`）：在那之前，一份照 Java 寫的 `import java.util.concurrent.*`
+  是 `TY-TYP-0115`。測試：`t336_concurrent_extra`（鏈、鎖、交換，逐行對 JDK）與
+  `t337_concurrent_stress`（4 寫 8 讀的總和、50 個未來的組合、逾時邊界）。
 - **平台矩陣那條的兩個空隙已補（`TEYRU_TARGET` 與 `--cc`）**：
   - `tests/run.sh` 讀 `TEYRU_TARGET=<os>/<arch>`：每一次 build 都經過一個 `build` 函式帶著 `--target`
     （放在一處，後加的 build 不會忘記），`.skip` 也改以**目標平台**判讀（跨目標的程式跑在目標平台上，
