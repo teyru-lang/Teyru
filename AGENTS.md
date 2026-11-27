@@ -1044,6 +1044,15 @@ private`——那是 **Vercel 的 GitHub App 沒有裝在 `teyru-lang` 組織上
   生啟動時的 attach 清單，第一次查詢得到空成員表；現在掃描一旦 widen 成「所有類別」，
   就設 `reflectUsed`。回歸測試是 `tests/programs/t342_updaters.teyru`（與 JDK 逐行
   相同），hello 的 `-O2` 大小前後都是 **109,608** 位元組（沒有因為放寬而變大）。
+- **`Thread.State` 與執行期的第二個狀態欄位（`tyrt_thread.c` 的 `jstate`）**：收集器要的
+  `state`（`TY_TH_RUNNING`／`PARKED`／`BLOCKED`／`DONE`）與程式要的 `Thread.State` 是
+  **兩個問題**——`WAITING` 與 `BLOCKED` 對收集器是同一件事，對程式是兩個答案——所以
+  `tythread` 多一個 `jstate`，在每個等待點設定：啟動 `RUNNABLE`、結束 `TERMINATED`、
+  `sleep` 與逾時等待 `TIMED_WAITING`、不打斷的等待 `WAITING`、排隊進監視器 `BLOCKED`。
+  監視器那一格需要把等待 helper 改成「帶著要發布的 Java 狀態去等」，否則它用的是
+  `Object.wait` 那條條件變數、會被記成 `WAITING`。測試 `t343_thread_state`（與 JDK 逐行
+  相同；三個阻塞狀態用 2 秒上限輪詢，斷言的是「曾經觀察到」）也在同一輪補上
+  `Object.wait()`（無參數）——先前只有 `wait(long)`，Java 的無參數形式根本沒有拼法。
 - **並行工具的最後一塊（`lib/61`，以及 `checker.go` 的匯入表）**：`CompletableFuture`、
   `ReentrantReadWriteLock`、`Exchanger` 三件，加上 `Lock` 介面（`ReentrantLock` 現在
   也有它）。三個決定要記住：①**非同步工廠用自己的 daemon 執行緒**，不是池——Java 用
