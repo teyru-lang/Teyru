@@ -516,6 +516,17 @@ func (e *Emitter) runFull() {
 	// is never emitted (see reflectset.go).
 	if !e.noTables {
 		e.reflTables, e.reflNames = e.reflectionReach()
+		/* The scan widens to every class when the program's own code reaches a
+		   library reflection user (Validation, Gson, the field updaters). The
+		   tables then exist for every class, but they are still attached only
+		   when the emitter believes the program reflects: a program that calls
+		   such a user and never writes a reflection call itself used to ship
+		   the tables and never attach them, so the first query answered an
+		   empty member list. The widened answer is exactly the case where the
+		   tables have to be attached. */
+		if e.reflTables.all || e.reflNames.all {
+			e.reflectUsed = true
+		}
 		// The array classes a reflecting program can ask for without naming an
 		// array type: Array.newInstance and Class.forName reach them through a
 		// component class, and the scan already bounded which classes those are.

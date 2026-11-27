@@ -566,6 +566,34 @@ func (s *reflectScan) triggers() {
 		reach[cl] = true
 		queue = append(queue, cl)
 	}
+	/* A subclass of a reflection user runs that user's code -- a constructor
+	   chain is not an *ast.Call, so the call closure above cannot see it -- and
+	   the updaters are exactly this shape: the program names
+	   AtomicIntegerFieldUpdater, the reflection calls are written in
+	   AtomicFieldUpdater. Marking the subtypes reached is the widening
+	   direction, which is the only direction this file may take. */
+	for cl := range s.users {
+		for sub := range s.sub[cl] {
+			if !reach[sub] {
+				reach[sub] = true
+				queue = append(queue, sub)
+			}
+		}
+	}
+	/* A subclass of a reflection user runs that user's code -- a constructor
+	   chain is not an *ast.Call, so the call closure above cannot see it -- and
+	   the updater's base class is exactly this shape: the program names
+	   AtomicIntegerFieldUpdater, the reflection calls are written in
+	   AtomicFieldUpdater. Marking the subtypes reached is the widening
+	   direction, which is the only direction this file may take. */
+	for cl := range s.users {
+		for sub := range s.sub[cl] {
+			if !reach[sub] {
+				reach[sub] = true
+				queue = append(queue, sub)
+			}
+		}
+	}
 	for len(queue) > 0 {
 		cl := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]

@@ -1,0 +1,272 @@
+package teyru
+
+/* The atomic field updaters: java.util.concurrent.atomic's
+   AtomicIntegerFieldUpdater, AtomicLongFieldUpdater and
+   AtomicReferenceFieldUpdater.
+
+   They exist for the same reason Java's do: a class wants its fields updated
+   atomically without boxing them in an AtomicInteger object, and the updater is
+   created once and shared.
+
+   The implementation is a monitor, like every other synchronizer in this
+   library. The lock is the declaring class's Class object, which is shared by
+   every updater made for the same class, so two updaters on one field exclude
+   each other; a program that creates two updaters with two different Class
+   instances for the same class would break that, and the class literal is
+   canonical, so this is a thing to avoid rather than something to guess about.
+   The field is read and written through reflection with setAccessible(true),
+   the same way the library's own binding does it.
+
+   What is checked, as in Java: the field must exist on the named class, and its
+   type must be the updater's (int, long, or the field type passed to the
+   reference updater) -- a mismatch is IllegalArgumentException. What is not
+   checked: `volatile`. Java requires it because a non-volatile field's other
+   readers would not see the update; here every update goes through the same
+   monitor, so the updaters see each other, and plain reads of the field from
+   other threads are exactly as strong as the language's ordinary field reads.
+
+   The tests are tests/programs/t342_updaters.teyru, whose expectation is
+   OpenJDK 21's run of the same program: two threads incrementing one field
+   through one updater, and a compareAndSet loop. */
+
+/* The base: the field, the class whose monitor serialises the updates, and the
+   helpers the three concrete updaters share. */
+abstract class AtomicFieldUpdater<T> {
+  protected final Class owner
+  protected final Field field
+
+  AtomicFieldUpdater(Class owner, String fieldName) {
+    if (owner == null) {
+      throw new NullPointerException("the class is null")
+    }
+    if (fieldName == null) {
+      throw new NullPointerException("the field name is null")
+    }
+    Field f
+    try {
+      f = owner.getDeclaredField(fieldName)
+    } catch (NoSuchFieldException e) {
+      /* Java's newUpdater wraps the lookup failure in a RuntimeException with
+         the NoSuchFieldException as its cause; a missing field is not the
+         IllegalArgumentException that a wrong type is. */
+      throw new RuntimeException(e)
+    }
+    f.setAccessible(true)
+    this.owner = owner
+    this.field = f
+  }
+
+  protected void checkType(Class expected, String what) {
+    if (this.field.getType() != expected) {
+      throw new IllegalArgumentException("the field is not a " + what)
+    }
+  }
+}
+
+class AtomicIntegerFieldUpdater<T> extends AtomicFieldUpdater<T> {
+  private AtomicIntegerFieldUpdater(Class owner, String fieldName) {
+    super(owner, fieldName)
+    checkType(int.class, "int")
+  }
+
+  public static < U > AtomicIntegerFieldUpdater<U> newUpdater(Class type, String fieldName) {
+    return new AtomicIntegerFieldUpdater<U>(type, fieldName)
+  }
+
+  public final int get(T obj) {
+    synchronized (this.owner) {
+      return ((Integer) this.field.get(obj)).intValue()
+    }
+  }
+
+  public final void set(T obj, int newValue) {
+    synchronized (this.owner) {
+      this.field.set(obj, Integer.valueOf(newValue))
+    }
+  }
+
+  /* Java's lazySet is a plain store with no ordering promise; this is the same
+     store as set, which is the honest mapping here. */
+  public final void lazySet(T obj, int newValue) {
+    set(obj, newValue)
+  }
+
+  public final boolean compareAndSet(T obj, int expect, int update) {
+    synchronized (this.owner) {
+      int current = ((Integer) this.field.get(obj)).intValue()
+      if (current != expect) {
+        return false
+      }
+      this.field.set(obj, Integer.valueOf(update))
+      return true
+    }
+  }
+
+  public final boolean weakCompareAndSet(T obj, int expect, int update) {
+    return compareAndSet(obj, expect, update)
+  }
+
+  public final int getAndSet(T obj, int newValue) {
+    synchronized (this.owner) {
+      int current = ((Integer) this.field.get(obj)).intValue()
+      this.field.set(obj, Integer.valueOf(newValue))
+      return current
+    }
+  }
+
+  public final int getAndIncrement(T obj) {
+    return getAndAdd(obj, 1)
+  }
+
+  public final int getAndDecrement(T obj) {
+    return getAndAdd(obj, -1)
+  }
+
+  public final int getAndAdd(T obj, int delta) {
+    synchronized (this.owner) {
+      int current = ((Integer) this.field.get(obj)).intValue()
+      this.field.set(obj, Integer.valueOf(current + delta))
+      return current
+    }
+  }
+
+  public final int incrementAndGet(T obj) {
+    return getAndAdd(obj, 1) + 1
+  }
+
+  public final int decrementAndGet(T obj) {
+    return getAndAdd(obj, -1) - 1
+  }
+
+  public final int addAndGet(T obj, int delta) {
+    return getAndAdd(obj, delta) + delta
+  }
+}
+
+class AtomicLongFieldUpdater<T> extends AtomicFieldUpdater<T> {
+  private AtomicLongFieldUpdater(Class owner, String fieldName) {
+    super(owner, fieldName)
+    checkType(long.class, "long")
+  }
+
+  public static < U > AtomicLongFieldUpdater<U> newUpdater(Class type, String fieldName) {
+    return new AtomicLongFieldUpdater<U>(type, fieldName)
+  }
+
+  public final long get(T obj) {
+    synchronized (this.owner) {
+      return ((Long) this.field.get(obj)).longValue()
+    }
+  }
+
+  public final void set(T obj, long newValue) {
+    synchronized (this.owner) {
+      this.field.set(obj, Long.valueOf(newValue))
+    }
+  }
+
+  public final void lazySet(T obj, long newValue) {
+    set(obj, newValue)
+  }
+
+  public final boolean compareAndSet(T obj, long expect, long update) {
+    synchronized (this.owner) {
+      long current = ((Long) this.field.get(obj)).longValue()
+      if (current != expect) {
+        return false
+      }
+      this.field.set(obj, Long.valueOf(update))
+      return true
+    }
+  }
+
+  public final boolean weakCompareAndSet(T obj, long expect, long update) {
+    return compareAndSet(obj, expect, update)
+  }
+
+  public final long getAndSet(T obj, long newValue) {
+    synchronized (this.owner) {
+      long current = ((Long) this.field.get(obj)).longValue()
+      this.field.set(obj, Long.valueOf(newValue))
+      return current
+    }
+  }
+
+  public final long getAndIncrement(T obj) {
+    return getAndAdd(obj, 1L)
+  }
+
+  public final long getAndDecrement(T obj) {
+    return getAndAdd(obj, -1L)
+  }
+
+  public final long getAndAdd(T obj, long delta) {
+    synchronized (this.owner) {
+      long current = ((Long) this.field.get(obj)).longValue()
+      this.field.set(obj, Long.valueOf(current + delta))
+      return current
+    }
+  }
+
+  public final long incrementAndGet(T obj) {
+    return getAndAdd(obj, 1L) + 1L
+  }
+
+  public final long decrementAndGet(T obj) {
+    return getAndAdd(obj, -1L) - 1L
+  }
+
+  public final long addAndGet(T obj, long delta) {
+    return getAndAdd(obj, delta) + delta
+  }
+}
+
+class AtomicReferenceFieldUpdater<T, V> extends AtomicFieldUpdater<T> {
+  private AtomicReferenceFieldUpdater(Class owner, Class fieldType, String fieldName) {
+    super(owner, fieldName)
+    checkType(fieldType, "reference of that type")
+  }
+
+  public static < U, W > AtomicReferenceFieldUpdater<U, W> newUpdater(Class type, Class fieldType, String fieldName) {
+    return new AtomicReferenceFieldUpdater<U, W>(type, fieldType, fieldName)
+  }
+
+  public final V get(T obj) {
+    synchronized (this.owner) {
+      return (V) this.field.get(obj)
+    }
+  }
+
+  public final void set(T obj, V newValue) {
+    synchronized (this.owner) {
+      this.field.set(obj, newValue)
+    }
+  }
+
+  public final void lazySet(T obj, V newValue) {
+    set(obj, newValue)
+  }
+
+  public final boolean compareAndSet(T obj, V expect, V update) {
+    synchronized (this.owner) {
+      V current = (V) this.field.get(obj)
+      if (current != expect) {
+        return false
+      }
+      this.field.set(obj, update)
+      return true
+    }
+  }
+
+  public final boolean weakCompareAndSet(T obj, V expect, V update) {
+    return compareAndSet(obj, expect, update)
+  }
+
+  public final V getAndSet(T obj, V newValue) {
+    synchronized (this.owner) {
+      V current = (V) this.field.get(obj)
+      this.field.set(obj, newValue)
+      return current
+    }
+  }
+}
