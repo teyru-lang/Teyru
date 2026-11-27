@@ -877,6 +877,7 @@ int64_t ty_thread_next_id(void);
    interrupted instead, in which case the interrupt status is already cleared
    and the prelude throws InterruptedException. */
 int32_t ty_thread_join(int64_t id);
+int32_t ty_thread_join_timeout(int64_t id, int64_t timeout_ns);
 int32_t ty_thread_alive(int64_t id);
 /* Sleep for the duration, or until interrupted. Answers 1 when interrupted, in
    which case the interrupt status is cleared. */

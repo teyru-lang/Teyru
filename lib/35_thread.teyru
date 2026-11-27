@@ -96,6 +96,9 @@ class Thread implements Runnable {
      of the thread finishing. The status is already cleared when it answers
      true; join() is what turns it into InterruptedException. */
   private static native boolean join0(long id)
+  /* The timed form; the deadline is passed in nanoseconds so a sub-millisecond
+     budget is expressible even though the API is milliseconds. */
+  private static native boolean joinTimeout0(long id, long timeoutNanos)
   private static native boolean alive0(long id)
 
   /* Sleep, answering true when the sleep was interrupted (and clearing the
@@ -201,6 +204,21 @@ class Thread implements Runnable {
      as it is thrown. */
   public void join() {
     if (Thread.join0(this.tid)) {
+      throw new InterruptedException()
+    }
+  }
+
+  /* Java's join(long): wait at most this many milliseconds. A duration of zero
+     or less means "wait until it finishes", which is Java's rule and is why the
+     zero case goes to join() rather than returning at once. An interrupt still
+     ends the wait with InterruptedException; a timeout simply returns, and
+     isAlive() is how the caller asks whether it finished. */
+  public void join(long millis) {
+    if (millis <= 0) {
+      join()
+      return
+    }
+    if (Thread.joinTimeout0(this.tid, millis * 1000000L)) {
       throw new InterruptedException()
     }
   }

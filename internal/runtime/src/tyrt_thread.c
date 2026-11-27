@@ -1595,6 +1595,42 @@ int32_t ty_thread_join(int64_t id) {
   return intr;
 }
 
+/* join with a deadline: the wait ends when the target finishes, the joiner is
+   interrupted, or the budget runs out. The runtime answers only the interrupt
+   flag, because a timeout is not an error in java.lang.Thread.join(long) -- the
+   caller simply continues. The waiting is the same condition variable the
+   untimed join uses, and the timed wait is a stop point for a virtual thread
+   the way the untimed one is. */
+int32_t ty_thread_join_timeout(int64_t id, int64_t timeout_ns) {
+  tythread *t = registry_find(id);
+  if (!t) return 0;
+  tythread *self = ty_self;
+  int32_t intr = 0;
+  typlat_mutex_lock(&t->mtx);
+  if (t != self) __atomic_store_n(&self->join_target, t, __ATOMIC_SEQ_CST);
+  int64_t deadline = ty_nanos() + (timeout_ns > 0 ? timeout_ns : 0);
+  int waited = 0;
+  while (!t->finished) {
+    if (__atomic_load_n(&self->interrupted, __ATOMIC_SEQ_CST)) {
+      intr = 1;
+      break;
+    }
+    int64_t left = deadline - ty_nanos();
+    if (left <= 0) {
+      break;
+    }
+    waited = 1;
+    /* A spurious wakeup -- or a notify from interrupt() on another thread --
+       lands back here, where the deadline and the finished flag are rechecked. */
+    ty_cond_timedwait(&t->cv, &t->mtx, left);
+  }
+  if (t != self) __atomic_store_n(&self->join_target, NULL, __ATOMIC_SEQ_CST);
+  if (waited && !intr && __atomic_load_n(&self->interrupted, __ATOMIC_SEQ_CST)) intr = 1;
+  if (intr) __atomic_store_n(&self->interrupted, 0, __ATOMIC_SEQ_CST);
+  typlat_mutex_unlock(&t->mtx);
+  return intr;
+}
+
 int32_t ty_thread_alive(int64_t id) {
   tythread *t = registry_find(id);
   return t && !t->finished;

@@ -157,6 +157,7 @@ var nativeTable = map[string]nativeFn{
 		fn: "ty_thread_start_virtual0", selClass: "teyru.Runnable", selMethod: "run",
 	},
 	"Thread.join0(J)":            {fn: "ty_thread_join"},
+	"Thread.joinTimeout0(J,J)":   {fn: "ty_thread_join_timeout"},
 	"Thread.alive0(J)":           {fn: "ty_thread_alive"},
 	"Thread.nextId0()":           {fn: "ty_thread_next_id"},
 	"Thread.current0()":          {fn: "ty_thread_current_obj"},

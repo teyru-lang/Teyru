@@ -260,6 +260,52 @@ class CompletableFuture<T> implements Future<T> {
     }
   }
 
+  /* orTimeout / completeOnTimeout: a deadline on a future nobody completed.
+
+     Java schedules a task on its common pool; this starts a daemon thread that
+     sleeps for the budget and then tries to finish the future, which does
+     nothing if it has already finished. The failure is a TimeoutException with
+     no message, as Java's is, and the value form completes normally instead. A
+     negative budget is IllegalArgumentException, which is also Java's answer. */
+  public CompletableFuture<T> orTimeout(long millis) {
+    final CompletableFuture<T> self = this
+    Thread watchdog = new Thread(new Runnable() {
+      public void run() {
+        if (millis > 0) {
+          try {
+            Thread.sleep(millis)
+          } catch (InterruptedException e) {
+            return
+          }
+        }
+          self.completeExceptionally(new TimeoutException())
+      }
+    })
+    watchdog.setDaemon(true)
+    watchdog.start()
+    return this
+  }
+
+  public CompletableFuture<T> completeOnTimeout(T value, long millis) {
+    final CompletableFuture<T> self = this
+    final T fallback = value
+    Thread watchdog = new Thread(new Runnable() {
+      public void run() {
+        if (millis > 0) {
+          try {
+            Thread.sleep(millis)
+          } catch (InterruptedException e) {
+            return
+          }
+        }
+          self.complete(fallback)
+      }
+    })
+    watchdog.setDaemon(true)
+    watchdog.start()
+    return this
+  }
+
   /* ------------------------------------------------------------ waiting */
 
   public T join() {
