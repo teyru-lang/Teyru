@@ -20,9 +20,11 @@ package teyru
  * waiter with one notifyAll. Several threads waiting on one object is the
  * ordinary shape of a synchronizer, and the runtime carries it.
  *
+ * The read/write lock, the exchanger and the future chain are in
+ * 61_concurrent_extra.teyru.
+ *
  * Absent, and deliberately not declared: TimeUnit (every duration here is
- * milliseconds, as in Thread.sleep), CyclicBarrier, Semaphore, Phaser,
- * Exchanger, and the atomic field updaters. CountDownLatch.await waits with
+ * milliseconds, as in Thread.sleep), Phaser, and the atomic field updaters. CountDownLatch.await waits with
  * Object.wait, so an interrupt ends it with InterruptedException -- this
  * compiler does not check checked exceptions, so the method declares no throws
  * clause for it, as in the rest of this library. */
@@ -566,7 +568,7 @@ class BrokenBarrierException extends RuntimeException {
  * `synchronized` does, which is the observable behaviour a program uses; the
  * difference is that the monitor is reentered explicitly here, so a thread that
  * takes the lock twice must release twice, and getHoldCount says so. */
-class ReentrantLock {
+class ReentrantLock implements Lock {
   private Thread owner
   private int holds
 

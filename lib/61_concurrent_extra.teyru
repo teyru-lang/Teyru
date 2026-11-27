@@ -1,0 +1,819 @@
+package teyru
+
+/* The rest of java.util.concurrent's synchronizers and the future chain: the
+   read/write lock, the exchanger, and CompletableFuture.
+
+   All of it is built on the monitor `synchronized` takes and
+   Object.wait/notifyAll, like lib/38_concurrent_collections.teyru, and on
+   nothing else. There are no hardware atomics in this runtime, so a reader who
+   assumes a lock-free implementation would reason about contention the wrong
+   way; what is true is that each object is safe for several threads at once and
+   that each call is atomic.
+
+   The one thing to know about CompletableFuture here: its async factories run
+   the supplier on a daemon thread of their own (Java's run on the daemon
+   common pool), because a worker that outlived main by its idle timeout would
+   keep the process alive after the program had finished. A caller that passes
+   an Executor gets that executor instead, and its lifetime is the caller's. */
+
+/* java.util.concurrent.locks.Lock: the four operations ReentrantLock and the
+   read/write lock share. It exists so that readLock() and writeLock() can have
+   a type that is not ReentrantLock, which is what a caller stores them in. */
+interface Lock {
+  void lock()
+  /* The lock if it is free, false otherwise. */
+  boolean tryLock()
+  /* The lock if it becomes free within this many milliseconds. */
+  boolean tryLock(long millis)
+  /* Release one hold; releasing a lock this thread does not hold is
+     IllegalMonitorStateException. */
+  void unlock()
+}
+
+/* Java's java.lang.Void: the type of a CompletableFuture that carries no
+   answer, which is what allOf and anyOf produce. */
+final class Void {
+  private Void() {}
+}
+
+/* Java's java.util.concurrent.CompletionException: what join() throws when the
+   future failed, wrapping the task's own throwable. get() throws
+   ExecutionException instead, which is Java's split of the same event. */
+class CompletionException extends RuntimeException {
+  public CompletionException(Throwable cause) {
+    super(cause)
+  }
+  public CompletionException(String message, Throwable cause) {
+    super(message, cause)
+  }
+}
+
+/* java.util.concurrent.TimeoutException: a timed wait that ran out. */
+class TimeoutException extends Exception {
+  public TimeoutException() {
+    super()
+  }
+  public TimeoutException(String message) {
+    super(message)
+  }
+}
+
+/* java.util.concurrent.CompletableFuture, the parts a program uses: the two
+   factories, a chain of dependent stages, the two exception handlers, the two
+   combinators, and the four ways to finish one.
+
+   The state is one value, one throwable, and a done flag, all written under this
+   object's monitor. A dependent stage is a Runnable registered before the future
+   finishes; the thread that finishes it runs those runnables after letting go of
+   the monitor, and a stage registered after it has finished runs immediately in
+   the registering thread. That is Java's shape, with Java's rule that exactly one
+   complete() wins: a second call answers false and changes nothing.
+
+   A stage's failure is carried forward: thenApply on a failed future does not
+   run its function, the next future fails with the same throwable, and
+   exceptionally/handle are the two places it can be turned back into a value.
+   An exception thrown inside a stage is caught the same way, which is what Java
+   does and what makes a chain of pure functions safe to write. */
+class CompletableFuture<T> implements Future<T> {
+  private T value
+  private Throwable failure
+  private boolean done
+  /* The stages registered on this future: run when it finishes, in the thread
+     that finished it, outside the monitor. */
+  private final List<Runnable> dependents = new ArrayList<Runnable>()
+
+  public CompletableFuture() {}
+
+  public static < U > CompletableFuture<U> completedFuture(U v) {
+    CompletableFuture<U> f = new CompletableFuture<U>()
+    f.complete(v)
+    return f
+  }
+
+  public static < U > CompletableFuture<U> failedFuture(Throwable t) {
+    CompletableFuture<U> f = new CompletableFuture<U>()
+    f.completeExceptionally(t)
+    return f
+  }
+
+  /* The supplier runs on a daemon thread of its own. Java's runs on the common
+     ForkJoinPool, which is also daemon, and this runtime has no pool to
+     share. */
+  public static < U > CompletableFuture<U> supplyAsync(Supplier<U> supplier) {
+    final CompletableFuture<U> f = new CompletableFuture<U>()
+    final Supplier<U> sup = supplier
+    Thread t = new Thread(new Runnable() {
+      public void run() {
+        try {
+          f.complete(sup.get())
+        } catch (Throwable failure) {
+          f.completeExceptionally(failure)
+        }
+      }
+    })
+    t.setDaemon(true)
+    t.start()
+    return f
+  }
+
+  public static < U > CompletableFuture<U> runAsync(Runnable action) {
+    final CompletableFuture<U> f = new CompletableFuture<U>()
+    final Runnable task = action
+    Thread t = new Thread(new Runnable() {
+      public void run() {
+        try {
+          task.run()
+            f.complete(null)
+        } catch (Throwable failure) {
+          f.completeExceptionally(failure)
+        }
+      }
+    })
+    t.setDaemon(true)
+    t.start()
+    return f
+  }
+
+  /* The Executor form: the caller owns the executor's lifetime, so a pool that
+     does not shut down keeps the process alive -- which is what a thread pool
+     the caller made already does. */
+  public static < U > CompletableFuture<U> supplyAsync(Supplier<U> supplier, Executor executor) {
+    final CompletableFuture<U> f = new CompletableFuture<U>()
+    final Supplier<U> sup = supplier
+    executor.execute(new Runnable() {
+      public void run() {
+        try {
+          f.complete(sup.get())
+        } catch (Throwable failure) {
+          f.completeExceptionally(failure)
+        }
+      }
+    })
+    return f
+  }
+
+  public static < U > CompletableFuture<U> runAsync(Runnable action, Executor executor) {
+    final CompletableFuture<U> f = new CompletableFuture<U>()
+    final Runnable task = action
+    executor.execute(new Runnable() {
+      public void run() {
+        try {
+          task.run()
+            f.complete(null)
+        } catch (Throwable failure) {
+          f.completeExceptionally(failure)
+        }
+      }
+    })
+    return f
+  }
+
+  /* ---------------------------------------------------------- finishing */
+
+  public boolean complete(T v) {
+    List<Runnable> run = null
+    synchronized (this) {
+      if (this.done) {
+        return false
+      }
+      this.value = v
+      this.done = true
+      run = new ArrayList<Runnable>(this.dependents)
+      this.dependents.clear()
+      this.notifyAll()
+    }
+    for (int i = 0 : i < run.size() : i++) {
+      run.get(i).run()
+    }
+    return true
+  }
+
+  public boolean completeExceptionally(Throwable t) {
+    List<Runnable> run = null
+    synchronized (this) {
+      if (this.done) {
+        return false
+      }
+      this.failure = t
+      this.done = true
+      run = new ArrayList<Runnable>(this.dependents)
+      this.dependents.clear()
+      this.notifyAll()
+    }
+    for (int i = 0 : i < run.size() : i++) {
+      run.get(i).run()
+    }
+    return true
+  }
+
+  /* Run this action when the future finishes, or now if it already has. The
+     action runs without the monitor held, which is why every stage reads the
+     state through the synchronized accessors below. */
+  private void attach(Runnable action) {
+    boolean now = false
+    synchronized (this) {
+      if (this.done) {
+        now = true
+      } else {
+        this.dependents.add(action)
+      }
+    }
+    if (now) {
+      action.run()
+    }
+  }
+
+  /* ------------------------------------------------------------ queries */
+
+  public boolean isDone() {
+    synchronized (this) {
+      return this.done
+    }
+  }
+
+  public boolean isCancelled() {
+    return false
+  }
+
+  /* This future cannot be cancelled: there is no worker to interrupt and no
+     promise that a stage has not started, so answering false is the honest
+     answer rather than a cancel that silently does nothing. */
+  public boolean cancel() {
+    return false
+  }
+
+  public boolean isCompletedExceptionally() {
+    synchronized (this) {
+      return this.done && this.failure != null
+    }
+  }
+
+  private Throwable failureNow() {
+    synchronized (this) {
+      return this.failure
+    }
+  }
+
+  private T valueNow() {
+    synchronized (this) {
+      return this.value
+    }
+  }
+
+  /* ------------------------------------------------------------ waiting */
+
+  public T join() {
+    synchronized (this) {
+      while (!this.done) {
+        this.wait(-1L)
+      }
+      if (this.failure != null) {
+        throw new CompletionException(this.failure)
+      }
+      return this.value
+    }
+  }
+
+  public T get() {
+    synchronized (this) {
+      while (!this.done) {
+        this.wait(-1L)
+      }
+      if (this.failure != null) {
+        throw new ExecutionException("the task failed", this.failure)
+      }
+      return this.value
+    }
+  }
+
+  /* Java's get(timeout, unit) with the unit fixed at milliseconds. */
+  public T get(long millis) {
+    long deadline = System.nanoTime() + millis * 1000000L
+    synchronized (this) {
+      while (!this.done) {
+        long left = deadline - System.nanoTime()
+        if (left <= 0) {
+          throw new TimeoutException("waiting for the future timed out")
+        }
+        long ms = left / 1000000L
+        if (ms <= 0) {
+          ms = 1
+        }
+        this.wait(ms)
+      }
+      if (this.failure != null) {
+        throw new ExecutionException("the task failed", this.failure)
+      }
+      return this.value
+    }
+  }
+
+  /* ------------------------------------------------------------- stages */
+
+  public < U > CompletableFuture<U> thenApply(Function<T, U> fn) {
+    final CompletableFuture<U> next = new CompletableFuture<U>()
+    final CompletableFuture<T> self = this
+    final Function<T, U> f = fn
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          if (failed != null) {
+          next.completeExceptionally(failed)
+            return
+        }
+          try {
+          next.complete(f.apply(self.valueNow()))
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    })
+    return next
+  }
+
+  public CompletableFuture<Void> thenAccept(Consumer<T> action) {
+    final CompletableFuture<Void> next = new CompletableFuture<Void>()
+    final CompletableFuture<T> self = this
+    final Consumer<T> c = action
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          if (failed != null) {
+          next.completeExceptionally(failed)
+            return
+        }
+          try {
+          c.accept(self.valueNow())
+            next.complete(null)
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    })
+    return next
+  }
+
+  public CompletableFuture<Void> thenRun(Runnable action) {
+    final CompletableFuture<Void> next = new CompletableFuture<Void>()
+    final CompletableFuture<T> self = this
+    final Runnable r = action
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          if (failed != null) {
+          next.completeExceptionally(failed)
+            return
+        }
+          try {
+          r.run()
+            next.complete(null)
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    })
+    return next
+  }
+
+  /* thenCompose: a stage that answers another future, flattened. The outer
+     future finishes when the inner one does, with the inner one's value or
+     failure. */
+  public < U > CompletableFuture<U> thenCompose(Function<T, CompletableFuture<U>> fn) {
+    final CompletableFuture<U> next = new CompletableFuture<U>()
+    final CompletableFuture<T> self = this
+    final Function<T, CompletableFuture<U>> f = fn
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          if (failed != null) {
+          next.completeExceptionally(failed)
+            return
+        }
+          CompletableFuture<U> inner
+          try {
+          inner = f.apply(self.valueNow())
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+            return
+        }
+          if (inner == null) {
+          next.complete(null)
+            return
+        }
+          inner.attach(new Runnable() {
+          public void run() {
+            Throwable innerFailed = inner.failureNow()
+              if (innerFailed != null) {
+              next.completeExceptionally(innerFailed)
+            } else {
+              next.complete(inner.valueNow())
+            }
+          }
+        })
+      }
+    })
+    return next
+  }
+
+  /* exceptionally: the one stage that runs only on failure, and whose answer
+     is the value the chain continues with. */
+  public CompletableFuture<T> exceptionally(Function<Throwable, T> fn) {
+    final CompletableFuture<T> next = new CompletableFuture<T>()
+    final CompletableFuture<T> self = this
+    final Function<Throwable, T> f = fn
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          if (failed == null) {
+          next.complete(self.valueNow())
+            return
+        }
+          try {
+          next.complete(f.apply(failed))
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    })
+    return next
+  }
+
+  /* handle: runs whether the future succeeded or failed, and sees the throwable
+     (null on success) beside the value (null on failure). */
+  public < U > CompletableFuture<U> handle(BiFunction<T, Throwable, U> fn) {
+    final CompletableFuture<U> next = new CompletableFuture<U>()
+    final CompletableFuture<T> self = this
+    final BiFunction<T, Throwable, U> f = fn
+    attach(new Runnable() {
+      public void run() {
+        Throwable failed = self.failureNow()
+          try {
+          next.complete(f.apply(failed == null ? self.valueNow() : null, failed))
+        } catch (Throwable thrown) {
+          next.completeExceptionally(thrown)
+        }
+      }
+    })
+    return next
+  }
+
+  /* ---------------------------------------------------------- combining */
+
+  /* allOf: done when every one of them is (failed if any failed). The answer is
+     a Void future, as in Java. */
+  public static CompletableFuture<Void> allOf(CompletableFuture<?>...futures) {
+    final CompletableFuture<Void> out = new CompletableFuture<Void>()
+    final CompletableFuture<?>[] all = futures
+    if (all.length == 0) {
+      out.complete(null)
+      return out
+    }
+    /* One counter under the answer's monitor: the last stage to finish
+       completes it. */
+    final int[] left = new int[] { all.length }
+    final Throwable[] firstFailure = new Throwable[1]
+    for (int i = 0 : i < all.length : i++) {
+      final CompletableFuture<?> f = all[i]
+      f.attach(new Runnable() {
+        public void run() {
+          synchronized (out) {
+            if (f.failureNow() != null && firstFailure[0] == null) {
+              firstFailure[0] = f.failureNow()
+            }
+              left[0] = left[0] - 1
+              if (left[0] == 0) {
+              synchronized (out) {
+                if (firstFailure[0] != null) {
+                  out.completeExceptionally(firstFailure[0])
+                } else {
+                  out.complete(null)
+                }
+              }
+            }
+          }
+        }
+      })
+    }
+    return out
+  }
+
+  /* anyOf: done when the first of them is, with that one's value. */
+  public static CompletableFuture<Object> anyOf(CompletableFuture<?>...futures) {
+    final CompletableFuture<Object> out = new CompletableFuture<Object>()
+    final CompletableFuture<?>[] all = futures
+    if (all.length == 0) {
+      out.completeExceptionally(new IllegalArgumentException("no futures to wait for"))
+      return out
+    }
+    for (int i = 0 : i < all.length : i++) {
+      final CompletableFuture<?> f = all[i]
+      f.attach(new Runnable() {
+        public void run() {
+          if (f.failureNow() != null) {
+            out.completeExceptionally(f.failureNow())
+          } else {
+            out.complete(f.valueNow())
+          }
+        }
+      })
+    }
+    return out
+  }
+}
+
+/* java.util.concurrent.locks.ReentrantReadWriteLock: many readers or one
+   writer, reentrant in each mode.
+
+   The state is two numbers and two identities under the lock object's monitor:
+   the writer and its hold count, and a per-thread reader count plus the total.
+   A reader waits only while a *different* thread writes; a writer waits while
+   anyone else writes or anyone at all reads. A thread already holding the write
+   lock may take the read lock (Java's downgrade), and a thread holding a read
+   lock that asks for the write lock waits forever -- Java's deadlock, kept rather
+   than papered over.
+
+   Fairness is accepted and ignored, for the reason ReentrantLock states: there
+   is no queue to order. */
+class ReentrantReadWriteLock {
+  private Thread writer
+  private int writeHolds
+  private final Map<Thread, Integer> readers = new HashMap<Thread, Integer>()
+  private int readCount
+
+  public ReentrantReadWriteLock() {}
+
+  public ReentrantReadWriteLock(boolean fair) {}
+
+  public Lock readLock() {
+    return new ReadLock(this)
+  }
+
+  public Lock writeLock() {
+    return new WriteLock(this)
+  }
+
+  private synchronized void acquireRead() {
+    Thread me = Thread.currentThread()
+    while (this.writer != null && this.writer != me) {
+      this.wait(-1L)
+    }
+    Integer held = this.readers.get(me)
+    int now = held == null ? 1 : held.intValue() + 1
+    this.readers.put(me, new Integer(now))
+    this.readCount = this.readCount + 1
+  }
+
+  private synchronized void releaseRead() {
+    Thread me = Thread.currentThread()
+    Integer held = this.readers.get(me)
+    if (held == null) {
+      throw new IllegalMonitorStateException("current thread is not owner")
+    }
+    int left = held.intValue() - 1
+    if (left == 0) {
+      this.readers.remove(me)
+    } else {
+      this.readers.put(me, new Integer(left))
+    }
+    this.readCount = this.readCount - 1
+    if (this.readCount == 0) {
+      this.notifyAll()
+    }
+  }
+
+  private synchronized void acquireWrite() {
+    Thread me = Thread.currentThread()
+    while (this.writer != me && (this.writer != null || this.readCount > 0)) {
+      this.wait(-1L)
+    }
+    this.writer = me
+    this.writeHolds = this.writeHolds + 1
+  }
+
+  private synchronized void releaseWrite() {
+    Thread me = Thread.currentThread()
+    if (this.writer != me) {
+      throw new IllegalMonitorStateException("current thread is not owner")
+    }
+    this.writeHolds = this.writeHolds - 1
+    if (this.writeHolds == 0) {
+      this.writer = null
+      this.notifyAll()
+    }
+  }
+
+  public boolean isWriteLocked() {
+    synchronized (this) {
+      return this.writer != null
+    }
+  }
+
+  public boolean isWriteLockedByCurrentThread() {
+    synchronized (this) {
+      return this.writer == Thread.currentThread()
+    }
+  }
+
+  public int getWriteHoldCount() {
+    synchronized (this) {
+      return this.writer == Thread.currentThread() ? this.writeHolds : 0
+    }
+  }
+
+  public int getReadLockCount() {
+    synchronized (this) {
+      return this.readCount
+    }
+  }
+
+  public int getReadHoldCount() {
+    synchronized (this) {
+      Integer held = this.readers.get(Thread.currentThread())
+      return held == null ? 0 : held.intValue()
+    }
+  }
+
+  /* The read half. It is a class rather than an inner class so that the lock's
+     fields stay private to the lock and the pair of classes is visible in the
+     library index; Java's are inner classes only because its API is older. */
+  static class ReadLock implements Lock {
+    private final ReentrantReadWriteLock outer
+
+    ReadLock(ReentrantReadWriteLock outer) {
+      this.outer = outer
+    }
+
+    public void lock() {
+      this.outer.acquireRead()
+    }
+
+    public boolean tryLock() {
+      synchronized (this.outer) {
+        if (this.outer.writer != null && this.outer.writer != Thread.currentThread()) {
+          return false
+        }
+      }
+      this.outer.acquireRead()
+      return true
+    }
+
+    public boolean tryLock(long millis) {
+      long deadline = System.nanoTime() + millis * 1000000L
+      synchronized (this.outer) {
+        Thread me = Thread.currentThread()
+        while (this.outer.writer != null && this.outer.writer != me) {
+          long left = deadline - System.nanoTime()
+          if (left <= 0) {
+            return false
+          }
+          long ms = left / 1000000L
+          if (ms <= 0) {
+            ms = 1
+          }
+          this.outer.wait(ms)
+        }
+        /* The count is taken inside the same monitor: nobody can slip a writer
+           in between the test and the increment. */
+        Integer held = this.outer.readers.get(me)
+        int now = held == null ? 1 : held.intValue() + 1
+        this.outer.readers.put(me, new Integer(now))
+        this.outer.readCount = this.outer.readCount + 1
+        return true
+      }
+    }
+
+    public void unlock() {
+      this.outer.releaseRead()
+    }
+  }
+
+  static class WriteLock implements Lock {
+    private final ReentrantReadWriteLock outer
+
+    WriteLock(ReentrantReadWriteLock outer) {
+      this.outer = outer
+    }
+
+    public void lock() {
+      this.outer.acquireWrite()
+    }
+
+    public boolean tryLock() {
+      synchronized (this.outer) {
+        Thread me = Thread.currentThread()
+        if (this.outer.writer != null && this.outer.writer != me) {
+          return false
+        }
+        if (this.outer.writer != me && this.outer.readCount > 0) {
+          return false
+        }
+        this.outer.writer = me
+        this.outer.writeHolds = this.outer.writeHolds + 1
+        return true
+      }
+    }
+
+    public boolean tryLock(long millis) {
+      long deadline = System.nanoTime() + millis * 1000000L
+      synchronized (this.outer) {
+        Thread me = Thread.currentThread()
+        while (this.outer.writer != me && (this.outer.writer != null || this.outer.readCount > 0)) {
+          long left = deadline - System.nanoTime()
+          if (left <= 0) {
+            return false
+          }
+          long ms = left / 1000000L
+          if (ms <= 0) {
+            ms = 1
+          }
+          this.outer.wait(ms)
+        }
+        this.outer.writer = me
+        this.outer.writeHolds = this.outer.writeHolds + 1
+        return true
+      }
+    }
+
+    public void unlock() {
+      this.outer.releaseWrite()
+    }
+  }
+}
+
+/* java.util.concurrent.Exchanger: two threads meet and trade values.
+
+   The first to arrive offers its value and waits on the exchanger's monitor;
+   the second takes that value, offers its own in its place, and wakes the first.
+   Both exchanges are then complete and the object is empty again, so it can be
+   used for the next pair. A third thread arriving before the first has woken
+   waits, because the state says a hand-off is still in flight.
+
+   The timed form answers TimeoutException rather than returning a value nobody
+   sent, which is Java's answer and the only honest one. */
+class Exchanger<V> {
+  private V offered
+  private V answer
+  private boolean waiting
+  private boolean answered
+
+  public Exchanger() {}
+
+  public V exchange(V x) {
+    synchronized (this) {
+      if (this.waiting) {
+        V other = this.offered
+        this.offered = null
+        this.waiting = false
+        this.answer = x
+        this.answered = true
+        this.notifyAll()
+        return other
+      }
+      this.waiting = true
+      this.offered = x
+      while (!this.answered) {
+        this.wait(-1L)
+      }
+      V mine = this.answer
+      this.answer = null
+      this.answered = false
+      return mine
+    }
+  }
+
+  public V exchange(V x, long millis) {
+    long deadline = System.nanoTime() + millis * 1000000L
+    synchronized (this) {
+      if (this.waiting) {
+        V other = this.offered
+        this.offered = null
+        this.waiting = false
+        this.answer = x
+        this.answered = true
+        this.notifyAll()
+        return other
+      }
+      this.waiting = true
+      this.offered = x
+      while (!this.answered) {
+        long left = deadline - System.nanoTime()
+        if (left <= 0) {
+          /* Nobody came: take the offer back so the next arrival does not pair
+             with a thread that has already given up. */
+          this.waiting = false
+          this.offered = null
+          throw new TimeoutException("the exchange timed out")
+        }
+        long ms = left / 1000000L
+        if (ms <= 0) {
+          ms = 1
+        }
+        this.wait(ms)
+      }
+      V mine = this.answer
+      this.answer = null
+      this.answered = false
+      return mine
+    }
+  }
+}
