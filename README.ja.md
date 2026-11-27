@@ -95,8 +95,9 @@ CI は `main` への push と PR のたびに `go build`、`go vet`、`go test` 
   `Object.wait`／`notify`、`interrupt`、daemon、`ThreadLocal`）、**仮想スレッド**
   （`Thread.startVirtualThread`／`Thread.ofVirtual()`、ucontext 上の M:N。Windows では
   名前付きの例外で拒否）、そして `java.util.concurrent` の形——`Executors`、
-  `ExecutorService`、`Future`、`Callable`、`CountDownLatch`、`AtomicInteger`／
-  `AtomicLong`、`ConcurrentHashMap`。
+  `ExecutorService`、`Future`、`Callable`、`CompletableFuture`、`CountDownLatch`、
+  `Semaphore`、`CyclicBarrier`、`ReentrantLock`、`ReentrantReadWriteLock`、`Exchanger`、
+  `AtomicInteger`／`AtomicLong`、`ConcurrentHashMap`。
 * **暗号**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`SecureRandom`（OS の
   CSPRNG）、`Mac`（HMAC）、`Cipher`（ECB／CBC／CTR／GCM の AES-128／192／256、RSA
   PKCS#1 v1.5）、`Signature`（RSA 検証）、`KeyFactory`（X.509／PKCS#8 DER）。すべて Teyru で

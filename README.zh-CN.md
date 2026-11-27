@@ -91,8 +91,9 @@ CI 在每次推送到 `main` 与每个 PR 上运行 `go build`、`go vet` 与整
   `Object.wait`／`notify`、`interrupt`、daemon、`ThreadLocal`），**虚拟线程**
   （`Thread.startVirtualThread`／`Thread.ofVirtual()`，ucontext 上的 M:N；Windows
   以具名异常拒绝），以及 `java.util.concurrent` 的形状——`Executors`、
-  `ExecutorService`、`Future`、`Callable`、`CountDownLatch`、`AtomicInteger`／
-  `AtomicLong`、`ConcurrentHashMap`。
+  `ExecutorService`、`Future`、`Callable`、`CompletableFuture`、`CountDownLatch`、
+  `Semaphore`、`CyclicBarrier`、`ReentrantLock`、`ReentrantReadWriteLock`、
+  `Exchanger`、`AtomicInteger`／`AtomicLong`、`ConcurrentHashMap`。
 * **密码学**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`SecureRandom`（系统
   CSPRNG）、`Mac`（HMAC）、`Cipher`（AES-128／192／256 于 ECB／CBC／CTR／GCM，RSA
   PKCS#1 v1.5）、`Signature`（RSA 验證）、`KeyFactory`（X.509／PKCS#8 DER），全部以

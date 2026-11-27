@@ -98,8 +98,9 @@ every platform.
   `Object.wait`/`notify`, `interrupt`, daemons, `ThreadLocal`), **virtual threads**
   (`Thread.startVirtualThread` / `Thread.ofVirtual()`, M:N on ucontext; refused by name on
   Windows), and the shape of `java.util.concurrent` — `Executors`,
-  `ExecutorService`, `Future`, `Callable`, `CountDownLatch`, `AtomicInteger`/`AtomicLong`,
-  `ConcurrentHashMap`.
+  `ExecutorService`, `Future`, `Callable`, `CompletableFuture`, `CountDownLatch`,
+  `Semaphore`, `CyclicBarrier`, `ReentrantLock`, `ReentrantReadWriteLock`, `Exchanger`,
+  `AtomicInteger`/`AtomicLong`, `ConcurrentHashMap`.
 * **Cryptography**: `MessageDigest` (MD5, SHA-1/224/256/384/512), `SecureRandom` (the system
   CSPRNG), `Mac` (HMAC), `Cipher` (AES-128/192/256 in ECB/CBC/CTR/GCM, RSA PKCS#1 v1.5),
   `Signature` (RSA verification), `KeyFactory` (X.509/PKCS#8 DER) -- all written in Teyru, with no

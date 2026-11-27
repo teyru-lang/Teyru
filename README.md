@@ -91,8 +91,9 @@ CI 在每次 push 到 `main` 與每個 PR 上跑 `go build`、`go vet` 與整套
   `Object.wait`／`notify`、`interrupt`、daemon、`ThreadLocal`），**虛擬執行緒**
   （`Thread.startVirtualThread`／`Thread.ofVirtual()`，ucontext 上的 M:N；Windows
   以具名例外拒絕），以及 `java.util.concurrent` 的形狀——`Executors`、
-  `ExecutorService`、`Future`、`Callable`、`CountDownLatch`、`AtomicInteger`／
-  `AtomicLong`、`ConcurrentHashMap`。
+  `ExecutorService`、`Future`、`Callable`、`CompletableFuture`、`CountDownLatch`、
+  `Semaphore`、`CyclicBarrier`、`ReentrantLock`、`ReentrantReadWriteLock`、
+  `Exchanger`、`AtomicInteger`／`AtomicLong`、`ConcurrentHashMap`。
 * **密碼學**：`MessageDigest`（MD5、SHA-1／224／256／384／512）、`SecureRandom`（系統
   CSPRNG）、`Mac`（HMAC）、`Cipher`（AES-128／192／256 於 ECB／CBC／CTR／GCM，RSA
   PKCS#1 v1.5）、`Signature`（RSA 驗證）、`KeyFactory`（X.509／PKCS#8 DER），全部以
